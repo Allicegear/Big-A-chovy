@@ -202,6 +202,9 @@ from urllib.parse import urlparse, parse_qs
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 STATIC_DIR = SCRIPT_DIR / "realtime_static"
+# 两个入口共用的导航与运行状态条：工作台 handler 继承本模块的静态路由，
+# 因此只需在这里挂一次（见 do_GET 的 /common.css、/common.js）。
+SHARED_STATIC_DIR = SCRIPT_DIR / "shared_static"
 PORT = 8765
 # 单次筛选硬超时（秒）。健康刷新通常 5~10s（K线走缓存）；若代理在筛选中途掉线，
 # 引擎会在超时附近空耗，这里兜底中止该轮，标记代理不可用并保留快照，
@@ -725,6 +728,10 @@ class ScreeningScheduler:
             "is_running": self.is_running,
             "is_prewarming": self.is_prewarming,
             "prewarm_progress": dict(self.prewarm_progress),
+            # 供两页共用的运行状态条：数据时点与可读数据源（meta 里的是文案，
+            # market_fetch_status.source 是内部标识如 eastmoney_push2，不用它）。
+            "data_timestamp": meta.get("timestamp"),
+            "data_source": meta.get("source") or mfs.get("source"),
             "last_run_time": self.last_run_time.strftime("%Y-%m-%d %H:%M:%S") if self.last_run_time else None,
             "last_run_duration": round(self.last_run_duration, 1) if self.last_run_duration else None,
             "is_trading_hours": is_trading_hours(),
@@ -808,6 +815,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_static("style.css")
         elif path == "/app.js":
             self._serve_static("app.js")
+        elif path == "/common.css":
+            self._serve_shared_static("common.css")
+        elif path == "/common.js":
+            self._serve_shared_static("common.js")
         elif path == "/api/data":
             self._serve_json(scheduler.latest_result or {"error": "waiting for first screening..."})
         elif path == "/api/status":
@@ -882,7 +893,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _serve_static(self, filename: str) -> None:
-        filepath = STATIC_DIR / filename
+        self._serve_static_from(STATIC_DIR, filename)
+
+    def _serve_shared_static(self, filename: str) -> None:
+        """导航与运行状态条的单一实现，两个入口共用同一份文件。"""
+        self._serve_static_from(SHARED_STATIC_DIR, filename)
+
+    def _serve_static_from(self, directory: Path, filename: str) -> None:
+        filepath = directory / filename
         if not filepath.exists():
             self.send_error(404, f"File not found: {filename}")
             return
@@ -892,6 +910,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
+        # 本机工具、文件很小：禁用缓存，改完前端刷新即生效（否则浏览器会拿旧的 CSS/JS）
+        self.send_header("Cache-Control", "no-store")
         self._send_cors_headers()
         self.end_headers()
         self.wfile.write(content)

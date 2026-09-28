@@ -177,7 +177,20 @@ INDEX_URLS = [
 TENCENT_KLINE_URLS = list(tencent_kline.TENCENT_KLINE_URLS)
 TENCENT_KLINE_URL = TENCENT_KLINE_URLS[0]  # 兼容旧调用点
 SINA_KLINE_URL = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-EM_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"  # 2026-09-25 实测下线，仅留档不调用
+# 东财日 K（push2his）——第二档备源。2026-09-25 实测该路径被断而停用，2026-09-28 复测已恢复：
+# 前复权（与腾讯同日收盘差 ≤0.2%）、含当日 bar，覆盖沪深主板/创业板/科创板/北交所。
+# 与腾讯**非同厂商**，所以作为并列的第二档：2026-09-28 腾讯整链连续失败 47 分钟时，
+# 若有这一档就不必整轮吃新浪不复权数据（实测池子被压掉约一半）。
+EM_KLINE_URLS: Tuple[str, ...] = (
+    "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://1.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://82.push2his.eastmoney.com/api/qt/stock/kline/get",
+)
+EM_KLINE_URL = EM_KLINE_URLS[0]  # 兼容旧调用点与文档引用
+# 东财 kline 的 fields2=f51..f61 列序与腾讯 qfqday 前 6 列一致（date,open,close,high,low,vol），
+# 因此两档可共用 parse_k_rows，不必各写一个解析器。
+EM_KLINE_FIELDS1 = "f1,f2,f3,f4,f5,f6"
+EM_KLINE_FIELDS2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
 # 当日 1 分钟累计资金流序列。本地快照够不着 5/15 分钟基准时用它兜底，
 # 只走 push2 系主机的 /webguest 路由（push2his 无 /webguest，standards 路由已下线）。
 EM_FFLOW_MINUTE_URLS = [
@@ -912,49 +925,167 @@ def fetch_indices() -> List[Dict[str, Any]]:
     return []
 
 
+SECTOR_BOARD_PAGE_SIZE = 100
+# 安全上限：total 异常时不至于无限翻页
+SECTOR_BOARD_MAX_PAGES = 20
+# 翻页排序键必须是**盘中不变**的字段。原用 f3（涨跌幅）实时排序：
+# 2026-09-28 实测同一页隔 6 秒取两次只重合 92/100，首行代码都会变。5 页串行取数
+# 期间板块在页间移动 → 有的板块被取到两次（去重后计数变少）、有的整轮漏掉。
+# 上游页大小上限是 100（pz=600 仍只回 100 行），所以只能靠固定排序键消除漂移；
+# f12（板块代码）实测两次取数 100/100 一致。
+SECTOR_BOARD_SORT_FIELD = "f12"
+SECTOR_BOARD_FIELDS = "f12,f14,f2,f3,f4,f8,f104,f105,f124"
+# 板块列表的完整性状态（与 MARKET_FETCH_STATUS 同一用途，供报告与诊断读取）
+SECTOR_BOARDS_STATUS: Dict[str, Any] = {
+    "complete": None, "provider_total": None, "expected_pages": 0,
+    "received_pages": 0, "failed_pages": [], "retrieved_rows": 0,
+    "raw_rows": 0, "duplicate_rows": 0, "blank_code_rows": 0, "missing_rows": 0,
+    "sort_field": SECTOR_BOARD_SORT_FIELD,
+}
+
+
+def _sector_board_params(page: int) -> Dict[str, Any]:
+    return {
+        "pn": page,
+        "pz": SECTOR_BOARD_PAGE_SIZE,
+        "po": 1,
+        "np": 1,
+        "fltt": 2,
+        "invt": 2,
+        "fid": SECTOR_BOARD_SORT_FIELD,
+        "fs": "m:90+t:2",
+        "fields": SECTOR_BOARD_FIELDS,
+        "ut": EASTMONEY_UT,
+    }
+
+
+def _fetch_sector_page(page: int) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """取一页板块原始行，并返回服务端 total。所有主机都失败时抛异常。"""
+    last_error: Optional[Exception] = None
+    for url in _rank_urls(CLIST_URLS):
+        try:
+            data = fetch_json(url, _sector_board_params(page))
+        except Exception as exc:
+            last_error = exc
+            continue
+        body = (data or {}).get("data") or {}
+        return list(body.get("diff") or []), body.get("total")
+    raise last_error or RuntimeError("板块分页取数失败")
+
+
 def fetch_sector_indices() -> List[Dict[str, Any]]:
-    """Fetch all industry board indices from East Money (行业板块)."""
+    """拉全部行业板块：按服务端 total 分页，失败页重试一次，并校验完整性。
+
+    2026-09-27 修正（同类工具调研发现）：
+    - 原实现固定最多 5 页且**不读 total**——板块数超过 500 时会被静默截断；
+    - 某页在所有主机都失败时会直接 break，悄悄返回部分板块，调用方无从察觉。
+    现在按 total 推算期望页数（带安全上限），失败页重试一次，并把「页数/行数是否符合预期」
+    写进 `SECTOR_BOARDS_STATUS` 与报告警告——不完整必须可见，不能静默。
+
+    2026-09-28 追加修正（盘中 total=496/实收 491 且无失败页）：
+    - 翻页排序键从 f3（实时涨跌幅）改为 f12（板块代码），消除页间漂移；
+    - 去重键从板块名改为板块代码——同名板块不会被互相顶掉，缺代码的行单独计数；
+    - 完整性同时记录原始行数/重复行/缺失行，警告写清差异构成，避免下次只剩
+      「实收 N」而看不出是重复、漂移还是真丢。
+    """
+    rows_by_page: Dict[int, List[Dict[str, Any]]] = {}
+    total: Optional[int] = None
+    try:
+        rows_by_page[1], total = _fetch_sector_page(1)
+    except Exception:
+        MARKET_WARNINGS.append("板块指数查询失败：首屏未取到，板块列表与板块指数区块将为空")
+        SECTOR_BOARDS_STATUS.update({
+            "complete": False, "provider_total": None, "expected_pages": 1,
+            "received_pages": 0, "failed_pages": [1], "retrieved_rows": 0,
+            "raw_rows": 0, "duplicate_rows": 0, "blank_code_rows": 0, "missing_rows": 0,
+            "sort_field": SECTOR_BOARD_SORT_FIELD,
+        })
+        return []
+
+    expected_pages = 1
+    if is_number(total) and int(total) > 0:
+        expected_pages = max(1, math.ceil(int(total) / SECTOR_BOARD_PAGE_SIZE))
+        if expected_pages > SECTOR_BOARD_MAX_PAGES:
+            MARKET_WARNINGS.append(
+                f"板块 total={int(total)} 推算需 {expected_pages} 页，超过安全上限 "
+                f"{SECTOR_BOARD_MAX_PAGES} 页；按上限取数并标记不完整"
+            )
+            expected_pages = SECTOR_BOARD_MAX_PAGES
+
+    failed_pages: List[int] = []
+    for page in range(2, expected_pages + 1):
+        try:
+            rows_by_page[page], _ = _fetch_sector_page(page)
+        except Exception:
+            failed_pages.append(page)
+    for page in list(failed_pages):     # 失败页重试一次，与全市场分页同样处理
+        try:
+            rows_by_page[page], _ = _fetch_sector_page(page)
+            failed_pages.remove(page)
+        except Exception:
+            continue
+
     all_boards: List[Dict[str, Any]] = []
-    for page in range(1, 6):  # paginate: 5 pages × 100 covers all ~500 boards
-        params = {
-            "pn": page,
-            "pz": 100,
-            "po": 1,
-            "np": 1,
-            "fltt": 2,
-            "invt": 2,
-            "fid": "f3",
-            "fs": "m:90+t:2",
-            "fields": "f12,f14,f2,f3,f4,f8,f104,f105,f124",
-            "ut": EASTMONEY_UT,
-        }
-        got_page = False
-        for url in _rank_urls(CLIST_URLS):
-            try:
-                data = fetch_json(url, params)
-                boards = ((data.get("data") or {}).get("diff") or [])
-                for b in boards:
-                    name = b.get("f14", "")
-                    if not name:
-                        continue
-                    all_boards.append({
-                        "name": name,
-                        "price": b.get("f2"),
-                        "change": b.get("f3"),
-                        "turnover": b.get("f8"),
-                        "up_count": b.get("f104"),
-                        "down_count": b.get("f105"),
-                    })
-                got_page = True
-                if len(boards) < 100:
-                    return all_boards  # last page
-                break
-            except Exception:
+    seen_codes: set = set()
+    raw_rows = 0
+    duplicate_rows = 0
+    blank_code_rows = 0
+    for page in sorted(rows_by_page):
+        for b in rows_by_page[page]:
+            raw_rows += 1
+            code = str(b.get("f12") or "").strip()
+            name = b.get("f14", "")
+            if not code:
+                # 代码是去重键，也是与自选/共振映射的键；缺代码的行不能算有效板块
+                blank_code_rows += 1
                 continue
-        if not got_page:
-            break
-    if not all_boards:
-        MARKET_WARNINGS.append("板块指数查询失败")
+            if code in seen_codes:
+                duplicate_rows += 1
+                continue
+            seen_codes.add(code)
+            all_boards.append({
+                "code": code,
+                "name": name,
+                "price": b.get("f2"),
+                "change": b.get("f3"),
+                "turnover": b.get("f8"),
+                "up_count": b.get("f104"),
+                "down_count": b.get("f105"),
+            })
+
+    provider_total = int(total) if is_number(total) else None
+    missing_rows = max(0, provider_total - len(all_boards)) if provider_total is not None else 0
+    complete = (not failed_pages) and (provider_total is None or len(all_boards) >= provider_total)
+    SECTOR_BOARDS_STATUS.update({
+        "complete": complete,
+        "provider_total": provider_total,
+        "expected_pages": expected_pages,
+        "received_pages": len(rows_by_page),
+        "failed_pages": failed_pages,
+        "retrieved_rows": len(all_boards),
+        "raw_rows": raw_rows,
+        "duplicate_rows": duplicate_rows,
+        "blank_code_rows": blank_code_rows,
+        "missing_rows": missing_rows,
+        "sort_field": SECTOR_BOARD_SORT_FIELD,
+    })
+    if not complete:
+        # 差异构成写清楚，否则下次只看到「实收 N」无法判断是漂移、重复还是真丢
+        detail: List[str] = []
+        if failed_pages:
+            detail.append(f"失败页 {sorted(failed_pages)}")
+        if missing_rows:
+            detail.append(f"较 total 少 {missing_rows} 个")
+        if duplicate_rows:
+            detail.append(f"重复行 {duplicate_rows}")
+        if blank_code_rows:
+            detail.append(f"缺板块代码 {blank_code_rows} 行")
+        MARKET_WARNINGS.append(
+            f"板块列表不完整：服务端 total={provider_total if provider_total is not None else '未知'}，"
+            f"实收 {len(all_boards)} 个板块（原始 {raw_rows} 行"
+            + (f"；{'、'.join(detail)}" if detail else "")
+            + "）；板块指数区块与双池交集的板块涨跌可能缺失，按不完整数据处理"
+        )
     return all_boards
 
 
@@ -1364,14 +1495,48 @@ def _note_tencent_kline_result(ok: bool) -> None:
 
 
 def _note_sina_kline_fallback() -> None:
+    """新浪降级的一次性 stderr 提示（报告内的逐轮标注见 kline_source_summary）。"""
     global _sina_kline_fallback_warned
     if _sina_kline_fallback_warned:
         return
     _sina_kline_fallback_warned = True
-    MARKET_WARNINGS.append(
-        "本次日 K 部分或全部来自新浪降级源；该端点可能返回不复权价，"
-        "均线与趋势确认池口径需按 source 字段复核。"
-    )
+    print("[kline] Sina fallback in use (unadjusted, may miss today's bar)", file=sys.stderr)
+
+
+# ── 日 K 降级：口径自检与逐轮标注 ────────────────────────────────────
+# 旧实现只在第一次落到新浪时往报告里塞一条警告（_sina_kline_fallback_warned 一次性），
+# 2026-09-28 实测：连续 15 轮走新浪、107 份报告里只有 1 份带警告，频率被严重低估。
+# 现在改为按轮汇总：每轮出报告时结算一次，并标注有多少只与前复权基准不一致。
+KLINE_MIN_BARS = 65
+# 同一交易日收盘与前复权基准的偏差上限；超过即视为复权口径不一致
+KLINE_QFQ_DEVIATION_LIMIT = 0.01
+# 前复权基准：code → (最新交易日, 收盘)。由腾讯/东财两档的成功结果维护，
+# 供降级源比对——不复权价比前复权价低 1.4%~2.7%（2026-09-28 实测），必须显式指出。
+_kline_reference: Dict[str, Tuple[str, float]] = {}
+_kline_fallback_codes: set = set()
+_kline_mismatch_codes: set = set()
+
+
+def _record_kline_reference(code: str, bars: List[Dict[str, float]]) -> None:
+    """用成功的前复权结果更新口径基准。"""
+    if bars:
+        _kline_reference[str(code)] = (str(bars[-1].get("date") or ""), float(bars[-1].get("close") or 0.0))
+
+
+def _note_sina_fallback_code(code: str, bars: List[Dict[str, float]]) -> None:
+    """登记一只走新浪降级的个股，并和基准比对日期/口径（用于逐轮标注）。"""
+    _kline_fallback_codes.add(str(code))
+    reference = _kline_reference.get(str(code))
+    if not reference or not bars:
+        return
+    ref_date, ref_close = reference
+    last = bars[-1]
+    last_date = str(last.get("date") or "")
+    last_close = float(last.get("close") or 0.0)
+    date_mismatch = bool(ref_date) and last_date != ref_date
+    deviation = abs(last_close / ref_close - 1) if ref_close else 0.0
+    if date_mismatch or deviation > KLINE_QFQ_DEVIATION_LIMIT:
+        _kline_mismatch_codes.add(str(code))
 
 
 KLINE_SOURCE_LABELS = {
@@ -1382,23 +1547,46 @@ KLINE_SOURCE_LABELS = {
 
 
 def kline_source_summary(enriched: List[Enriched]) -> str:
-    """按本轮实际用到的日 K 来源生成报告标签。
+    """按本轮实际用到的日 K 来源生成报告标签，并逐轮结算降级标注。
 
     2026-09-26 修正：原先写死“腾讯/东方财富日K”，但腾讯被 WAF 拦截时会整轮降级到新浪、
     东财日 K 又已下线，写死的来源会与实际不符，掩盖均线口径变化。
+    2026-09-28 追加：降级警告改为**逐轮**输出（旧实现每进程只报一次，导致 15 轮降级里
+    只有 1 份报告带警告），并点名有多少只与前复权基准的日期/收盘不一致。
     """
     seen: List[str] = []
     for e in enriched:
         source = getattr(e, "k_source", "") or ""
         if source and source not in seen:
             seen.append(source)
+    fallback_count = len(_kline_fallback_codes)
+    if fallback_count:
+        mismatch = len(_kline_mismatch_codes)
+        detail = (
+            f"，其中 {mismatch} 只与前复权基准的日期或收盘不一致"
+            f"（偏差>{KLINE_QFQ_DEVIATION_LIMIT * 100:.0f}%；均线类判据不可比）"
+            if mismatch else ""
+        )
+        MARKET_WARNINGS.append(
+            f"日K降级：本轮 {fallback_count} 只来自新浪（不复权、可能缺当日 bar）{detail}；"
+            "均线与趋势确认池口径需按 source 字段复核，勿与本轮之外的数据直接比较。"
+        )
+    _kline_fallback_codes.clear()
+    _kline_mismatch_codes.clear()
     if not seen:
         return "日K来源未记录"
     return " + ".join(KLINE_SOURCE_LABELS.get(s, s) for s in seen)
 
 
 def fetch_kline(code: str, limit: int = 90) -> Tuple[List[Dict[str, float]], str]:
-    # 1. Tencent qfq daily bars（主源，多主机故障转移 + 失败熔断）。
+    """取前复权日 K：腾讯（主）→ 东财（备，独立厂商）→ 新浪（末档，不复权，逐轮标注）。
+
+    三档都要求根数达标；前两档成功即登记口径基准，新浪命中时与该基准比对日期与收盘，
+    不一致的个股计入 _kline_mismatch_codes，由 kline_source_summary 逐轮报出，
+    避免不复权数据静默进入均线类判据（超短池 adj_close>ma5、趋势确认池全部均线条件）。
+    """
+    min_bars = min(KLINE_MIN_BARS, limit)
+    # 1. 腾讯 qfq daily bars（主源，多主机故障转移 + 失败熔断）。
     if _tencent_kline_ready():
         normalized = str(code).strip().lower()
         symbol = normalized if normalized.startswith(("sh", "sz")) else ("sh" if normalized.startswith(("6", "9")) else "sz") + normalized
@@ -1412,25 +1600,57 @@ def fetch_kline(code: str, limit: int = 90) -> Tuple[List[Dict[str, float]], str
                 _mark_host_failed(url)
                 continue
             all_hosts_failed = False
-            parsed = _parse_tencent_qfq_kline(data, symbol)
-            if len(parsed) >= min(65, limit):
+            try:
+                parsed = _parse_tencent_qfq_kline(data, symbol)
+            except (AttributeError, TypeError, ValueError):
+                # 上游形状异常（拦截页/结构变更）按该主机失败处理，继续下一档，不要整只崩掉
+                parsed = []
+            if len(parsed) >= min_bars:
                 _mark_host_ok(url)
                 _note_tencent_kline_result(True)
+                _record_kline_reference(code, parsed)
                 return parsed, "tencent_qfq"
             _mark_host_failed(url)
         # 全部主机不可达/被拦才计入熔断；主机可达但样本不足（如次新股）不算故障
         _note_tencent_kline_result(True if not all_hosts_failed else False)
-    # 2. Sina（末档；该端点可能返回不复权历史价，前复权均线会出现口径跳变，命中时以 source 标记）。
-    # 东财日 K（push2his /api/qt/stock/kline/get）已于 2026-09-25 实测下线（连接被断），
-    # 因此不再保留中间档，避免一次注定失败的请求拖长每只股票的取数时间。
+    # 2. 东财 push2his 前复权（并列备源，与腾讯非同厂商）。列序与腾讯 qfqday 前 6 列一致，
+    #    因此共用 parse_k_rows。2026-09-25 该路径曾被断而停用，09-28 复测恢复。
+    for url in _rank_urls(EM_KLINE_URLS):
+        try:
+            data = fetch_json(url, {
+                "secid": secid_for(code),
+                "klt": 101,          # 日线
+                "fqt": 1,            # 前复权
+                "lmt": limit,
+                "end": "20500101",
+                "fields1": EM_KLINE_FIELDS1,
+                "fields2": EM_KLINE_FIELDS2,
+            }, timeout=5, retries=1)
+        except Exception:
+            _mark_host_failed(url)
+            continue
+        # 形状容错：非预期结构（列表/文案/WAF 页）按该主机失败处理，继续下沉，不要整只崩掉
+        try:
+            body = data.get("data") if isinstance(data, dict) else None
+            klines = body.get("klines") if isinstance(body, dict) else None
+            parsed = parse_k_rows(klines) if isinstance(klines, list) else []
+        except (AttributeError, TypeError, ValueError):
+            parsed = []
+        if len(parsed) >= min_bars:
+            _mark_host_ok(url)
+            _record_kline_reference(code, parsed)
+            return parsed, "eastmoney_qfq"
+        _mark_host_failed(url)
+    # 3. 新浪（末档；该端点返回不复权历史价、且可能缺当日 bar，前复权均线会出现口径跳变）。
     try:
         symbol = ("sh" if code.startswith("6") else "sz") + code
         data = fetch_json(SINA_KLINE_URL, {
             "symbol": symbol, "scale": 240, "ma": "no", "datalen": limit,
         }, timeout=5, retries=1)
         parsed = _parse_sina_kline(data)
-        if len(parsed) >= min(65, limit):
+        if len(parsed) >= min_bars:
             _note_sina_kline_fallback()
+            _note_sina_fallback_code(code, parsed)
             return parsed, "sina_daily"
     except Exception:
         pass

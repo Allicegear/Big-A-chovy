@@ -98,26 +98,10 @@ body {
   color: var(--text-secondary);
   white-space: nowrap;
 }
-.next-refresh {
-  font-size: 12px;
-  color: var(--blue);
-  white-space: nowrap;
-}
-.next-refresh.next-running {
-  color: var(--amber);
-}
-.fetch-warn {
-  font-size: 12px;
-  color: var(--amber);
-  white-space: nowrap;
-}
-.cache-info {
+/* 顶栏里「看板默认」选项组的组标签：这些勾选是持久设置，与一次性的动作按钮区分开 */
+.topbar-group-label {
   font-size: 11px;
-  color: var(--teal);
-  background: var(--teal-bg);
-  padding: 2px 8px;
-  border-radius: 4px;
-  border: 1px solid #2a4a47;
+  color: var(--text-dim);
   white-space: nowrap;
 }
 .toggle {

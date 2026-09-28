@@ -13,9 +13,9 @@
 
 ## 版本标识
 
-- 当前开发预览版：[v0.5.0-preview.4](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.5.0-preview.4)，适配东财 `/webguest` 取数路径与腾讯日 K 多主机故障转移，修正资金增量窗口、超大单否决标注与 K 线缓存刷新；仍为预览版。
-- Docker 发布版：[v0.5.0-docker.3](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.5.0-docker.3)，基于同一源码提供 `linux/amd64` 和 `linux/arm64` 容器镜像。
-- 旧版本（`v0.3.x`、`v0.4.x`、`v0.5.0-preview.1`–`preview.3`、`v0.5.0-docker.1`–`docker.2`）已被当前版本取代；其 tag 与容器镜像标签保留，便于复现与回退。
+- 当前开发预览版：[v0.5.0-preview.5](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.5.0-preview.5)，增加东财前复权日 K 备用源与逐轮降级诊断，完善板块分页完整性，并统一看板和工作台的运行状态提示；仍为预览版。
+- Docker 发布版：[v0.5.0-docker.4](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.5.0-docker.4)，基于同一源码提供 `linux/amd64` 和 `linux/arm64` 容器镜像。
+- 旧版本（`v0.3.x`、`v0.4.x`、`v0.5.0-preview.1`–`preview.4`、`v0.5.0-docker.1`–`docker.3`）已被当前版本取代；其 tag 与容器镜像标签保留，便于复现与回退。
 
 完整更新记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 

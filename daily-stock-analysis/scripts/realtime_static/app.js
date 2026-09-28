@@ -599,11 +599,7 @@ function renderTable(data, tabName) {
 }
 
 function renderMarketPanel(data) {
-  const meta = data.meta || {};
   const breadth = data.breadth || {};
-
-  document.getElementById("mp-timestamp").textContent = meta.timestamp || "-";
-  document.getElementById("mp-source").textContent = meta.source || "-";
 
   const adv = breadth.adv || 0;
   const dec = breadth.dec || 0;
@@ -788,44 +784,24 @@ function updateStatus(status) {
   document.getElementById("elapsed-time").textContent =
     status.last_run_duration ? `耗时${status.last_run_duration}s` : "";
 
-  // 下一次刷新时间
-  const nextEl = document.getElementById("next-refresh");
-  if (status.next_refresh_time) {
-    if (status.next_refresh_time === "运行中") {
-      nextEl.textContent = "刷新中…";
-      nextEl.classList.add("next-running");
-    } else if (status.next_is_trading_open) {
-      nextEl.textContent = `下次开盘: ${status.next_refresh_time.split(" ")[1] || status.next_refresh_time}`;
-      nextEl.classList.remove("next-running");
-    } else {
-      nextEl.textContent = `下次刷新: ${status.next_refresh_time.split(" ")[1] || status.next_refresh_time}`;
-      nextEl.classList.remove("next-running");
+  // 共用运行状态条：数据时点 / 数据源 / 自动刷新 / 引擎占用 / 告警旗标。
+  // 与筛选工作台同一实现、同一措辞；三个动作按钮的忙时禁用也由它决定。
+  // （原先分散在这里的「下次刷新」「行情不完整」「K线缓存」三处展示已并入状态条，
+  //   避免同一事实在页面上出现三次。）
+  SharedUI.render(document.getElementById("shared-status"), status);
+  const ownerState = SharedUI.ownerState(status);
+  for (const id of ["refresh-btn", "force-refresh-btn", "prewarm-btn"]) {
+    const btn = document.getElementById(id);
+    if (!btn) continue;
+    if (!ownerState.canStartScreening && !btn.dataset.busyLocked) {
+      btn.dataset.busyLocked = "1";
+      btn.disabled = true;
+      btn.title = ownerState.busyReason || "";
+    } else if (ownerState.canStartScreening && btn.dataset.busyLocked) {
+      delete btn.dataset.busyLocked;
+      btn.disabled = false;
+      btn.title = "";
     }
-    nextEl.style.display = "";
-  } else {
-    nextEl.textContent = "";
-    nextEl.style.display = "none";
-  }
-
-  // 行情快照完整度提示（东财部分页失败但非降级时）
-  const fwEl = document.getElementById("fetch-warn");
-  if (status.market_fetch_complete === false && !status.market_data_degraded) {
-    const fp = status.failed_pages || [];
-    fwEl.textContent = `⚠ 行情不完整(缺${fp.length}页·局部快照)`;
-    fwEl.style.display = "";
-  } else {
-    fwEl.textContent = "";
-    fwEl.style.display = "none";
-  }
-
-  const cacheEl = document.getElementById("cache-info");
-  if (status.is_prewarming) {
-    const p = status.prewarm_progress || {};
-    cacheEl.textContent = `预热 ${p.done || 0}/${p.total || 0}`;
-  } else if (status.is_running) {
-    cacheEl.textContent = "运行中";
-  } else {
-    cacheEl.textContent = status.is_trading_hours ? "交易时段" : "非交易时段";
   }
 
   // Show md path in footer
@@ -882,7 +858,20 @@ async function triggerRefresh(force = false) {
   btn.textContent = "刷新中...";
   other.textContent = "刷新中...";
   try {
-    await fetch("/api/refresh" + (force ? "?force=1" : ""), { method: "POST" });
+    const response = await fetch("/api/refresh" + (force ? "?force=1" : ""), { method: "POST" });
+    const started = await response.json();
+    if (started.status !== "started") {
+      // 被另一个入口（工作台手动任务 / 预热）占用：说明原因，不能默默返回。
+      btn.disabled = false;
+      other.disabled = false;
+      btn.textContent = force ? "强制刷新" : "立即刷新";
+      other.textContent = force ? "强制刷新" : "立即刷新";
+      SharedUI.notice(document.getElementById("action-notice"),
+        started.reason || "已有筛选任务在运行（看板自动刷新或工作台手动任务），请等它结束后再试");
+      fetchStatus();
+      return;
+    }
+    SharedUI.notice(document.getElementById("action-notice"), "");
     // Poll status until done
     const checkInterval = setInterval(async () => {
       const resp = await fetch("/api/status");
@@ -949,7 +938,16 @@ async function triggerPrewarm() {
   btn.disabled = true;
   btn.textContent = "预热中...";
   try {
-    await fetch("/api/prewarm", { method: "POST" });
+    const response = await fetch("/api/prewarm", { method: "POST" });
+    const started = await response.json();
+    if (started.status !== "started") {
+      btn.disabled = false;
+      btn.textContent = "预热K线";
+      SharedUI.notice(document.getElementById("action-notice"),
+        started.reason || "已有任务在运行（看板自动刷新或工作台手动任务），请等它结束后再试");
+      fetchStatus();
+      return;
+    }
     // Poll status until done
     const checkInterval = setInterval(async () => {
       const resp = await fetch("/api/status");

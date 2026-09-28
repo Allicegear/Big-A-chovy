@@ -122,12 +122,13 @@ $("#run-btn").addEventListener("click", async () => {
   if ($("#mode-low").checked) modes.push("low");
   if ($("#mode-watchlist").checked) modes.push("watchlist");
   if (!modes.length) { alert("请至少选择一个筛选模块"); return; }
+  // 与看板顶部同名选项保持同一极性：勾选 = 执行检查/排名，取消 = 跳过。
   const body = {
     modes,
     top: parseInt($("#top").value, 10) || 15,
     network_mode: $("#network-mode").value,
-    skip_announcements: $("#skip-announcements").checked,
-    skip_capital_ranking: $("#skip-capital").checked,
+    skip_announcements: !$("#check-announcements").checked,
+    skip_capital_ranking: !$("#rank-capital").checked,
   };
   try {
     const res = await fetchJSON("/api/wb/screen/run", {
@@ -136,14 +137,18 @@ $("#run-btn").addEventListener("click", async () => {
       body: JSON.stringify(body),
     });
     if (res.status === "started") {
+      SharedUI.notice($("#action-notice"), "");
       $("#screen-result").classList.add("hidden");
       $("#screen-summary").classList.add("hidden");
       startPolling();
     } else {
+      // 被另一个入口占用：说清原因，不能点完没反应。
       $("#job-state").textContent = res.reason || "任务已在运行中";
+      SharedUI.notice($("#action-notice"), res.reason || "有筛选任务正在运行，请稍后再试");
     }
   } catch (e) {
     $("#job-state").textContent = `启动失败: ${e.message || e}`;
+    SharedUI.notice($("#action-notice"), `启动失败：${e.message || e}`, "bad");
   }
 });
 
@@ -262,21 +267,40 @@ $("#track-btn").addEventListener("click", () => {
   });
 });
 
-/* ================= 服务器状态与时钟 ================= */
-async function ping() {
+/* ================= 服务器状态与共用运行状态条 ================= */
+async function pollSharedStatus() {
+  const el = $("#server-status");
+  let status;
   try {
-    const st = await fetchJSON("/api/status");
-    const el = $("#server-status");
-    el.textContent = "服务正常";
-    el.className = "status-badge online";
-  } catch {
-    const el = $("#server-status");
+    status = await SharedUI.fetchStatus();
+  } catch (error) {
     el.textContent = "连接断开";
     el.className = "status-badge offline";
+    return;
   }
+  el.textContent = "服务正常";
+  el.className = "status-badge online";
+  // 数据时点/数据源/自动刷新/引擎占用/告警旗标：与实时看板同一实现、同一措辞
+  SharedUI.render($("#shared-status"), status);
+
+  const state = SharedUI.ownerState(status);
+  const btn = $("#run-btn");
+  if (!state.canStartScreening && !btn.dataset.busyLocked) {
+    btn.dataset.busyLocked = "1";
+    btn.disabled = true;
+    btn.title = state.busyReason || "已有任务在运行，请稍后再试";
+  } else if (state.canStartScreening && btn.dataset.busyLocked) {
+    delete btn.dataset.busyLocked;
+    btn.disabled = false;
+    btn.title = "";
+  }
+
+  // 本次任务 vs 看板默认：把两个作用域并排说清，避免改错地方。
+  const settings = status.settings || {};
+  $("#dashboard-options-hint").textContent =
+    `看板自动刷新当前：公告检查 ${settings.skip_announcements ? "关" : "开"} · 资金排名 ${settings.skip_capital_ranking ? "关" : "开"}`;
 }
-setInterval(ping, 10000);
-ping();
+SharedUI.startPolling(pollSharedStatus, 5000);
 
 setInterval(() => {
   $("#clock").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });

@@ -16,8 +16,11 @@
   --yellow: #f9e2af;
   --yellow-bg: #2e2a1e;
   --orange: #fab387;
+  --orange-bg: #2e2418;
   --purple: #cba6f7;
+  --purple-bg: #282038;
   --teal: #94e2d5;
+  --teal-bg: #1a2826;
   --border: #45475a;
   --border-light: #585b70;
 }
@@ -89,7 +92,19 @@ main { padding: 16px; max-width: 1400px; margin: 0 auto; }
   margin-bottom: 14px;
 }
 .card h2 { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.card-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.card-head h2 { margin-bottom: 0; }
+/* 作用域标识：说明这组设置只作用于本次任务，还是持久生效 */
+.scope-chip {
+  padding: 2px 9px;
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
 .hint { color: var(--text-dim); font-size: 12px; margin-bottom: 10px; }
+.hint code { background: var(--bg-base); padding: 1px 5px; border-radius: 4px; color: var(--teal); }
 
 .form-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 8px 0; }
 .form-row.spread { justify-content: space-between; }
@@ -110,6 +125,7 @@ input.grow { flex: 1; min-width: 200px; }
 .num { width: 90px; }
 
 .toggle { cursor: pointer; user-select: none; }
+.toggle input[type="checkbox"] { accent-color: var(--blue); width: 15px; height: 15px; cursor: pointer; }
 
 .btn {
   padding: 6px 14px;

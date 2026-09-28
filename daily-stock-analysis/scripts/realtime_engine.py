@@ -121,8 +121,15 @@ def _save_kline_cache() -> None:
 
 
 def _is_entry_fresh(entry: Optional[Dict[str, Any]]) -> bool:
-    """单条缓存是否仍在 TTL 内且属于当日。"""
-    if not entry or _kline_cache_date != _today():
+    """单条缓存是否仍在 TTL 内。
+
+    只看抓取时间，不看缓存文件日期：条目是本进程写入的，天然属于当日；
+    跨日文件在 `_load_kline_cache` 已被整体丢弃。2026-09-27 修正：
+    原先这里额外要求 `_kline_cache_date == today`，而该变量只在"载入同日文件"时才被设置，
+    导致**没有同日缓存文件的进程里，所有条目永远不新鲜、缓存完全不命中**——
+    看板每轮会把全部 K 线重新拉一遍，缓存形同虚设。
+    """
+    if not entry:
         return False
     fetched_at = float(entry.get("fetched_at") or 0)
     return fetched_at > 0 and (time.time() - fetched_at) <= KLINE_CACHE_TTL
@@ -144,7 +151,8 @@ _original_fetch_kline = screen.fetch_kline
 
 def _cached_fetch_kline(code: str, *args, **kwargs):
     """Cached + adaptively rate-limited version of fetch_kline."""
-    global _kline_fetch_count, _kline_cache_hit_count, _kline_fail_count
+    global _kline_fetch_count, _kline_cache_hit_count, _kline_fail_count, _kline_cache_date
+    _kline_cache_date = _today()   # 本进程写入的条目属于当日，缓存文件日期随之为当日
 
     # 1. 命中当日且未过 TTL 的条目 — 立即返回，不占限速
     entry = _kline_cache.get(code)

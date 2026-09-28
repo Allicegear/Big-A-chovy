@@ -5,22 +5,25 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>A股实时筛选看板</title>
 <link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/common.css">
 </head>
 <body>
 
 <header class="topbar">
   <div class="topbar-left">
+    <nav class="view-switch" aria-label="视图切换">
+      <a class="vs-item current" href="/" aria-current="page">实时看板</a>
+      <a class="vs-item" href="/workbench">筛选工作台</a>
+    </nav>
     <h1>A股实时筛选看板</h1>
     <span id="market-status" class="status-badge">连接中...</span>
     <span id="last-refresh" class="meta-text"></span>
     <span id="elapsed-time" class="meta-text"></span>
-    <span id="next-refresh" class="meta-text next-refresh"></span>
-    <span id="fetch-warn" class="meta-text fetch-warn"></span>
   </div>
   <div class="topbar-right">
-    <div class="cache-info" id="cache-info" title="K线缓存统计"></div>
-    <label class="toggle"><input type="checkbox" id="skip-ann" checked> 公告检查</label>
-    <label class="toggle"><input type="checkbox" id="skip-capital" checked> 资金排序</label>
+    <span class="topbar-group-label" title="看板默认设置：保存后对每一轮自动刷新生效">看板默认</span>
+    <label class="toggle" title="关闭后公告 avoid/unknown 的一票否决门禁失效"><input type="checkbox" id="skip-ann" checked> 公告检查</label>
+    <label class="toggle" title="关闭后不做资金排名，候选按其他条件排序"><input type="checkbox" id="skip-capital" checked> 资金排名</label>
     <button id="prewarm-btn" class="btn">预热K线</button>
     <button id="refresh-btn" class="btn">立即刷新</button>
     <button id="force-refresh-btn" class="btn btn-warn">强制刷新</button>
@@ -29,17 +32,13 @@
   </div>
 </header>
 
+<div id="action-notice" class="ss-notice hidden" role="status"></div>
+
+<div class="shared-status" id="shared-status" aria-label="运行状态"></div>
+
 <div class="banner" id="snapshot-banner" style="display:none"></div>
 
 <div class="market-panel" id="market-panel">
-  <div class="mp-section">
-    <span class="mp-label">数据时间</span>
-    <span class="mp-value" id="mp-timestamp">-</span>
-  </div>
-  <div class="mp-section">
-    <span class="mp-label">数据源</span>
-    <span class="mp-value" id="mp-source">-</span>
-  </div>
   <div class="mp-section">
     <span class="mp-label">涨/跌</span>
     <span class="mp-value" id="mp-breadth">-</span>
@@ -112,6 +111,7 @@
 
 <footer class="footer" id="footer"></footer>
 
+<script src="/common.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

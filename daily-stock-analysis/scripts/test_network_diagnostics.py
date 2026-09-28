@@ -47,12 +47,16 @@ class NetworkDiagnosticsTests(unittest.TestCase):
         self.assertEqual(fetch.call_args.args[0], screen.TENCENT_KLINE_URL)
 
     def test_fetch_kline_falls_back_to_sina_when_tencent_fails(self):
-        """东财日 K 已于 2026-09-25 下线，腾讯各主机失败后直接走新浪末档。"""
+        """腾讯与东财两档都不可用时，才落到新浪末档；三档主机都要被尝试过。
+
+        2026-09-28 更新：链路改为 腾讯（主）→ 东财 push2his（备，前复权）→ 新浪（末档，不复权）。
+        东财档同日复测已恢复，因此这里把东财主机也设为失败，才是在测"末档兜底"这件事本身。
+        """
         rows = [{"day": f"2026-06-{i:02d}", "open": "10", "high": "11",
                  "low": "9.5", "close": "10.5", "volume": "1000"} for i in range(1, 71)]
 
         def fake_fetch(url, params=None, **kwargs):
-            if "gtimg" in url or "qq.com" in url:
+            if "gtimg" in url or "qq.com" in url or "push2his" in url:
                 raise NetworkUnavailable(url, {})
             return rows
 
@@ -65,6 +69,10 @@ class NetworkDiagnosticsTests(unittest.TestCase):
         tencent_hosts = {c.args[0] for c in fetch.call_args_list
                          if c.args[0].endswith("/appstock/app/fqkline/get")}
         self.assertEqual(tencent_hosts, set(screen.TENCENT_KLINE_URLS))
+        eastmoney_hosts = {c.args[0] for c in fetch.call_args_list
+                           if c.args[0] in screen.EM_KLINE_URLS}
+        self.assertEqual(eastmoney_hosts, set(screen.EM_KLINE_URLS),
+                         "东财档也必须被尝试过，否则不算'两档都不可用'")
 
     def test_tencent_kline_circuit_opens_after_repeated_failures(self):
         """连续失败后熔断腾讯日 K：避免 WAF 拦截页把一轮 76 只放大成上百次请求。"""

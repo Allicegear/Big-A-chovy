@@ -58,6 +58,23 @@ class KlineCacheTtlTests(unittest.TestCase):
             engine._cached_fetch_kline("600519")
         self.assertTrue(engine._is_entry_fresh(engine._kline_cache["600519"]))
 
+    def test_fresh_entry_is_served_without_fetch_even_without_dated_file(self):
+        """回归：缓存文件不存在（或非当日）时，本进程写入的条目仍必须能命中。
+
+        2026-09-27 修正：原先 `_is_entry_fresh` 还要求 `_kline_cache_date == today`，
+        而该变量只在载入同日文件时才被设置 → 新进程里缓存永不命中，看板每轮重拉全部 K 线。
+        """
+        engine._kline_cache_date = ""      # 模拟"没有同日缓存文件"的进程状态
+        with patch.object(engine, "_original_fetch_kline", return_value=RESULT) as fetch:
+            first = engine._cached_fetch_kline("600519")
+            second = engine._cached_fetch_kline("600519")
+            third = engine._cached_fetch_kline("600519")
+        self.assertEqual(first, RESULT)
+        self.assertEqual(second, RESULT)
+        self.assertEqual(third, RESULT)
+        self.assertEqual(fetch.call_count, 1, "同一只在 TTL 内只应取数一次")
+        self.assertEqual(engine._kline_cache_hit_count, 2)
+
     # ---------- 回归点：保存不得刷新 TTL ----------
     def test_saving_does_not_refresh_entry_ttl(self):
         engine._kline_cache["600519"] = self._entry(engine.KLINE_CACHE_TTL + 10)
