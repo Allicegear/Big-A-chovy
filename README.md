@@ -61,8 +61,12 @@ uv run --python 3.13 --with requests --with pyyaml --with tzdata python daily-st
 python3 daily-stock-analysis/scripts/web_workbench.py
 ```
 
-- 工作台：<http://localhost:8765/workbench>（一次性筛选 + 报告库 + 行情/基本面/持仓/T+1 工具箱）
+- 工作台：<http://localhost:8765/workbench>（一次性筛选 + 报告库 + 工具箱）
 - 实时看板：<http://localhost:8765/>（原版页面不变）
+
+两个页面共用同一套导航与运行状态：顶部同一组视图切换「实时看板｜筛选工作台」（同页切换、标出当前位置），下方同一条运行状态条显示**数据时点 / 数据源 / 自动刷新 / 引擎占用**，并把会影响判读的异常做成旗标（降级数据、最近快照、行情不完整、东财冷却、代理断开、**公告检查或资金排名被关闭**）。看板顶部原来分散的「数据时间 / 数据源 / 下次刷新 / 行情不完整 / K 线缓存」五处展示已收敛进这条状态条，同一事实不再重复出现。
+
+运行选项两页同名同极性：勾选=执行（`公告检查`、`资金排名`），作用域分别标注——工作台是**本次任务参数**（只影响这一次手动筛选），看板顶部是**看板默认**（持久设置，对每一轮自动刷新生效）；工作台会显示看板当前的这两个开关状态，避免改错地方。动作被占用时不静默，会在页面内提示原因（例如「看板自动刷新正在运行」）。
 
 Web 工作台默认只监听本机，避免报告、持仓和决策快照被局域网读取。确实需要手机或其他电脑访问时，显式运行：
 
@@ -234,10 +238,9 @@ python3 tools/verify_t1.py 20260824
 
 影子验证只用于模拟数据统计，不能直接转化为真实仓买入依据：
 
-```bash
-# 更新四类影子样本并输出进度
-python3 tools/shadow_tracker.py --date 20260824
+> ⚠️ **样本保全警告**：当前 `shadow_tracker.py` 每次扫描都会重建三类核心样本，而不带日期的报告查找只取最新一天；无参数或带 `--date` 运行都可能丢掉历史样本。修复并验证全历史增量累积前，禁止用它更新样本；`--report` 仅用于只读查看。线下反馈提到的 `shadow_sample.py` 和 `每日收盘.bat` 不在当前工作副本中，先同步并核实后再使用。
 
+```bash
 # 只查看当前进度
 python3 tools/shadow_tracker.py --report
 
@@ -319,7 +322,7 @@ git diff --cached --name-only
 3. 需要诊断单一路径时，可用 `--network-mode direct` 或 `--network-mode proxy`；正常使用建议保留 `auto`。
 4. 看板无法连接时，确认 `8765` 端口没有被旧进程占用，并运行停止脚本后重新启动。
 5. 行情接口部分失败时，不要把降级结果当成完整实时结果；优先等待网络恢复。
-6. 当前筛选列表、基本面查询和实时 1 分钟趋势分别使用东财 `push2/webguest` 的 `clist`、`ulist.np`、`stock/get`、`trends2` 路由；日 K 在三个腾讯主机间故障转移（`ifzq.gtimg.cn`、`proxy.finance.qq.com`、`web.ifzq.gtimg.cn`，2026-09-26 实测最后一个被 WAF 拦截而前两个正常），全部失败才降级到新浪（可能不复权）；东财日 K 接口已于 2026-09-25 下线，不再作为数据源。报告头部的「来源」按本轮实际来源生成。可用 `python3 tools/verify_em_webguest.py` 对比标准入口、`/webguest` 路由和 K 线降级路径。
+6. 当前筛选列表、基本面查询和实时 1 分钟趋势分别使用东财 `push2/webguest` 的 `clist`、`ulist.np`、`stock/get`、`trends2` 路由。**日 K 按三档依次下沉：腾讯前复权（`ifzq.gtimg.cn` / `proxy.finance.qq.com` / `web.ifzq.gtimg.cn`，带连续失败熔断）→ 东财 `push2his` 前复权（`klt=101&fqt=1`，另有数字子域）→ 新浪（末档，可能不复权且可能缺当日 bar）**。前两档来自不同厂商，因此互相兜底：腾讯被 WAF 拦截时由东财顶上，东财被限流/封禁时由腾讯顶上。2026-09-28 复测：东财日 K 已恢复可用且为前复权（与腾讯同日收盘差 ≤0.2%），沪深主板/创业板/科创板/北交所均返回。降级不会被静默掩盖——报告头部「来源」按本轮实际来源生成，报告警告逐轮报出「本轮 N 只来自新浪」以及其中多少只**与前复权基准的日期或收盘不一致**（偏差 >1%；基准由前两档的成功结果维护）。同日实测：腾讯整链故障约 47 分钟期间走新浪，与前复权基准收盘差 1.4%–2.7%、5 日涨幅差最多 2.2 倍，超短池被压掉约一半。可用 `python3 tools/verify_em_webguest.py` 对比标准入口、`/webguest` 路由和 K 线降级路径。
 7. 请求频率、限流参数，以及「限流」与「路径下线」的区分方法见 [`docs/东财请求频率与限流.md`](docs/东财请求频率与限流.md)。
 
 ## 七、开发和测试
@@ -363,12 +366,14 @@ python3 -m unittest discover -s daily-stock-analysis/scripts -p 'test_*.py'
 - `Sol xhigh`：当前自动复盘模型。
 - `Ox Alpha`：测试中，主要在深夜使用。
 
-## 九、已知问题与待改进
+## 九、问题与改进跟踪
 
-以下问题已知存在，后续需要通过 Agent 修改代码或启动配置解决：
+本节跟踪工程和运维问题。已完成项保留背景与验证状态，不再当作待办；交易规则的实验与待验证项见《选股框架》第六节。
 
-1. **筛选结果保存路径**：已修复。GUI、实时看板和 `.command` 失败回退路径均基于项目根目录解析，克隆到其他位置后可直接运行；命令行 `--save` 仍可按使用者需要指定路径。
-2. **网络路径（已代码内实测择优，2026-09-09；同日方案 C 增强）**：`daily-stock-analysis/scripts/network_path.py` 对「直连 + 本机候选代理端口（软件无关）+ 环境代理 + 系统代理」并发实测真实东财接口延迟，按实际可用路径择优；不预设代理或直连优先，路径失败后会重测。看板不再因无代理而放弃筛选；诊断运行 `python3 daily-stock-analysis/scripts/network_path.py`。
+### 已完成或持续观察
+
+1. **筛选结果保存路径（已修复）**：GUI、实时看板和 `.command` 失败回退路径均基于项目根目录解析，克隆到其他位置后可直接运行；命令行 `--save` 仍可按使用者需要指定路径。
+2. **网络路径自动择优（已实现，盘中高峰稳定性待观察）**：`daily-stock-analysis/scripts/network_path.py` 对「直连 + 本机候选代理端口（软件无关）+ 环境代理 + 系统代理」并发实测真实东财接口延迟，按实际可用路径择优；不预设代理或直连优先，路径失败后会重测。诊断运行 `python3 daily-stock-analysis/scripts/network_path.py`。
    - **前提**：本机若开启代理的 TUN / Fake-IP 模式，「直连」与「代理」实际是同一出口，该择优退化为网络健康探测（自查方法见「十三、容易踩的坑」第 1 条）。
    - **配置唯一来源**：`daily-stock-analysis/scripts/proxy_ports.json` 的 `candidate_ports`，`network_path.py` 与 `keep_proxy_alive.sh` 读同一份——**换代理软件只改这一处**。
    - **多端点探测**：主端点使用筛选器实际采用的 `push2/webguest` 列表路由；辅助端点检查 `82.push2/webguest` 与 `push2his` K 线。不通的辅助端点只记降级 + 排序惩罚，不一票否决。
@@ -377,7 +382,13 @@ python3 -m unittest discover -s daily-stock-analysis/scripts -p 'test_*.py'
    - 「太慢」判定用主端点实测延迟，不用含惩罚的评分（否则降级惩罚会把所有路径误判成太慢）。
    - 测试：`scripts/test_network_path.py`（29 个用例，覆盖枚举/验活/降级/粘性/缓存/熔断/配置回退）。
    - 历史坑：旧版脚本硬编码 7897 并 `open -a "Clash Verge"`，会与新代理软件争夺系统代理、关掉 Verge 就断网。
-   - 2026-09-08 实测行情接口直连可达（0.08~0.2s），旧结论"直连会被封锁"已不成立。盘中高峰稳定性仍待验证。
+   - 2026-09-08 实测行情接口直连可达（0.08~0.2s），旧结论"直连会被封锁"已不成立。
+3. **Windows 报告目录名提取（本地修补，待 Windows 复验）**：`tools/scan_reports.py` 和 `tools/track_stock.py` 原先用 `split('/')[-2]`，在 Windows 反斜杠路径上会触发 `IndexError`；当前工作副本已改为 `os.path.basename(os.path.dirname(...))`。线下反馈报告该补丁可正常扫描 88 份报告；本环境未重复运行验证。
+
+### 待处理
+
+1. **工作台的网络前置检查可能跳过新浪全市场备用（2026-09-28 记录）**：`a_share_daily_screen.fetch_market()` 已有新浪备用；但 `realtime_dashboard.ScreeningScheduler.run_screening()` 在 `network_path.has_working_path()` 为假时会提前返回并保留旧快照，不调用筛选引擎。若东财探测全失败、但新浪仍可用，已有备用逻辑可能到不了。修复目标：全网断开时继续快速失败；东财路径不可用但新浪可达时，仍允许进入备用行情流程，并在结果中明确标注降级。待下一个交易时段做真实联调；盘后可先用模拟/受控故障场景验证。
+2. **影子样本扫描会丢失历史累计（线下反馈，2026-09-28）**：`tools/shadow_tracker.py:scan_and_update()` 每次都把 `coalition`、`breakout`、`sector_boost` 三类样本先重建为空；`get_report_files(reports_dir, None)` 又只返回最新一天的报告。每天执行扫描会让样本只剩当天内容，20 样本验证门槛无法累计，已有结算也可能丢失。修复目标是遍历历史报告并按样本键增量合并，同时保持原有业务规则函数不变。修复验证前禁止直接运行 `python3 tools/shadow_tracker.py` 或带 `--date` 扫描；`--report` 只读。当前工作副本没有线下反馈提到的 `shadow_sample.py` / `每日收盘.bat`，临时绕行方案需先同步确认。
 
 ## 十、内置 Skill
 

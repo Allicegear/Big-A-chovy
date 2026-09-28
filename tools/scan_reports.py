@@ -308,7 +308,7 @@ def scan_day(date_str: Optional[str] = None, top_n_latest: int = 0):
     if top_n_latest > 0:
         files = files[-top_n_latest:]
 
-    print(f"=== 正在扫描 {len(files)} 份筛选报告 ({files[0].split('/')[-2]}) ===")
+    print(f"=== 正在扫描 {len(files)} 份筛选报告 ({os.path.basename(os.path.dirname(files[0]))}) ===")
     
     all_passed_history = {}  # code -> [times]
     last_res = None
