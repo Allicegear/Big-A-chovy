@@ -422,11 +422,15 @@ def _tool_track(code: str, date: str | None) -> dict:
     return {"text": _capture_stdout(track_stock_timeline, code, date)}
 
 
-def _tool_financials(code: str) -> dict:
+def _tool_financials(code: str, date: str | None = None) -> dict:
     from tools.query_financials import query_financial_profile
     if not code:
         return {"error": "缺少 code 参数"}
-    return query_financial_profile(code)
+    result = query_financial_profile(code)
+    if date:
+        result["requested_as_of"] = date
+        result.setdefault("warnings", []).append("财务接口返回最新披露与当前估值快照，不支持按观察日回溯；报告期请以 report_period/published_at 核对")
+    return result
 
 
 _TICK_SOURCE = None
@@ -436,14 +440,24 @@ _SENTIMENT_SOURCE = None
 _CALENDAR_SOURCE = None
 
 
-def _tool_ticks(code: str, *, force: bool = False, max_pages: int = 300) -> dict:
+def _tool_ticks(code: str, *, date: str | None = None, force: bool = False, max_pages: int = 300) -> dict:
     global _TICK_SOURCE
     if not code:
         return {"error": "缺少 code 参数"}
+    if date and date != datetime.now().date().isoformat():
+        return {
+            "status": "unsupported",
+            "source": "tencent_ticks",
+            "data_date": date,
+            "warnings": ["腾讯分笔适配器只支持当前交易日，不能把实时分笔伪装成历史观察日证据"],
+        }
     from tools.data_sources.tencent import TencentTickSource
     if _TICK_SOURCE is None:
         _TICK_SOURCE = TencentTickSource()
-    return _TICK_SOURCE.fetch(code, force=force, max_pages=max(1, min(int(max_pages), 300))).to_dict()
+    result = _TICK_SOURCE.fetch(code, force=force, max_pages=max(1, min(int(max_pages), 300))).to_dict()
+    if date:
+        result["requested_as_of"] = date
+    return result
 
 
 def _tool_context(code: str, topic: str, *, date: str | None = None, force: bool = False, limit: int = 20, contract: str | None = None) -> dict:
@@ -627,14 +641,14 @@ class WorkbenchHandler(dash.DashboardHandler):
         elif path == "/api/wb/track":
             self._serve_json(_tool_track(g1("code"), g1("date") or None))
         elif path == "/api/wb/financials":
-            self._serve_json(_tool_financials(g1("code")))
+            self._serve_json(_tool_financials(g1("code"), g1("date") or None))
         elif path == "/api/wb/ticks":
             try:
                 max_pages = i1("max_pages", 300, 1, 300)
             except ValueError as exc:
                 self._serve_json({"status": "unsupported", "error": str(exc)}, status=400)
                 return True
-            self._serve_json(_tool_ticks(g1("code"), force=g1("force") in ("1", "true"), max_pages=max_pages))
+            self._serve_json(_tool_ticks(g1("code"), date=g1("date") or None, force=g1("force") in ("1", "true"), max_pages=max_pages))
         elif path == "/api/wb/context":
             topic = g1("topic")
             from tools.data_sources.context import CONTEXT_TOPICS

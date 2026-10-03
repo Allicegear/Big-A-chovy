@@ -33,6 +33,7 @@ def _number(value: Any, field: str) -> float:
 
 
 def _time_seconds(value: str) -> int:
+    value = str(value or "").strip()
     if re.fullmatch(r"\d{6}", value):
         value = f"{value[:2]}:{value[2:4]}:{value[4:]}"
     if not re.fullmatch(r"\d{2}:\d{2}:\d{2}", value):
@@ -41,6 +42,28 @@ def _time_seconds(value: str) -> int:
     if h > 23 or m > 59 or s > 59:
         raise ValueError(f"分笔时间无效: {value!r}")
     return h * 3600 + m * 60 + s
+
+
+def _validate_raw_tick_rows(rows: Iterable[dict[str, Any]], *, first_page: bool = False) -> list[str]:
+    """Check provider order before the merge-by-sequence step can hide it."""
+    materialized = list(rows)
+    warnings: list[str] = []
+    if not materialized:
+        return warnings
+    seqs = [int(row["seq"]) for row in materialized]
+    if len(seqs) != len(set(seqs)):
+        warnings.append("分笔原始序号重复")
+    if any(current < previous for previous, current in zip(seqs, seqs[1:])):
+        warnings.append("分笔原始序号倒退")
+    previous_seconds: int | None = None
+    for row in materialized:
+        seconds = _time_seconds(str(row.get("time") or ""))
+        if previous_seconds is not None and seconds < previous_seconds:
+            warnings.append("分笔原始时间倒退")
+        previous_seconds = seconds
+    if first_page and min(seqs) > 1 and _time_seconds(str(materialized[0].get("time") or "")) <= _time_seconds(SESSION_END):
+        warnings.append(f"连续竞价缺序号 1–{min(seqs) - 1}")
+    return list(dict.fromkeys(warnings))
 
 
 def parse_snapshot(text: str, symbol: str) -> dict[str, Any]:
@@ -131,7 +154,8 @@ def aggregate_ticks(rows: Iterable[dict[str, Any]], *, window_minutes: int = 5, 
             "data_sufficient": False,
             "reason": "连续竞价窗口没有有效分笔",
         }
-    latest = max(_time_seconds(as_of), prepared[-1][0]) if as_of else prepared[-1][0]
+    as_of_seconds = _time_seconds(as_of) if as_of else prepared[-1][0]
+    latest = max(as_of_seconds, prepared[-1][0])
     cutoff = latest - max(1, int(window_minutes)) * 60
     selected = [row for seconds, row in prepared if cutoff <= seconds <= latest]
     buy = sum(float(row.get("amount") or 0) for row in selected if row.get("side") == "B")
@@ -139,18 +163,25 @@ def aggregate_ticks(rows: Iterable[dict[str, Any]], *, window_minutes: int = 5, 
     neutral = sum(float(row.get("amount") or 0) for row in selected if row.get("side") == "M")
     selected_times = [_time_seconds(str(row["time"])) for row in selected]
     coverage = ((max(selected_times) - min(selected_times)) / 60.0) if len(selected_times) > 1 else 0.0
+    # A 5-minute live window can be accepted with the provider's one-minute
+    # minimum observation, while a 15-minute window must cover materially
+    # more than one minute.  The old ``min(window_minutes, 1)`` rule made both
+    # windows equivalent and allowed a single-minute sample to pass 15m.
+    required_coverage = 1.0 if int(window_minutes) <= 5 else max(5.0, float(window_minutes) * 0.5)
+    sufficient = coverage >= required_coverage
     return {
         "window_minutes": int(window_minutes),
         "as_of": as_of or selected[-1].get("time"),
         "row_count": len(selected),
         "coverage_minutes": round(coverage, 2),
+        "required_coverage_minutes": required_coverage,
         "buy_amount": round(buy, 2),
         "sell_amount": round(sell, 2),
         "neutral_amount": round(neutral, 2),
         "net_amount": round(buy - sell, 2),
         "buy_sell_ratio": round(buy / sell, 4) if sell > 0 else None,
-        "data_sufficient": coverage >= min(float(window_minutes), 1.0),
-        "reason": "" if coverage >= min(float(window_minutes), 1.0) else "窗口覆盖不足",
+        "data_sufficient": sufficient,
+        "reason": "" if sufficient else f"窗口覆盖不足（{coverage:.2f} / {required_coverage:.2f} 分钟）",
     }
 
 
@@ -208,6 +239,7 @@ class TencentTickSource:
             # gap when page sizes are exactly 70.
             rows = [row for row in base_rows if int(row.get("seq", -1)) <= start_page * 70] if cached else []
             missing_seq: list[int] = []
+            integrity_warnings: list[str] = []
             complete = False
             page = start_page
             for _ in range(max(1, int(max_pages))):
@@ -216,6 +248,7 @@ class TencentTickSource:
                     complete = True
                     next_page = page
                     break
+                integrity_warnings.extend(_validate_raw_tick_rows(page_rows, first_page=(page == 0)))
                 rows = self._merge_rows(rows, page_rows)
                 page += 1
                 if self.sleep_seconds:
@@ -224,7 +257,7 @@ class TencentTickSource:
                 return result_error(ResultStatus.PARTIAL, source=TICK_SOURCE, source_url=TICK_URL, code="page_limit", message=f"翻页超过 {max_pages} 页，结果不完整", data={"rows": rows})
 
             if not rows:
-                status = ResultStatus.EMPTY if snapshot["as_of"] < "092500" else ResultStatus.PARTIAL
+                status = ResultStatus.EMPTY if _time_seconds(snapshot["as_of"]) < _time_seconds("09:25:00") else ResultStatus.PARTIAL
                 return Result(
                     status=status,
                     data={"code": symbol.code, "symbol": symbol.tencent, "rows": [], "windows": {}},
@@ -240,10 +273,10 @@ class TencentTickSource:
             # Validate sequence and time order.  Gaps after the continuous
             # auction are recorded, not treated as a missing live transaction.
             ordered = sorted(rows, key=lambda row: int(row["seq"]))
-            warnings: list[str] = []
+            warnings: list[str] = list(integrity_warnings)
             seen: set[int] = set()
-            last_time = ""
-            expected = int(ordered[0]["seq"])
+            last_time_seconds: int | None = None
+            expected = 1
             for row in ordered:
                 seq = int(row["seq"])
                 if seq in seen:
@@ -251,18 +284,23 @@ class TencentTickSource:
                 seen.add(seq)
                 if seq > expected:
                     gap = list(range(expected, seq))
-                    if str(row["time"]) <= SESSION_END:
+                    if _time_seconds(str(row["time"])) <= _time_seconds(SESSION_END):
                         warnings.append(f"连续竞价缺序号 {gap[0]}–{gap[-1]}")
                     else:
                         missing_seq.extend(gap)
-                if last_time and _time_seconds(str(row["time"])) < _time_seconds(last_time):
+                current_time_seconds = _time_seconds(str(row["time"]))
+                if last_time_seconds is not None and current_time_seconds < last_time_seconds:
                     warnings.append("分笔时间倒退")
                 expected = seq + 1
-                last_time = str(row["time"])
+                last_time_seconds = current_time_seconds
 
-            continuous = [row for row in ordered if "09:30:00" <= str(row["time"]) <= SESSION_END]
+            continuous = [
+                row for row in ordered
+                if _time_seconds(str(row["time"])) >= _time_seconds("09:30:00")
+                and _time_seconds(str(row["time"])) <= _time_seconds(SESSION_END)
+            ]
             continuous_amount = sum(float(row.get("amount") or 0) for row in continuous)
-            if verify_amount and snapshot["amount"] > 0 and snapshot["as_of"] >= "15:01:00":
+            if verify_amount and snapshot["amount"] > 0 and _time_seconds(snapshot["as_of"]) >= _time_seconds("15:01:00"):
                 tolerance = snapshot["amount"] * 0.001 + 1000
                 if abs(continuous_amount - snapshot["amount"]) > tolerance:
                     warnings.append(
@@ -282,10 +320,12 @@ class TencentTickSource:
                 "snapshot_amount": snapshot["amount"],
                 "missing_seq": sorted(set(missing_seq)),
                 "windows": windows,
+                "integrity_warnings": list(dict.fromkeys(warnings)),
                 "note": "腾讯约3秒聚合分笔，不是交易所 Level-2 原始逐笔委托/成交",
             }
             self.cache.set(cache_key, {"data_date": snapshot["data_date"], "rows": ordered, "next_page": next_page, "complete": complete}, ttl=24 * 3600, data_date=snapshot["data_date"])
-            if any("连续竞价缺序号" in warning or "时间倒退" in warning for warning in warnings):
+            warnings = list(dict.fromkeys(warnings))
+            if warnings:
                 status = ResultStatus.PARTIAL
             else:
                 status = ResultStatus.OK

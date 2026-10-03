@@ -9,7 +9,7 @@ import json
 import re
 from typing import Any
 
-from .cache import JsonCache
+from .cache import JsonCache, coalesced_fetch, result_cache_value, result_from_cache
 from .contracts import Result, ResultStatus, result_empty, result_error, result_ok
 from .events import DATACENTER_URL
 from .http import HTTPClient, HTTPClientError
@@ -139,10 +139,14 @@ def parse_theme_payload(payload: Mapping[str, Any], *, code: str) -> list[dict[s
     rows = _rows_from_json(payload, keys=("diff", "data", "list"))
     output = []
     for item in rows:
-        item_code = str(_first(item, ("f12", "code", "SECURITY_CODE")) or "")
-        if item_code and item_code != code:
+        # In the theme endpoint f12 is commonly a board identity such as
+        # BK1001, not the requested security.  Keep the two identities
+        # separate; only explicit security fields are eligible for filtering.
+        item_code = str(_first(item, ("SECURITY_CODE", "stockCode", "secuCode")) or "")
+        if item_code and item_code.zfill(6) != code:
             continue
-        output.append({"code": code, "concept": _first(item, ("conceptName", "f14", "name", "concept")), "concept_id": _first(item, ("conceptId", "bk", "f12")), "hit": _first(item, ("hitCount", "hit")), "source": "eastmoney_stock_themes", "raw": dict(item)})
+        board_code = _first(item, ("boardCode", "bk", "f12"))
+        output.append({"code": code, "identity_type": "board", "board_code": board_code, "concept": _first(item, ("conceptName", "f14", "name", "concept")), "concept_id": _first(item, ("conceptId", "bk", "f12")), "hit": _first(item, ("hitCount", "hit")), "source": "eastmoney_stock_themes", "raw": dict(item)})
     return output
 
 
@@ -207,24 +211,45 @@ def parse_sse_interaction_html(text: str, *, code: str) -> list[dict[str, Any]]:
     return output
 
 
-def normalize_dragon_tiger(records: Iterable[Mapping[str, Any]], buys: Iterable[Mapping[str, Any]], sells: Iterable[Mapping[str, Any]], *, code: str, source_url: str = DATACENTER_URL) -> dict[str, Any]:
+def normalize_dragon_tiger(records: Iterable[Mapping[str, Any]], buys: Iterable[Mapping[str, Any]], sells: Iterable[Mapping[str, Any]], *, code: str, as_of: str | None = None, source_url: str = DATACENTER_URL) -> dict[str, Any]:
+    def row_date(item: Mapping[str, Any]) -> str | None:
+        return _date(_first(item, ("TRADE_DATE", "BILLBOARD_DATE", "date", "DATE")))
+
+    normalized_records = []
+    record_keys: set[tuple[Any, ...]] = set()
+    record_dates: set[str] = set()
+    for item in records:
+        item_code = str(_first(item, ("SECURITY_CODE", "code")) or code)
+        if item_code.zfill(6) != code:
+            raise ValueError(f"龙虎榜返回其他证券: {item_code}")
+        trade_date = row_date(item)
+        if as_of and trade_date and trade_date[:10] > as_of:
+            continue
+        if as_of and not trade_date:
+            continue
+        key = (trade_date, _first(item, ("EXPLANATION", "reason")), _first(item, ("BILLBOARD_NET_AMT", "net_buy")))
+        if key in record_keys:
+            continue
+        record_keys.add(key)
+        if trade_date:
+            record_dates.add(trade_date[:10])
+        normalized_records.append({"code": code, "date": trade_date, "reason": _first(item, ("EXPLANATION", "reason")), "net_buy": _first(item, ("BILLBOARD_NET_AMT", "net_buy")), "turnover": _first(item, ("TURNOVERRATE", "turnover")), "source": "eastmoney_dragon_tiger", "raw": dict(item)})
+
     def normalize_seats(rows: Iterable[Mapping[str, Any]], side: str) -> list[dict[str, Any]]:
         unique: dict[str, dict[str, Any]] = {}
         for item in rows:
             name = str(_first(item, ("OPERATEDEPT_NAME", "seat", "name")) or "").strip()
             if not name:
                 continue
-            unique[name] = {"name": name, "side": side, "buy_amount": _first(item, ("BUY", "buy_amt")), "sell_amount": _first(item, ("SELL", "sell_amt")), "net_amount": _first(item, ("NET", "net")), "seat_code": _first(item, ("OPERATEDEPT_CODE", "seat_code")), "raw": dict(item)}
+            seat_date = row_date(item)
+            if as_of and (not seat_date or (record_dates and seat_date[:10] not in record_dates)):
+                continue
+            unique_key = f"{seat_date or ''}|{name}|{side}"
+            unique[unique_key] = {"name": name, "date": seat_date, "side": side, "buy_amount": _first(item, ("BUY", "buy_amt")), "sell_amount": _first(item, ("SELL", "sell_amt")), "net_amount": _first(item, ("NET", "net")), "seat_code": _first(item, ("OPERATEDEPT_CODE", "seat_code")), "raw": dict(item)}
         return list(unique.values())
     buy_rows, sell_rows = normalize_seats(buys, "buy"), normalize_seats(sells, "sell")
     buy_names, sell_names = {row["name"] for row in buy_rows}, {row["name"] for row in sell_rows}
-    normalized_records = []
-    for item in records:
-        item_code = str(_first(item, ("SECURITY_CODE", "code")) or code)
-        if item_code != code:
-            raise ValueError(f"龙虎榜返回其他证券: {item_code}")
-        normalized_records.append({"code": code, "date": _date(_first(item, ("TRADE_DATE", "date"))), "reason": _first(item, ("EXPLANATION", "reason")), "net_buy": _first(item, ("BILLBOARD_NET_AMT", "net_buy")), "turnover": _first(item, ("TURNOVERRATE", "turnover")), "source": "eastmoney_dragon_tiger", "raw": dict(item)})
-    return {"code": code, "records": normalized_records, "seats": {"buy": buy_rows[:5], "sell": sell_rows[:5], "overlap": sorted(buy_names & sell_names)}, "institution": {"buy": [row for row in buy_rows if str(row.get("seat_code")) == "0"], "sell": [row for row in sell_rows if str(row.get("seat_code")) == "0"]}, "source": "eastmoney_dragon_tiger", "source_url": source_url, "note": "单日/多日榜按源记录保留；买卖重叠席位不重复累计，不把席位名称映射成游资身份"}
+    return {"code": code, "records": normalized_records, "record_dates": sorted(record_dates, reverse=True), "seats": {"buy": buy_rows[:5], "sell": sell_rows[:5], "overlap": sorted(buy_names & sell_names)}, "institution": {"buy": [row for row in buy_rows if str(row.get("seat_code")) == "0"], "sell": [row for row in sell_rows if str(row.get("seat_code")) == "0"]}, "source": "eastmoney_dragon_tiger", "source_url": source_url, "as_of": as_of, "note": "按交易日期截止 as_of；席位只与同一上榜交易日关联，买卖重叠席位不重复累计，不把席位名称映射成未经核实的游资身份"}
 
 
 def parse_commodity_payload(text: str, *, contract: str, source_url: str = SINA_HQ_URL) -> dict[str, Any]:
@@ -336,7 +361,7 @@ class ContextSource:
         urls = []
         configs = [("RPT_DAILYBILLBOARD_DETAILSNEW", "records"), ("RPT_BILLBOARD_DAILYDETAILSBUY", "buy"), ("RPT_BILLBOARD_DAILYDETAILSSELL", "sell")]
         for report, kind in configs:
-            response = self.client.get(DATACENTER_URL, params={"reportName": report, "columns": "ALL", "source": "WEB", "client": "WEB", "filter": f'(SECURITY_CODE="{symbol.code}")', "pageNumber": "1", "pageSize": str(min(limit, 100)), "sortColumns": "TRADE_DATE", "sortTypes": "-1"}, headers={"Referer": "https://data.eastmoney.com/"}, retries=1)
+            response = self.client.get(DATACENTER_URL, params={"reportName": report, "columns": "ALL", "source": "WEB", "client": "WEB", "filter": f'(SECURITY_CODE="{symbol.code}")(TRADE_DATE<\'={as_of}\')', "pageNumber": "1", "pageSize": str(min(limit, 100)), "sortColumns": "TRADE_DATE", "sortTypes": "-1"}, headers={"Referer": "https://data.eastmoney.com/"}, retries=1)
             urls.append(response.url)
             rows = _rows_from_json(response.json(), keys=("data",))
             if kind == "records":
@@ -345,8 +370,10 @@ class ContextSource:
                 buy = rows
             else:
                 sell = rows
-        data = normalize_dragon_tiger(records, buy, sell, code=symbol.code, source_url=urls[0] if urls else DATACENTER_URL)
-        return self._result("dragon_tiger", symbol.code, data, source_url=urls[0] if urls else DATACENTER_URL, data_date=as_of, status=ResultStatus.OK if records else ResultStatus.EMPTY)
+        data = normalize_dragon_tiger(records, buy, sell, code=symbol.code, as_of=as_of, source_url=urls[0] if urls else DATACENTER_URL)
+        actual_date = max(data.get("record_dates") or [], default=None)
+        warnings = [] if actual_date else ["龙虎榜没有可确认的历史上榜交易日；不能把请求日期当作数据日期"]
+        return self._result("dragon_tiger", symbol.code, data, source_url=urls[0] if urls else DATACENTER_URL, data_date=actual_date, status=ResultStatus.OK if data.get("records") else ResultStatus.EMPTY, warnings=warnings)
 
     def _commodity(self, *, contract: str | None, code: str, as_of: str | None) -> Result:
         chosen = self.commodity_map.get(contract or "copper") if (contract or "copper") in self.commodity_map else next((value for value in self.commodity_map.values() if value.get("contract") == contract), None)
@@ -358,6 +385,7 @@ class ContextSource:
         row["display_name"] = chosen.get("name")
         return self._result("commodity", code, row, source_url=response.url, data_date=as_of)
 
+    @coalesced_fetch("context")
     def fetch(self, code: str, *, topic: str, as_of: str | None = None, force: bool = False, limit: int = 20, contract: str | None = None) -> Result:
         if topic not in CONTEXT_TOPICS:
             return result_error(ResultStatus.UNSUPPORTED, source=CONTEXT_SOURCE, source_url="", code="unsupported_topic", message=f"topic 必须是: {', '.join(CONTEXT_TOPICS)}")
@@ -371,15 +399,17 @@ class ContextSource:
         key = self.cache.key({"code": symbol.code, "market": symbol.market, "topic": topic, "as_of": as_of, "limit": limit, "contract": contract})
         if not force:
             cached = self.cache.get(key, ttl=self.cache_ttl)
-            if cached and isinstance(cached.value, dict):
-                return Result(status=cached.value.get("status", "ok"), data=cached.value.get("data"), source=cached.value.get("source", CONTEXT_SOURCE), source_url=cached.value.get("source_url", ""), data_date=as_of, freshness="cached", warnings=cached.value.get("warnings") or [], cache={"hit": True})
+            restored = result_from_cache(cached.value, default_source=CONTEXT_SOURCE, default_source_url="") if cached else None
+            if restored is not None:
+                return restored
         try:
             result = self._fetch_topic(symbol, topic, as_of=as_of, limit=limit, contract=contract)
         except HTTPClientError as exc:
-            return result_error(ResultStatus.UNAVAILABLE, source=CONTEXT_SOURCE, source_url="", code=exc.code, message=str(exc), retryable=exc.retryable)
+            result = result_error(ResultStatus.UNAVAILABLE, source=CONTEXT_SOURCE, source_url="", code=exc.code, message=str(exc), retryable=exc.retryable, data_date=as_of, as_of=as_of)
         except (TypeError, ValueError, KeyError, IndexError) as exc:
-            return result_error(ResultStatus.UNAVAILABLE, source=CONTEXT_SOURCE, source_url="", code="malformed_or_unavailable", message=str(exc), retryable=True)
-        cache_value = {"status": result.status, "data": result.data, "source": result.source, "source_url": result.source_url, "warnings": result.warnings}
-        if result.status in {ResultStatus.OK.value, ResultStatus.EMPTY.value}:
-            self.cache.set(key, cache_value, ttl=self.cache_ttl, data_date=as_of)
+            result = result_error(ResultStatus.UNAVAILABLE, source=CONTEXT_SOURCE, source_url="", code="malformed_or_unavailable", message=str(exc), retryable=True, data_date=as_of, as_of=as_of)
+        if result.status in {ResultStatus.OK.value, ResultStatus.EMPTY.value, ResultStatus.PARTIAL.value, ResultStatus.STALE.value}:
+            self.cache.set(key, result_cache_value(result), ttl=self.cache_ttl, data_date=as_of)
+        elif result.status == ResultStatus.UNAVAILABLE.value:
+            self.cache.set(key, result_cache_value(result), ttl=min(self.cache_ttl, 30), data_date=as_of)
         return result

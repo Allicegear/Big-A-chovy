@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 import math
 from typing import Any
 
-from .cache import JsonCache
+from .cache import JsonCache, coalesced_fetch, result_cache_value, result_from_cache
 from .contracts import Result, ResultStatus, result_empty, result_error, result_ok
 from .http import HTTPClient, HTTPClientError
 from .symbols import validate_ymd
@@ -173,11 +173,13 @@ def calculate_market_sentiment(rows: Sequence[Mapping[str, Any]], *, as_of: str 
 class EastmoneySentimentSource:
     """Low-frequency pool fetcher; failed pools are reported independently."""
 
-    def __init__(self, client: HTTPClient | None = None, *, cache: JsonCache | None = None, cache_ttl: int = 90):
+    def __init__(self, client: HTTPClient | None = None, *, cache: JsonCache | None = None, cache_ttl: int = 90, request_timeout: float = 10.0):
         self.client = client or HTTPClient()
         self.cache = cache or JsonCache("eastmoney_sentiment")
         self.cache_ttl = max(30, int(cache_ttl))
+        self.request_timeout = max(0.5, float(request_timeout))
 
+    @coalesced_fetch("sentiment")
     def fetch(self, data_date: str | None = None, *, force: bool = False, page_size: int = 1000) -> Result:
         if data_date is None:
             data_date = datetime.now(BEIJING).date().isoformat()
@@ -188,14 +190,15 @@ class EastmoneySentimentSource:
         key = self.cache.key({"date": data_date, "page_size": page_size})
         if not force:
             cached = self.cache.get(key, ttl=self.cache_ttl)
-            if cached and isinstance(cached.value, dict):
-                return Result(status=ResultStatus.OK, data=cached.value, source=SENTIMENT_SOURCE, source_url=SENTIMENT_BASE, data_date=data_date, freshness="cached", cache={"hit": True})
+            restored = result_from_cache(cached.value, default_source=SENTIMENT_SOURCE, default_source_url=SENTIMENT_BASE) if cached else None
+            if restored is not None:
+                return restored
         pools: dict[str, list[dict[str, Any]]] = {}
         errors: list[str] = []
         urls: dict[str, str] = {}
         for pool_kind, url in POOL_URLS.items():
             try:
-                response = self.client.get(url, params={"ut": "7eea3edcaed734bea9c7b7a7f85d5b38", "dpt": "wz.ztzt", "pageindex": "1", "pagesize": str(page_size), "sort": "fbt:asc", "date": data_date.replace("-", "")}, headers={"Referer": "https://quote.eastmoney.com/"}, retries=1)
+                response = self.client.get(url, params={"ut": "7eea3edcaed734bea9c7b7f85d5b38", "dpt": "wz.ztzt", "pageindex": "1", "pagesize": str(page_size), "sort": "fbt:asc", "date": data_date.replace("-", "")}, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=self.request_timeout, retries=1)
                 pools[pool_kind] = parse_sentiment_pool_payload(response.json(), pool_kind=pool_kind, data_date=data_date)
                 urls[pool_kind] = response.url
             except HTTPClientError as exc:
@@ -203,13 +206,15 @@ class EastmoneySentimentSource:
             except (TypeError, ValueError, KeyError) as exc:
                 errors.append(f"{pool_kind}:malformed:{exc}")
         if not pools:
-            return result_error(ResultStatus.UNAVAILABLE, source=SENTIMENT_SOURCE, source_url=SENTIMENT_BASE, code="all_pools_failed", message="涨停/炸板/跌停池均不可用", warnings=errors, retryable=True)
+            failure = result_error(ResultStatus.UNAVAILABLE, source=SENTIMENT_SOURCE, source_url=SENTIMENT_BASE, code="all_pools_failed", message="涨停/炸板/跌停池均不可用", warnings=errors, retryable=True, data_date=data_date)
+            self.cache.set(key, result_cache_value(failure), ttl=min(self.cache_ttl, 30), data_date=data_date)
+            return failure
         combined = [row for rows in pools.values() for row in rows]
         # A stock can appear in more than one source list; retain pool_kind in
         # the evidence rows but calculate distinct counts by code where useful.
         metrics = calculate_market_sentiment(combined, as_of=datetime.now(BEIJING).isoformat(timespec="seconds"), scope="eastmoney_pools", source=SENTIMENT_SOURCE)
         data = {"pools": pools, "metrics": metrics, "pool_status": {kind: "ok" if kind in pools else "unavailable" for kind in POOL_URLS}}
-        self.cache.set(key, data, ttl=self.cache_ttl, data_date=data_date)
         status = ResultStatus.PARTIAL if errors else ResultStatus.OK
-        return Result(status=status, data=data, source=SENTIMENT_SOURCE, source_url=SENTIMENT_BASE, data_date=data_date, as_of=metrics["as_of"], freshness="fresh", warnings=errors, cache={"hit": False}, request_count=self.client.request_count)
-
+        result = Result(status=status, data=data, source=SENTIMENT_SOURCE, source_url=SENTIMENT_BASE, data_date=data_date, as_of=metrics["as_of"], freshness="fresh", warnings=errors, cache={"hit": False}, request_count=self.client.request_count)
+        self.cache.set(key, result_cache_value(result), ttl=self.cache_ttl, data_date=data_date)
+        return result

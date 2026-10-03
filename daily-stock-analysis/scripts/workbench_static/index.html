@@ -123,6 +123,11 @@
         <div class="form-row">
           <input type="text" id="evidence-code" placeholder="代码：600519" class="grow" aria-label="证据核验股票代码">
           <label>观察日 <input type="text" id="evidence-date" placeholder="YYYY-MM-DD，可空" class="num"></label>
+          <label>商品 <select id="evidence-commodity" aria-label="商品合约">
+            <option value="copper">铜 · COMEX</option>
+            <option value="gold">金 · COMEX</option>
+            <option value="crude_oil">原油 · NYMEX</option>
+          </select></label>
           <label class="toggle"><input type="checkbox" id="evidence-force"> 强制刷新</label>
           <button class="btn btn-primary" id="evidence-btn">核验证据</button>
         </div>
@@ -135,12 +140,15 @@
           <label><input type="checkbox" name="evidence-topic" value="interaction"> 公司问答</label>
           <label><input type="checkbox" name="evidence-topic" value="dragon_tiger"> 龙虎榜</label>
           <label><input type="checkbox" name="evidence-topic" value="commodity"> 商品背景</label>
+          <label><input type="checkbox" name="evidence-topic" value="monitor"> 监控状态</label>
+          <label><input type="checkbox" name="evidence-topic" value="anomaly"> 异动记录</label>
         </div>
         <div class="evidence-background-row">
           <button class="btn" id="calendar-btn">查交易日历</button>
           <button class="btn" id="sentiment-btn">查市场情绪</button>
           <span class="meta-text">日历未确认时不推进 T+1 或自动筛选。</span>
         </div>
+        <p class="hint evidence-scope-note">时点口径：事件/龙虎榜支持观察日截止；财务显示最新披露；分笔仅支持当前交易日；商品合约按上方选择。</p>
         <div id="evidence-out" class="evidence-out" aria-live="polite"></div>
       </div>
 

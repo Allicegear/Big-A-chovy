@@ -218,6 +218,9 @@ SCREENING_TIMEOUT = 120
 # 代理断开时，用更短的轮询间隔探测恢复（正常刷新间隔是 settings["interval"]=90s）。
 # 你一旦把代理弄通，看板约 20s 内自动恢复，不用干等一整轮。
 PROXY_RECOVERY_INTERVAL = 15
+# Market background is evidence-only.  It refreshes after the core result is
+# published and never extends the screening round's lock/timeout.
+BACKGROUND_REFRESH_BUDGET_SECONDS = 8.0
 # 报告归档目录：验证跑会按 A_SHARE_REPORT_DIR 改写，避免把验证产物混进当日的
 # 报告序列（scan_reports / “继续看筛选”都读这个目录）。
 MD_OUTPUT_DIR = runtime_paths.report_dir(PROJECT_ROOT / "筛选结果")
@@ -231,7 +234,8 @@ TRADING_SESSIONS = [
 
 # 当日是否交易日：优先使用深交所官方整月日历；官方源不可用时保留原上证指数
 # 日K确认机制，最后才落到“工作日但未确认”的兼容状态。未确认状态不会开启自动筛选。
-_TRADING_DAY_CACHE = {"date": None, "value": True, "source": None}
+TRADING_DAY_RETRY_SECONDS = 15.0
+_TRADING_DAY_CACHE = {"date": None, "value": True, "source": None, "checked_at": 0.0}
 _TRADING_DAY_LOCK = threading.Lock()
 _OFFICIAL_CALENDAR = TradingCalendarService()
 
@@ -271,8 +275,17 @@ def is_trading_day(now: datetime | None = None) -> bool:
         if _TRADING_DAY_CACHE["date"] == key:
             # A pre-open guess is only provisional. Recheck it once the market
             # has had a chance to publish today's index bar.
-            if _TRADING_DAY_CACHE.get("source") != "pending" or before_open:
+            cached_source = _TRADING_DAY_CACHE.get("source")
+            if cached_source == "szse_official" or cached_source == "index":
                 return _TRADING_DAY_CACHE["value"]
+            if cached_source == "pending" and before_open:
+                return _TRADING_DAY_CACHE["value"]
+            if cached_source == "unavailable":
+                try:
+                    if time.monotonic() - float(_TRADING_DAY_CACHE.get("checked_at") or 0.0) < TRADING_DAY_RETRY_SECONDS:
+                        return _TRADING_DAY_CACHE["value"]
+                except (TypeError, ValueError):
+                    pass
         official = _fetch_official_calendar_day(now)
         if official is not None:
             value, source = official
@@ -290,7 +303,7 @@ def is_trading_day(now: datetime | None = None) -> bool:
                 # but ``_trading_day_pending`` prevents automatic screening or
                 # T+1 scheduling while the day is unconfirmed.
                 value, source = True, "unavailable"
-        _TRADING_DAY_CACHE.update(date=key, value=value, source=source)
+        _TRADING_DAY_CACHE.update(date=key, value=value, source=source, checked_at=time.monotonic())
         return value
 
 
@@ -372,6 +385,9 @@ class ScreeningScheduler:
         self.latest_md_path: str | None = None
         self.proxy_unavailable = False
         self._screening_lock = threading.Lock()
+        self._background_lock = threading.Lock()
+        self._background_thread: threading.Thread | None = None
+        self.background_enabled = True
         self._prewarm_lock = threading.Lock()
         self._stop_event = threading.Event()
         self.settings = {
@@ -397,6 +413,54 @@ class ScreeningScheduler:
                 print(f"[dashboard] restored last valid result ({self.preserved_from})", file=sys.stderr)
         except Exception as e:
             print(f"[dashboard] restore last valid failed: {e}", file=sys.stderr)
+
+    def _start_market_background(self, result: dict, data_date: str | None) -> None:
+        """Refresh evidence after publishing the core result, outside the run lock."""
+        if not getattr(self, "background_enabled", False):
+            return
+        lock = getattr(self, "_background_lock", None)
+        if lock is None:
+            return
+        if not lock.acquire(blocking=False):
+            return
+        current = getattr(self, "_background_thread", None)
+        if current is not None and current.is_alive():
+            lock.release()
+            return
+        result["market_background"] = {
+            "status": "loading",
+            "data_date": data_date,
+            "note": "背景证据异步刷新，不改变核心筛选结果或交易权限",
+        }
+
+        def _worker() -> None:
+            try:
+                try:
+                    background = build_market_background(
+                        data_date,
+                        budget_seconds=BACKGROUND_REFRESH_BUDGET_SECONDS,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    background = {
+                        "data_date": data_date,
+                        "status": "unavailable",
+                        "error": {"code": "background_source_error", "message": f"{type(exc).__name__}: {exc}"},
+                        "warnings": ["背景源失败，不影响核心筛选结果"],
+                    }
+                # A later screening round owns the UI snapshot; an old
+                # background worker must not overwrite it.
+                if self.latest_result is result:
+                    result["market_background"] = background
+                    try:
+                        self._save_markdown(result)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[dashboard] background snapshot save failed: {exc}", file=sys.stderr)
+            finally:
+                lock.release()
+
+        thread = threading.Thread(target=_worker, name="market-background", daemon=True)
+        self._background_thread = thread
+        thread.start()
 
     def run_screening(self, force: bool = False) -> bool:
         if not self._screening_lock.acquire(blocking=False):
@@ -503,17 +567,13 @@ class ScreeningScheduler:
                         round_commit.abort()
                         return False
 
-                # Background evidence is fetched after the production state
-                # commit gate. It is independently degradable and cannot
-                # clear or advance screening/T+1 state when a source fails.
-                try:
-                    result["market_background"] = build_market_background(
-                        (result.get("meta") or {}).get("timestamp", "")[:10] or None
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    result.setdefault("warnings", []).append(
-                        f"市场背景查询失败：{type(exc).__name__}: {exc}"
-                    )
+                # The evidence-only background starts as loading and is
+                # refreshed after the core result is published below.
+                result["market_background"] = {
+                    "status": "loading",
+                    "data_date": (meta.get("timestamp", "")[:10] or None),
+                    "note": "背景证据异步刷新，不改变核心筛选结果或交易权限",
+                }
 
                 # 已有有效完整结果？
                 prev = self.latest_result
@@ -546,6 +606,7 @@ class ScreeningScheduler:
                 if (not now_trading) and is_incomplete:
                     self.preserved_from = meta.get("timestamp")
                 self._save_markdown(result)
+                self._start_market_background(result, meta.get("timestamp", "")[:10] or None)
                 # 仅「完整盘中结果」持久化为最近有效快照
                 if (not degraded) and (complete is not False):
                     self._save_last_valid(result)

@@ -14,9 +14,10 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,6 +33,7 @@ from tools.data_sources.tencent import parse_snapshot  # noqa: E402
 
 EASTMONEY_QUOTE_URL = "https://push2.eastmoney.com/webguest/api/qt/stock/get"
 TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
+BEIJING = ZoneInfo("Asia/Shanghai")
 
 
 def normalize_code_clean(code: str) -> str:
@@ -86,48 +88,89 @@ def _tencent_snapshot(client: HTTPClient, symbol: Any) -> tuple[dict[str, Any], 
 
 
 def _first_row_value(row: dict[str, Any], names: tuple[str, ...]) -> Optional[float]:
+    """Read only an exact actual-period line item.
+
+    Sina keeps year-over-year values beside actual values (often with a
+    ``_同比`` suffix).  Substring matching can therefore turn a missing actual
+    value into a fake profit/loss signal.
+    """
+    normalized = {str(key).strip(): value for key, value in row.items()}
     for name in names:
-        for key, value in row.items():
-            if key == name or name in str(key):
-                parsed = _number(value)
-                if parsed is not None:
-                    return parsed
+        value = normalized.get(name)
+        parsed = _number(value)
+        if parsed is not None:
+            return parsed
     return None
 
 
-def _disclosed_financials(result: Result) -> dict[str, Any]:
+def _unknown_disclosed_financials(*, reason: str = "未取到最新利润表中的归母净利润或每股收益") -> dict[str, Any]:
+    return {
+        "report_period": None,
+        "published_at": None,
+        "eps_disclosed": None,
+        "net_profit_disclosed": None,
+        "revenue_disclosed": None,
+        "revenue_growth_disclosed": None,
+        "net_profit_growth_disclosed": None,
+        "profit_evidence_status": "unknown",
+        "profit_basis": reason,
+    }
+
+
+def _disclosed_financials(result: Result, *, as_of: str | None = None) -> dict[str, Any]:
     rows = result.data if isinstance(result.data, list) else []
     if not rows:
-        return {
-            "report_period": None,
-            "eps_disclosed": None,
-            "net_profit_disclosed": None,
-            "revenue_disclosed": None,
-            "revenue_growth_disclosed": None,
-            "net_profit_growth_disclosed": None,
-            "profit_evidence_status": "unknown",
-            "profit_basis": "未取到最新利润表中的归母净利润或每股收益",
-        }
+        return _unknown_disclosed_financials()
     row = rows[0]
+    if not isinstance(row, dict):
+        return _unknown_disclosed_financials(reason="最新利润表记录结构异常")
     eps = _first_row_value(row, ("基本每股收益", "稀释每股收益", "每股收益", "EPS"))
     net_profit = _first_row_value(row, ("归属于母公司所有者的净利润", "归属于母公司股东的净利润", "归母净利润", "净利润"))
     revenue = _first_row_value(row, ("营业总收入", "营业收入", "主营业务收入"))
-    revenue_growth = _first_row_value(row, ("营业收入同比", "营业总收入同比"))
+    revenue_growth = _first_row_value(row, ("营业收入同比", "营业总收入同比", "营业收入_同比", "营业总收入_同比"))
     profit_growth = _first_row_value(row, ("归属于母公司所有者的净利润_同比", "净利润_同比"))
-    if (eps is not None and eps > 0) or (net_profit is not None and net_profit > 0):
-        status = "profit"
-        basis = "最新披露利润表为正"
-    elif (eps is not None and eps < 0) or (net_profit is not None and net_profit < 0):
-        status = "loss"
-        basis = "最新披露利润表为负"
-    elif eps is not None or net_profit is not None:
-        status = "break_even"
-        basis = "最新披露利润表为零或接近盈亏平衡"
-    else:
+    report_period = str(row.get("report_period") or row.get("报告期") or "").strip() or None
+    published_at = str(row.get("published_at") or "").strip() or None
+
+    check_date = str(as_of or datetime.now(BEIJING).date().isoformat())[:10]
+    try:
+        as_of_date = date.fromisoformat(check_date)
+        report_date = date.fromisoformat(str(report_period)[:10]) if report_period else None
+    except ValueError:
+        as_of_date = datetime.now(BEIJING).date()
+        report_date = None
+    if report_date is None or report_date > as_of_date or report_date.year != as_of_date.year:
+        status = "unknown"
+        basis = f"报告期 {report_period or '未知'} 不是 {as_of_date.year} 年当前实绩，不能作为当前盈利结论"
+    elif eps is None and net_profit is None:
         status = "unknown"
         basis = "最新披露利润表未提供可解析的归母净利润或每股收益"
+    elif eps is not None and net_profit is not None:
+        if eps > 0 and net_profit > 0:
+            status, basis = "profit", "当前年度最新披露 EPS 与归母净利润均为正"
+        elif eps < 0 and net_profit < 0:
+            status, basis = "loss", "当前年度最新披露 EPS 与归母净利润均为负"
+        elif eps == 0 and net_profit == 0:
+            status, basis = "break_even", "当前年度最新披露 EPS 与归母净利润均为零"
+        else:
+            status, basis = "unknown", "当前年度 EPS 与归母净利润正负矛盾，财务证据待核验"
+    elif eps is not None:
+        if eps > 0:
+            status, basis = "profit", "当前年度最新披露 EPS 为正（归母净利润缺失）"
+        elif eps < 0:
+            status, basis = "loss", "当前年度最新披露 EPS 为负"
+        else:
+            status, basis = "break_even", "当前年度最新披露 EPS 为零"
+    elif net_profit is not None:
+        if net_profit > 0:
+            status, basis = "profit", "当前年度最新披露归母净利润为正（EPS缺失）"
+        elif net_profit < 0:
+            status, basis = "loss", "当前年度最新披露归母净利润为负"
+        else:
+            status, basis = "break_even", "当前年度最新披露归母净利润为零"
     return {
-        "report_period": row.get("report_period") or row.get("报告期"),
+        "report_period": report_period,
+        "published_at": published_at,
         "eps_disclosed": eps,
         "net_profit_disclosed": net_profit,
         "revenue_disclosed": revenue,
@@ -209,13 +252,20 @@ def query_financial_profile(code: str, *, client: HTTPClient | None = None) -> D
     else:
         fin_status, fin_color = "待披露/未知 ⚪", "gray"
 
+    disclosed_complete_positive = (
+        evidence_status == "profit"
+        and disclosed.get("eps_disclosed") is not None
+        and disclosed.get("eps_disclosed") > 0
+        and disclosed.get("net_profit_disclosed") is not None
+        and disclosed.get("net_profit_disclosed") > 0
+    )
     if fin_color == "red" or (pe_dynamic is not None and pe_dynamic < 0):
         safety_advice = "❌ 亏损股(不宜重仓)"
-    elif fin_color == "green" and pe_dynamic is not None and 0 < pe_dynamic < 60:
+    elif disclosed_complete_positive and pe_dynamic is not None and 0 < pe_dynamic < 60:
         safety_advice = "✅ 稳健盈利(安全)"
-    elif fin_color == "green" and pe_dynamic is not None and pe_dynamic >= 60:
+    elif evidence_status == "profit" and pe_dynamic is not None and pe_dynamic >= 60:
         safety_advice = "⚠️ 盈利但高估值"
-    elif evidence_status == "unknown" and pe_dynamic is not None and pe_dynamic > 0:
+    elif evidence_status in {"unknown", "break_even"} and pe_dynamic is not None and pe_dynamic > 0:
         safety_advice = "⚪ 动态PE为正，但实际披露盈利待核验"
     else:
         safety_advice = "⚪ 正常观察"
@@ -239,6 +289,7 @@ def query_financial_profile(code: str, *, client: HTTPClient | None = None) -> D
         "net_profit_disclosed": disclosed["net_profit_disclosed"],
         "net_profit_growth": disclosed["net_profit_growth_disclosed"] if disclosed["net_profit_growth_disclosed"] is not None else snapshot_net_profit_growth,
         "report_period": disclosed["report_period"],
+        "published_at": disclosed["published_at"],
         "profit_evidence_status": evidence_status,
         "profit_basis": disclosed["profit_basis"],
         "fin_status": fin_status,
@@ -300,4 +351,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

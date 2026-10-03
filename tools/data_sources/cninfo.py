@@ -46,7 +46,7 @@ def parse_announcement_payload(payload: Mapping[str, Any], *, code: str, source_
         raise ValueError("巨潮公告响应缺少 announcements")
     announcements = payload.get("announcements")
     if announcements is None:
-        announcements = []
+        raise ValueError("巨潮公告响应 announcements 为 null")
     if not isinstance(announcements, list):
         raise ValueError("巨潮 announcements 不是列表")
     rows: list[dict[str, Any]] = []

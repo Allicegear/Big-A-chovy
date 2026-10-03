@@ -1173,6 +1173,43 @@ def collect_announcement_titles(obj: Any) -> List[str]:
     return deduped
 
 
+def _has_announcement_container(value: Any) -> bool:
+    """Return whether an announcement response contains a list-shaped payload.
+
+    An HTTP 200 response is not enough evidence that Eastmoney returned a
+    valid empty list.  The endpoint has returned business-error envelopes with
+    ``data: null`` and empty objects; those must reach the CNINFO fallback.
+    """
+    if isinstance(value, list):
+        return True
+    if not isinstance(value, dict):
+        return False
+    for key in ("rows", "list", "announcements"):
+        if key in value and isinstance(value[key], list):
+            return True
+    for key in ("data", "result"):
+        if key in value and _has_announcement_container(value[key]):
+            return True
+    return False
+
+
+def _validate_primary_announcement_response(data: Any) -> None:
+    """Validate Eastmoney's business envelope before title extraction."""
+    if isinstance(data, list):
+        return
+    if not isinstance(data, dict):
+        raise RuntimeError("东财公告响应不是对象")
+    if data.get("success") is False or data.get("data") is None:
+        raise RuntimeError(f"东财公告业务失败: code={data.get('code')!r}")
+    known_keys = {"data", "result", "total", "totalCount", "announcements", "list", "rows"}
+    if not (known_keys & set(data)):
+        raise RuntimeError("东财公告响应缺少已知结构字段")
+    # A total=0 response is only a valid empty result when the list container
+    # is present.  ``{data: {}}`` and ``{data: null}`` are schema failures.
+    if not _has_announcement_container(data):
+        raise RuntimeError("东财公告响应缺少公告列表容器")
+
+
 def fetch_announcements(code: str, page_size: int = 8) -> List[str]:
     """Return announcement titles while preserving the existing risk API.
 
@@ -1193,11 +1230,7 @@ def fetch_announcements(code: str, page_size: int = 8) -> List[str]:
         }, timeout=ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS, retries=0)
         if isinstance(data, list):
             return {"rows": [{"title": title} for title in collect_announcement_titles(data)], "source_url": ANNOUNCEMENT_URL}
-        if not isinstance(data, dict):
-            raise RuntimeError("东财公告响应不是对象")
-        known_keys = {"data", "result", "total", "totalCount", "announcements", "list"}
-        if not (known_keys & set(data)):
-            raise RuntimeError("东财公告响应缺少已知结构字段")
+        _validate_primary_announcement_response(data)
         titles = collect_announcement_titles(data)[:page_size]
         return {"rows": [{"title": title} for title in titles], "source_url": ANNOUNCEMENT_URL}
 

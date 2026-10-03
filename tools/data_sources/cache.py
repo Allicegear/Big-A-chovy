@@ -15,6 +15,14 @@ from pathlib import Path
 import threading
 import time
 from typing import Any
+import uuid
+from contextlib import contextmanager
+from functools import wraps
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback keeps thread safety
+    fcntl = None
 
 
 def cache_root() -> Path:
@@ -32,9 +40,15 @@ def cache_path(namespace: str) -> Path:
 def atomic_write_json(path: Path, payload: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False), encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 @dataclass
@@ -43,6 +57,80 @@ class CacheEntry:
     stored_at: float
     expires_at: float | None = None
     data_date: str | None = None
+
+
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT: dict[str, threading.Event] = {}
+
+
+@contextmanager
+def coalesced_request(key: str):
+    """Let concurrent non-forced calls share one cache-filling request."""
+    with _INFLIGHT_LOCK:
+        event = _INFLIGHT.get(key)
+        owner = event is None
+        if owner:
+            event = threading.Event()
+            _INFLIGHT[key] = event
+    if not owner:
+        event.wait()
+    try:
+        yield owner
+    finally:
+        if owner:
+            with _INFLIGHT_LOCK:
+                _INFLIGHT.pop(key, None)
+                event.set()
+
+
+def coalesced_fetch(namespace: str):
+    """Decorator for source fetches whose normal path already checks cache."""
+    def decorator(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            if kwargs.get("force"):
+                return function(*args, **kwargs)
+            payload = {"args": [str(value) for value in args[1:]], "kwargs": {str(key): str(value) for key, value in sorted(kwargs.items())}}
+            key = f"{namespace}:{JsonCache.key(payload)}"
+            with coalesced_request(key):
+                return function(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+def result_cache_value(result: Any) -> dict[str, Any]:
+    """Persist the complete Result envelope, not only its data payload."""
+    return {"_result": result.to_dict()}
+
+
+def result_from_cache(value: Any, *, default_source: str, default_source_url: str, cache_hit: bool = True) -> Any | None:
+    """Restore a cached Result; legacy data-only entries are deliberately ignored."""
+    if not isinstance(value, dict) or not isinstance(value.get("_result"), dict):
+        return None
+    payload = value["_result"]
+    status = payload.get("status")
+    if not isinstance(status, str):
+        return None
+    try:
+        from .contracts import Result
+
+        return Result(
+            status=status,
+            data=payload.get("data"),
+            source=str(payload.get("source") or default_source),
+            source_url=str(payload.get("source_url") or default_source_url),
+            fetched_at=str(payload.get("fetched_at") or ""),
+            data_date=payload.get("data_date"),
+            as_of=payload.get("as_of"),
+            freshness="cached",
+            warnings=list(payload.get("warnings") or []),
+            error=payload.get("error"),
+            schema_version=str(payload.get("schema_version") or "a-share-data.v1"),
+            cache={**(payload.get("cache") or {}), "hit": cache_hit},
+            request_count=int(payload.get("request_count") or 0),
+        )
+    except (TypeError, ValueError, KeyError):
+        return None
 
 
 class JsonCache:
@@ -54,16 +142,33 @@ class JsonCache:
         self._loaded = False
         self._payload: dict[str, Any] = {}
 
-    def _load(self) -> None:
-        if self._loaded:
-            return
-        self._loaded = True
+    def _read_disk(self) -> dict[str, Any]:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
-                self._payload = payload
+                return payload
         except (OSError, ValueError, TypeError):
-            self._payload = {}
+            pass
+        return {}
+
+    def _load(self) -> None:
+        if not self._loaded:
+            self._payload = self._read_disk()
+            self._loaded = True
+
+    @contextmanager
+    def _file_lock(self, *, exclusive: bool):
+        """Coordinate read-modify-write across cache instances/processes."""
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def key(value: Any) -> str:
@@ -72,7 +177,11 @@ class JsonCache:
 
     def get(self, key: str, *, ttl: float | None = None, now: float | None = None, allow_stale: bool = False) -> CacheEntry | None:
         with self._lock:
-            self._load()
+            with self._file_lock(exclusive=False):
+                # Another JsonCache instance/process may have published a
+                # newer key since this object was constructed.
+                self._payload = self._read_disk()
+                self._loaded = True
             entry = self._payload.get(key)
             if not isinstance(entry, dict) or "value" not in entry:
                 return None
@@ -88,25 +197,32 @@ class JsonCache:
 
     def set(self, key: str, value: Any, *, ttl: float | None = None, data_date: str | None = None) -> None:
         with self._lock:
-            self._load()
-            stored = time.time()
-            self._payload[key] = {
-                "value": value,
-                "stored_at": stored,
-                "expires_at": stored + float(ttl) if ttl is not None else None,
-                "data_date": data_date,
-            }
-            atomic_write_json(self.path, self._payload)
+            with self._file_lock(exclusive=True):
+                # Read while holding the same lock as the eventual replace so
+                # concurrent instances cannot lose each other's keys.
+                self._payload = self._read_disk()
+                self._loaded = True
+                stored = time.time()
+                self._payload[key] = {
+                    "value": value,
+                    "stored_at": stored,
+                    "expires_at": stored + float(ttl) if ttl is not None else None,
+                    "data_date": data_date,
+                }
+                atomic_write_json(self.path, self._payload)
 
     def delete(self, key: str) -> None:
         with self._lock:
-            self._load()
-            if key in self._payload:
-                self._payload.pop(key, None)
-                atomic_write_json(self.path, self._payload)
+            with self._file_lock(exclusive=True):
+                self._payload = self._read_disk()
+                self._loaded = True
+                if key in self._payload:
+                    self._payload.pop(key, None)
+                    atomic_write_json(self.path, self._payload)
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
-            self._load()
+            with self._file_lock(exclusive=False):
+                self._payload = self._read_disk()
+                self._loaded = True
             return {"path": str(self.path), "entries": len(self._payload)}
-

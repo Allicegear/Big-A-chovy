@@ -75,10 +75,11 @@ def parse_calendar_payload(payload: Mapping[str, Any], *, year: int, month: int,
 class TradingCalendarService:
     """Fetch/cache official months and expose date/session lookups."""
 
-    def __init__(self, client: HTTPClient | None = None, *, cache: JsonCache | None = None, cache_ttl: int = 7 * 24 * 3600):
+    def __init__(self, client: HTTPClient | None = None, *, cache: JsonCache | None = None, cache_ttl: int = 7 * 24 * 3600, request_timeout: float = 10.0):
         self.client = client or HTTPClient()
         self.cache = cache or JsonCache("szse_calendar")
         self.cache_ttl = max(60, int(cache_ttl))
+        self.request_timeout = max(0.5, float(request_timeout))
 
     def fetch_month(self, year: int, month: int, *, force: bool = False) -> Result:
         if type(year) is not int or type(month) is not int or not 1 <= month <= 12:
@@ -97,7 +98,7 @@ class TradingCalendarService:
                     cache={"hit": True},
                 )
         try:
-            response = self.client.get(SZSE_CALENDAR_URL, params={"month": f"{year}-{month:02d}"}, headers={"Referer": "https://www.szse.cn/"}, retries=1)
+            response = self.client.get(SZSE_CALENDAR_URL, params={"month": f"{year}-{month:02d}"}, headers={"Referer": "https://www.szse.cn/"}, timeout=self.request_timeout, retries=1)
             rows = parse_calendar_payload(response.json(), year=year, month=month, source_url=response.url)
             self.cache.set(key, {"rows": rows}, ttl=self.cache_ttl, data_date=f"{year:04d}-{month:02d}")
             return result_ok(rows, source=CALENDAR_SOURCE, source_url=response.url, data_date=f"{year:04d}-{month:02d}", cache={"hit": False}, request_count=self.client.request_count)

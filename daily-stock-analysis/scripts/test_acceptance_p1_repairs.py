@@ -1,0 +1,140 @@
+"""Synthetic regression tests for the independent P1 acceptance findings."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+
+import a_share_daily_screen as screen
+from tools import query_financials
+import realtime_dashboard as dashboard
+from tools.data_sources.cache import JsonCache
+from tools.data_sources.contracts import Result, ResultStatus, result_ok
+from tools.data_sources.tencent import TencentTickSource, aggregate_ticks
+
+
+class AnnouncementBusinessFailureTests(unittest.TestCase):
+    def _fallback(self, rows):
+        fallback = Mock()
+        fallback.fetch.return_value = result_ok(rows, source="cninfo", source_url="cninfo")
+        return fallback
+
+    def test_http_200_business_failure_uses_cninfo_fallback(self) -> None:
+        with patch.object(screen, "fetch_json", return_value={"success": False, "code": 429, "data": None}):
+            fallback = self._fallback([{"title": "关于重大诉讼的公告"}])
+            with patch.object(screen, "CNInfoAnnouncementSource", return_value=fallback):
+                self.assertEqual(screen.fetch_announcements("600519"), ["关于重大诉讼的公告"])
+        fallback.fetch.assert_called_once()
+
+    def test_valid_empty_primary_does_not_use_fallback(self) -> None:
+        with patch.object(screen, "fetch_json", return_value={"success": True, "data": {"list": [], "total": 0}}):
+            fallback = self._fallback([{"title": "不应读取"}])
+            with patch.object(screen, "CNInfoAnnouncementSource", return_value=fallback):
+                self.assertEqual(screen.fetch_announcements("600519"), [])
+        fallback.fetch.assert_not_called()
+
+    def test_both_sources_fail_and_stale_avoid_is_preserved(self) -> None:
+        result = {"trend_observation": [{"code": "600519"}]}
+        stale = {"600519": {"status": "avoid", "keywords": ["立案"], "titles": ["立案调查"], "checked_at": 0}}
+        with patch.object(screen, "fetch_announcements", side_effect=RuntimeError("all announcement sources failed")):
+            errors = screen.attach_announcement_risks(result, page_size=8, workers=1, risk_cache=stale)
+        self.assertEqual(errors, ["600519"])
+        self.assertEqual(result["trend_observation"][0]["risk_status"], "avoid")
+
+
+class FinancialEvidenceTests(unittest.TestCase):
+    def test_yoy_fields_are_not_used_as_actual_values(self) -> None:
+        result = Result(
+            status=ResultStatus.OK,
+            data=[{"report_period": "2026-06-30", "基本每股收益_同比": "-10", "归母净利润_同比": "-30"}],
+            source="fixture",
+            source_url="fixture",
+        )
+        disclosed = query_financials._disclosed_financials(result, as_of="2026-10-04")
+        self.assertIsNone(disclosed["eps_disclosed"])
+        self.assertIsNone(disclosed["net_profit_disclosed"])
+        self.assertEqual(disclosed["profit_evidence_status"], "unknown")
+
+    def test_conflicting_eps_and_profit_and_old_period_cannot_be_safe(self) -> None:
+        current = Result(
+            status=ResultStatus.OK,
+            data=[{
+                "report_period": "2026-06-30",
+                "基本每股收益": "-0.20",
+                "归属于母公司所有者的净利润": "100",
+            }],
+            source="fixture",
+            source_url="fixture",
+        )
+        disclosed = query_financials._disclosed_financials(current, as_of="2026-10-04")
+        self.assertEqual(disclosed["profit_evidence_status"], "unknown")
+        self.assertIn("矛盾", disclosed["profit_basis"])
+
+        old = Result(
+            status=ResultStatus.OK,
+            data=[{"report_period": "2025-12-31", "基本每股收益": "1.20", "归属于母公司所有者的净利润": "100"}],
+            source="fixture",
+            source_url="fixture",
+        )
+        old_disclosed = query_financials._disclosed_financials(old, as_of="2026-10-04")
+        self.assertEqual(old_disclosed["profit_evidence_status"], "unknown")
+
+    def test_non_positive_eps_never_gets_safe_advice(self) -> None:
+        row = [{"report_period": "2026-06-30", "基本每股收益": "0", "归属于母公司所有者的净利润": "100"}]
+        with (
+            patch.object(query_financials, "_eastmoney_snapshot", return_value=({"f43": "1000", "f162": "1000"}, None)),
+            patch.object(query_financials, "_tencent_snapshot", return_value=({}, None)),
+            patch.object(query_financials, "_ytd", return_value=(0.0, None, "fixture")),
+            patch.object(query_financials.SinaFinancialSource, "fetch_reports", return_value=result_ok(row, source="sina", source_url="sina")),
+        ):
+            profile = query_financials.query_financial_profile("600519", client=Mock())
+        self.assertNotIn("安全", profile["safety_advice"])
+
+
+class TickCoverageTests(unittest.TestCase):
+    def test_two_ticks_one_minute_apart_do_not_cover_fifteen_minute_window(self) -> None:
+        result = aggregate_ticks(
+            [
+                {"time": "10:00:00", "amount": 100, "side": "B"},
+                {"time": "10:01:00", "amount": 100, "side": "S"},
+            ],
+            window_minutes=15,
+            as_of="100100",
+        )
+        self.assertFalse(result["data_sufficient"])
+        self.assertIn("覆盖不足", result["reason"])
+
+    def test_snapshot_close_time_is_normalized_before_amount_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = TencentTickSource(cache=JsonCache("p1_ticks", path=Path(directory) / "cache.json"), sleep_seconds=0)
+            source._snapshot = Mock(return_value={
+                "data_date": "2026-10-04", "as_of": "153000", "amount": 100_000,
+                "name": "测试股", "price": 10.0,
+            })
+            source._page = Mock(side_effect=[
+                [{"seq": 1, "time": "09:30:00", "price": 10.0, "change": 0.0, "volume": 1, "amount": 100, "side": "B"}],
+                None,
+            ])
+            result = source.fetch("600519", max_pages=4)
+        self.assertTrue(any("成交额" in warning for warning in result.warnings))
+
+
+class TradingDayRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        dashboard._TRADING_DAY_CACHE.update(date=None, value=True, source=None, checked_at=0.0)
+
+    def tearDown(self) -> None:
+        dashboard._TRADING_DAY_CACHE.update(date=None, value=True, source=None, checked_at=0.0)
+
+    def test_unavailable_official_calendar_is_retried(self) -> None:
+        now = dashboard.datetime(2026, 10, 2, 10, 0)
+        with patch.object(dashboard, "_fetch_official_calendar_day", side_effect=[None, (False, "szse_official")]), patch.object(dashboard, "_fetch_index_kline_dates", return_value=[]):
+            self.assertTrue(dashboard.is_trading_day(now))
+            dashboard._TRADING_DAY_CACHE["checked_at"] -= dashboard.TRADING_DAY_RETRY_SECONDS + 1
+            self.assertFalse(dashboard.is_trading_day(now))
+
+
+if __name__ == "__main__":
+    unittest.main()
