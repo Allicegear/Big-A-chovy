@@ -202,6 +202,10 @@ from urllib.parse import urlparse, parse_qs
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from tools.data_sources.calendar import TradingCalendarService  # noqa: E402
+from tools.data_sources.background import build_market_background  # noqa: E402
 STATIC_DIR = SCRIPT_DIR / "realtime_static"
 # 两个入口共用的导航与运行状态条：工作台 handler 继承本模块的静态路由，
 # 因此只需在这里挂一次（见 do_GET 的 /common.css、/common.js）。
@@ -225,10 +229,22 @@ TRADING_SESSIONS = [
     (12, 55, 15, 5),
 ]
 
-# 当日是否交易日：以上证指数日K是否出现当日记录为准（法定节假日/临时休市天然
-# 覆盖，无需每年维护日历）；接口失败保守视为交易日（宁可跑快照，不可漏跑）。
+# 当日是否交易日：优先使用深交所官方整月日历；官方源不可用时保留原上证指数
+# 日K确认机制，最后才落到“工作日但未确认”的兼容状态。未确认状态不会开启自动筛选。
 _TRADING_DAY_CACHE = {"date": None, "value": True, "source": None}
 _TRADING_DAY_LOCK = threading.Lock()
+_OFFICIAL_CALENDAR = TradingCalendarService()
+
+
+def _fetch_official_calendar_day(now: datetime) -> tuple[bool, str] | None:
+    """Return (is_open, source) when the official calendar is conclusive."""
+    try:
+        result = _OFFICIAL_CALENDAR.is_open(now.date())
+        if result.status == "ok" and isinstance(result.data, dict):
+            return bool(result.data.get("is_open")), "szse_official"
+    except Exception:
+        pass
+    return None
 
 
 def _fetch_index_kline_dates() -> list:
@@ -245,8 +261,7 @@ def _fetch_index_kline_dates() -> list:
 
 
 def is_trading_day(now: datetime | None = None) -> bool:
-    """当日是否 A 股交易日。当日结果缓存；竞价时段(9:30 前)当日K可能未生成，
-    暂按交易日处理，但标记为待确认，开盘后重新查询，避免把节假日误缓存一整天。"""
+    """当日是否 A 股交易日，且保留来源/确认状态供调度器使用。"""
     now = now or datetime.now()
     if now.weekday() >= 5:
         return False
@@ -258,28 +273,34 @@ def is_trading_day(now: datetime | None = None) -> bool:
             # has had a chance to publish today's index bar.
             if _TRADING_DAY_CACHE.get("source") != "pending" or before_open:
                 return _TRADING_DAY_CACHE["value"]
-        dates = _fetch_index_kline_dates()
-        if dates:
-            if dates[-1] == key:
-                value, source = True, "index"
-            elif before_open:
-                value, source = True, "pending"
-            else:
-                value, source = False, "index"
+        official = _fetch_official_calendar_day(now)
+        if official is not None:
+            value, source = official
         else:
-            value = True  # 接口失败，退回「工作日即交易日」的原有行为
-            source = "unavailable"
+            dates = _fetch_index_kline_dates()
+            if dates:
+                if dates[-1] == key:
+                    value, source = True, "index"
+                elif before_open:
+                    value, source = True, "pending"
+                else:
+                    value, source = False, "index"
+            else:
+                # Compatibility: callers still see a weekday as a candidate,
+                # but ``_trading_day_pending`` prevents automatic screening or
+                # T+1 scheduling while the day is unconfirmed.
+                value, source = True, "unavailable"
         _TRADING_DAY_CACHE.update(date=key, value=value, source=source)
         return value
 
 
 def _trading_day_pending(now: datetime | None = None) -> bool:
-    """Whether today's positive weekday result still relies on the pre-open guess."""
+    """Whether today's positive result is not confirmed by an official/index source."""
     now = now or datetime.now()
     with _TRADING_DAY_LOCK:
         return (
             _TRADING_DAY_CACHE["date"] == now.strftime("%Y-%m-%d")
-            and _TRADING_DAY_CACHE.get("source") == "pending"
+            and _TRADING_DAY_CACHE.get("source") in {"pending", "unavailable"}
         )
 
 
@@ -481,6 +502,18 @@ class ScreeningScheduler:
                         print(f"[dashboard] state commit failed: {e}", file=sys.stderr)
                         round_commit.abort()
                         return False
+
+                # Background evidence is fetched after the production state
+                # commit gate. It is independently degradable and cannot
+                # clear or advance screening/T+1 state when a source fails.
+                try:
+                    result["market_background"] = build_market_background(
+                        (result.get("meta") or {}).get("timestamp", "")[:10] or None
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    result.setdefault("warnings", []).append(
+                        f"市场背景查询失败：{type(exc).__name__}: {exc}"
+                    )
 
                 # 已有有效完整结果？
                 prev = self.latest_result
@@ -981,22 +1014,17 @@ class ScreeningScheduler:
 
 
 def _next_trading_open() -> datetime | None:
-    """返回下一个交易时段开始时间（09:30 或 13:00），用于非交易时段提示。"""
+    """返回官方日历确认的下一个交易时段开始时间。"""
     now = datetime.now()
-    today = now.date()
-    candidates = []
-    for h, m in ((9, 30), (13, 0)):
-        cand = datetime(today.year, today.month, today.day, h, m)
-        if cand > now:
-            candidates.append(cand)
-    if candidates:
-        return candidates[0]
-    # 今天已过，找下一个工作日 09:30
-    d = today
-    while True:
-        d += timedelta(days=1)
-        if d.weekday() < 5:
-            return datetime(d.year, d.month, d.day, 9, 30)
+    try:
+        result = _OFFICIAL_CALENDAR.next_session(now)
+        if result.status == "ok" and isinstance(result.data, dict) and result.data.get("start"):
+            value = datetime.fromisoformat(str(result.data["start"]))
+            return value.replace(tzinfo=None)
+    except Exception:
+        pass
+    # 不把工作日推断成已确认交易日；上层状态会保留“待确认”，让用户手动诊断。
+    return None
 
 
 scheduler = ScreeningScheduler()

@@ -50,6 +50,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.rule_config import RULE_CONFIG, get_rule_config, hhmm_to_minutes  # noqa: E402
 from tools.data_sources.announcements import fetch_announcement_evidence  # noqa: E402
 from tools.data_sources.cninfo import CNInfoAnnouncementSource  # noqa: E402
+from tools.data_sources.background import build_market_background  # noqa: E402
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -4712,6 +4713,30 @@ def render_markdown(result: Dict[str, Any]) -> str:
     lines: List[str] = []
     meta = result["meta"]
     lines.append(f"数据时间：{meta['timestamp']}，状态：{meta['status']}，耗时 {meta.get('elapsed_seconds', '?')}s。来源：{meta['source']}。")
+    background = result.get("market_background") or {}
+    calendar_info = background.get("calendar") if isinstance(background, dict) else None
+    if isinstance(calendar_info, dict):
+        calendar_status = calendar_info.get("status")
+        calendar_data = calendar_info.get("data") or {}
+        if calendar_status == "ok" and isinstance(calendar_data, dict):
+            day_label = "交易日" if calendar_data.get("is_open") else "休市日"
+            lines.append(f"交易日历：{day_label}（深交所官方整月日历，数据日 {calendar_info.get('data_date') or background.get('data_date') or '-'}）。")
+        else:
+            lines.append("交易日历：待确认（官方整月日历不可用或未发布；未据此推进状态机/T+1）。")
+    sentiment_info = background.get("sentiment") if isinstance(background, dict) else None
+    if isinstance(sentiment_info, dict):
+        metrics = ((sentiment_info.get("data") or {}).get("metrics") if isinstance(sentiment_info.get("data"), dict) else None) or {}
+        if sentiment_info.get("status") in {"ok", "partial"} and metrics:
+            lines.append(
+                "市场情绪（背景摘要，仅统计已取范围）："
+                f"涨停 {metrics.get('limit_up_count', 0)} / 炸板 {metrics.get('broken_count', 0)} / 跌停 {metrics.get('limit_down_count', 0)}；"
+                f"炸板率 {metrics.get('break_rate') if metrics.get('break_rate') is not None else '不适用'}%；"
+                f"最高连板 {metrics.get('max_streak') or '未取到'}；"
+                f"昨涨停今日平均 {metrics.get('yesterday_limit_up_today_average_change_pct') if metrics.get('yesterday_limit_up_today_average_change_pct') is not None else '不适用'}%。"
+                f"范围={metrics.get('scope', '未知')}，时点={metrics.get('as_of') or '-'}。"
+            )
+        else:
+            lines.append("市场情绪：不可用/待确认；不把失败当作空池，也不改变现有评分和权限。")
     # 交易板范围：报告必须能追溯本轮实际筛了什么范围，避免把扩展板沉默地混进主板结论。
     if meta.get("enabled_boards_label"):
         lines.append(
@@ -5740,6 +5765,15 @@ def main() -> int:
     except NetworkUnavailable as exc:
         print(format_network_failure(exc), file=sys.stderr)
         return 2
+
+    # 背景数据在核心筛选、公告门禁和状态机完成后按独立缓存请求；任何失败只
+    # 影响报告顶部证据，不改变候选池、排序或状态提交语义。
+    try:
+        result["market_background"] = build_market_background(
+            (result.get("meta") or {}).get("timestamp", "")[:10] or None
+        )
+    except Exception as exc:
+        result.setdefault("warnings", []).append(f"市场背景查询失败：{type(exc).__name__}: {exc}")
 
     if args.format == "json":
         output = json.dumps(_sanitize_for_json(result), ensure_ascii=False, indent=2)

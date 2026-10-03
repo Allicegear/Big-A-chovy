@@ -5,8 +5,11 @@ It does not contain trading rules, position handling, or buy/sell decisions.
 """
 
 from .contracts import Result, ResultStatus, SourceError
+from .calendar import TradingCalendarService
 from .cninfo import CNInfoAnnouncementSource
+from .events import EastmoneyEventSource
 from .sina import SinaFinancialSource
+from .sentiment import EastmoneySentimentSource
 from .symbols import SecuritySymbol, normalize_security
 from .tencent import TencentTickSource
 
@@ -16,7 +19,10 @@ __all__ = [
     "SecuritySymbol",
     "SourceError",
     "CNInfoAnnouncementSource",
+    "EastmoneyEventSource",
+    "EastmoneySentimentSource",
     "SinaFinancialSource",
+    "TradingCalendarService",
     "TencentTickSource",
     "normalize_security",
 ]

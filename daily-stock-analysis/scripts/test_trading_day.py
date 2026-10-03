@@ -12,6 +12,14 @@ def _reset_cache():
 class TradingDayTests(unittest.TestCase):
     def setUp(self):
         _reset_cache()
+        # The legacy tests exercise the index-K-line fallback path. The new
+        # official-calendar path is covered with synthetic payloads in the
+        # data-source tests and must not make network requests here.
+        self._official_calendar = patch.object(
+            dash, "_fetch_official_calendar_day", return_value=None
+        )
+        self._official_calendar.start()
+        self.addCleanup(self._official_calendar.stop)
         self.addCleanup(_reset_cache)
 
     @patch.object(dash, "_fetch_index_kline_dates", return_value=[])
