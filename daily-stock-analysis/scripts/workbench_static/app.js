@@ -110,6 +110,7 @@ $$(".tab-btn[data-tab]").forEach((btn) => {
     $$(".tab-panel").forEach((p) => p.classList.remove("active"));
     $(`#tab-${btn.dataset.tab}`).classList.add("active");
     if (btn.dataset.tab === "reports") loadReports();
+    if (btn.dataset.tab === "config") loadConfig();
   });
 });
 
@@ -123,11 +124,11 @@ $("#run-btn").addEventListener("click", async () => {
   if ($("#mode-watchlist").checked) modes.push("watchlist");
   if (!modes.length) { alert("请至少选择一个筛选模块"); return; }
   // 与看板顶部同名选项保持同一极性：勾选 = 执行检查/排名，取消 = 跳过。
+  // 公告检查不在此列：它是框架一票否决门禁，服务端强制开启，没有关闭入口。
   const body = {
     modes,
     top: parseInt($("#top").value, 10) || 15,
     network_mode: $("#network-mode").value,
-    skip_announcements: !$("#check-announcements").checked,
     skip_capital_ranking: !$("#rank-capital").checked,
   };
   try {
@@ -174,7 +175,7 @@ async function pollJob() {
   $("#job-progress-hint").style.display = "none";
   $("#run-btn").disabled = false;
   if (job.state === "error") {
-    $("#job-state").innerHTML = `<span class="down">失败: ${esc(job.error)}</span>`;
+    $("#job-state").innerHTML = `<span class="err-text">失败: ${esc(job.error)}</span>`;
     return;
   }
   $("#job-state").textContent = `完成，耗时 ${job.elapsed}s`;
@@ -190,7 +191,7 @@ async function pollJob() {
     $("#screen-result").innerHTML = renderMD(md);
     $("#screen-result").classList.remove("hidden");
   } catch (e) {
-    $("#screen-result").innerHTML = `<p class="down">报告获取失败: ${esc(e.message || e)}</p>`;
+    $("#screen-result").innerHTML = `<p class="err-text">报告获取失败: ${esc(e.message || e)}</p>`;
     $("#screen-result").classList.remove("hidden");
   }
 }
@@ -267,6 +268,159 @@ $("#track-btn").addEventListener("click", () => {
   });
 });
 
+/* ================= 参数配置 ================= */
+let configState = null;
+
+function selectedView() {
+  const el = document.querySelector('input[name="neg-view"]:checked');
+  return el ? el.value : "strict";
+}
+
+async function loadConfig() {
+  let cfg;
+  try {
+    cfg = await fetchJSON("/api/config");
+  } catch (e) {
+    const box = $("#config-error");
+    box.textContent = `配置读取失败：${e.message || e}`;
+    box.classList.remove("hidden");
+    return;
+  }
+  configState = cfg;
+  const d = cfg.dashboard || {};
+  $$('input[name="neg-view"]').forEach((el) => {
+    el.checked = el.value === (d.negative_super_view || "strict");
+  });
+  $("#cfg-top").value = d.top != null ? d.top : 15;
+  $("#cfg-interval").value = d.interval != null ? d.interval : 90;
+  $("#cfg-network").value = d.network_mode || "auto";
+  // 交易板范围：默认只选沪深主板（与历史基线一致）
+  const savedBoards = Array.isArray(d.enabled_boards) && d.enabled_boards.length ? d.enabled_boards : ["main"];
+  $("#cfg-board-main").checked = savedBoards.indexOf("main") !== -1;
+  $("#cfg-board-chinext").checked = savedBoards.indexOf("chinext") !== -1;
+  $("#cfg-board-star").checked = savedBoards.indexOf("star") !== -1;
+
+  const snapRev = cfg.snapshot_revision;
+  const snapView = cfg.snapshot_view === "observe" ? "观察开启" : (cfg.snapshot_view ? "严格展示" : "待生成");
+  // 交易板范围：把「当前设置」与「当前快照实际范围」并排显示——两者可能不同，
+  // 设置是对下一轮生效，快照是已经跑完那一轮的真实范围。
+  const boardText = (list) => {
+    const labels = { main: "沪深主板", chinext: "创业板", star: "科创板" };
+    return Array.isArray(list) && list.length ? list.map((b) => labels[b] || b).join(" + ") : null;
+  };
+  const curBoards = boardText(d.enabled_boards) || "沪深主板";
+  const snapBoards = cfg.snapshot_enabled_boards == null
+    ? null
+    : (boardText(cfg.snapshot_enabled_boards) || "（空）");
+  // 快照口径：新快照带 board_scope_status（所选交易板统一参与正式筛选）；旧快照带
+  // extended_board_observations（当时两板只进观察列表）。两者筛选方式不同，必须提示，
+  // **不能**把旧快照的范围结论按当前设置重新解释。
+  const legacyMethod = cfg.snapshot_screen_method === "legacy_extended_observation";
+  const scopeStatus = cfg.snapshot_board_scope_status;
+  const scopeText = scopeStatus == null
+    ? (legacyMethod ? "旧口径（两板仅观察，不参与正式池）" : "范围未记录（该快照生成于交易板口径之前）")
+    : scopeStatus !== "ok"
+      ? `本轮结果不完整（${scopeStatus === "degraded" ? "行情降级" : "行情快照不完整"}）——无候选不等于未符合条件`
+      : "数据完整";
+  // 设置与快照范围不一致时（含旧口径快照），并排显示容易看漏，这里再明确提示一次。
+  const curList = (d.enabled_boards || []).join(",");
+  const snapList = (cfg.snapshot_enabled_boards || []).join(",");
+  const methodWarn = legacyMethod
+    ? `<div class="scope-warn">⚠️ 当前快照由旧口径生成：当时创业板/科创板只进观察列表，未参与正式池。当前设置已是「所选交易板统一参与正式筛选」，两者不可直接比较；如需同口径结果，请重新跑一轮筛选。</div>`
+    : (cfg.snapshot_enabled_boards != null && curList !== snapList
+        ? `<div class="scope-warn">⚠️ 当前设置的范围（${esc(curBoards)}）与当前快照实际范围（${esc(snapBoards)}）不同：设置改动只对下一轮筛选生效，看板仍显示旧快照。</div>`
+        : "");
+
+  $("#config-status").innerHTML =
+    `<div>当前设置：<strong>v${cfg.revision}</strong>` +
+    `${cfg.updated_at ? `（修改于 ${esc(cfg.updated_at)}）` : ""}` +
+    `｜交易板范围：<strong>${esc(curBoards)}</strong></div>` +
+    `<div>当前快照：<strong>${snapRev != null ? "v" + snapRev : "待生成"}</strong>` +
+    `（观察模式：${esc(snapView)}｜实际范围：${snapBoards == null ? "范围未记录" : esc(snapBoards)}` +
+    `｜口径：${esc(scopeText)}）</div>` +
+    methodWarn +
+    (cfg.pending
+      ? `<div class="pending">新配置 v${cfg.revision} 待下一轮生效（当前快照仍按 v${snapRev} 的范围）</div>`
+      : "");
+
+  const err = $("#config-error");
+  if (cfg.error) {
+    err.textContent = `配置告警：${cfg.error}`;
+    err.classList.remove("hidden");
+  } else {
+    err.classList.add("hidden");
+    err.textContent = "";
+  }
+
+  // 影响数量仅基于有时间标记的完整快照计算
+  $("#config-impact").textContent =
+    cfg.affected_count == null || cfg.affected_status !== "ok"
+      ? "影响数量：待下一轮筛选（当前没有可比的完整负超单快照数据）"
+      : `影响数量：按最近完整快照，超大单为负标的 ${cfg.affected_count} 只`;
+}
+
+function selectedBoards() {
+  const boards = [];
+  if ($("#cfg-board-main").checked) boards.push("main");
+  if ($("#cfg-board-chinext").checked) boards.push("chinext");
+  if ($("#cfg-board-star").checked) boards.push("star");
+  return boards;
+}
+
+function validateConfigInput() {
+  const top = parseInt($("#cfg-top").value, 10);
+  const interval = parseInt($("#cfg-interval").value, 10);
+  if (!Number.isFinite(top) || top < 3 || top > 50) return "输出条数必须是 3~50 的整数";
+  if (!Number.isFinite(interval) || interval < 10 || interval > 600) return "刷新间隔必须是 10~600 的整数";
+  if (!selectedBoards().length) return "至少选择一个交易板";
+  return null;
+}
+
+async function applyConfig() {
+  const invalid = validateConfigInput();
+  const state = $("#config-apply-state");
+  if (invalid) {
+    state.innerHTML = `<span class="err-text">${esc(invalid)}</span>`;
+    return;
+  }
+  const body = {
+    revision: configState ? configState.revision : undefined,
+    dashboard: {
+      negative_super_view: selectedView(),
+      // 交易板范围必须随每次提交一起发出：整对象提交时漏传该字段会把它重置成默认（仅主板），
+      // 用户改了别的配置却悄悄丢掉筛选范围。
+      enabled_boards: selectedBoards(),
+      top: parseInt($("#cfg-top").value, 10),
+      interval: parseInt($("#cfg-interval").value, 10),
+      network_mode: $("#cfg-network").value,
+    },
+  };
+  const btn = $("#config-apply");
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/api/config/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const res = await resp.json();
+    if (res.status === "ok") {
+      const running = configState && configState.running;
+      state.textContent = running ? "已保存；正在筛选，新配置待下一轮生效" : "已保存，下一轮筛选生效";
+      await loadConfig();
+    } else {
+      state.innerHTML = `<span class="err-text">${esc((res.errors || []).join("；"))}</span>`;
+      await loadConfig();
+    }
+  } catch (e) {
+    state.innerHTML = `<span class="err-text">应用失败：${esc(e.message || e)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("#config-apply").addEventListener("click", applyConfig);
+
 /* ================= 服务器状态与共用运行状态条 ================= */
 async function pollSharedStatus() {
   const el = $("#server-status");
@@ -295,13 +449,19 @@ async function pollSharedStatus() {
     btn.title = "";
   }
 
-  // 本次任务 vs 看板默认：把两个作用域并排说清，避免改错地方。
+  // 本次任务 vs 全局口径：把两个作用域并排说清，避免改错地方。
   const settings = status.settings || {};
   $("#dashboard-options-hint").textContent =
-    `看板自动刷新当前：公告检查 ${settings.skip_announcements ? "关" : "开"} · 资金排名 ${settings.skip_capital_ranking ? "关" : "开"}`;
+    `看板自动刷新当前：公告检查 强制开启 · 资金排名 ${settings.skip_capital_ranking ? "关" : "开"}`;
 }
 SharedUI.startPolling(pollSharedStatus, 5000);
 
 setInterval(() => {
   $("#clock").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }, 1000);
+
+// 看板顶部的口径入口用 /workbench#config 直接落到参数配置页
+if (window.location.hash === "#config") {
+  const btn = document.querySelector('.tab-btn[data-tab="config"]');
+  if (btn) btn.click();
+}

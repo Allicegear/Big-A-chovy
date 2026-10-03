@@ -241,7 +241,63 @@ table.data a:hover { text-decoration: underline; }
 /* 涨跌配色 */
 .up { color: var(--red); }        /* A股红涨 */
 .down { color: var(--green); }    /* A股绿跌 */
+.err-text { color: var(--red); }  /* 错误/校验提示（与涨跌无关） */
+
+/* 参数配置页 */
+.config-block {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 10px 0;
+  background: var(--bg-surface);
+}
+.config-block legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
+.config-block .toggle { margin-right: 18px; }
+.config-status {
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  line-height: 1.8;
+}
+.config-status .pending { color: var(--yellow); }
+/* 设置与快照筛选口径不一致（旧口径快照 / 范围已改但尚未重跑）：提示不可直接比较 */
+.config-status .scope-warn { color: var(--yellow); }
+.config-error {
+  font-size: 12px;
+  color: var(--red);
+  background: var(--red-bg);
+  border: 1px solid #6e3030;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+.rule-list { margin: 4px 0 6px 18px; font-size: 12px; color: var(--text-secondary); }
+.rule-list li { margin: 2px 0; }
+/* 只读的强制规则标记：与可勾选的开关在视觉上区分开 */
+.rule-chip {
+  font-size: 12px;
+  color: var(--green);
+  background: var(--green-bg);
+  border: 1px solid #3b6e35;
+  border-radius: 4px;
+  padding: 3px 8px;
+}
 
 @media (max-width: 720px) {
   .tools-grid { grid-template-columns: 1fr; }
+}
+
+/* ---- 交易板范围的「仅观察」标注 ---- */
+.observe-tag {
+  margin-left: 2px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-size: 10px;
+  white-space: nowrap;
 }

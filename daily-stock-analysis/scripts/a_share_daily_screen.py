@@ -15,7 +15,6 @@ import math
 import os
 import random
 import re
-import ssl
 import sys
 import threading
 import time
@@ -53,6 +52,9 @@ from tools.rule_config import RULE_CONFIG, get_rule_config, hhmm_to_minutes  # n
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import tencent_kline  # noqa: E402
+import runtime_paths  # noqa: E402  运行状态路径唯一来源（A_SHARE_STATE_DIR 可定向到临时目录）
+import state_commit  # noqa: E402  回合状态提交门（超时轮不得提交运行状态）
+import tls_context  # noqa: E402  TLS 校验上下文唯一来源（默认校验证书）
 
 RISK_CONFIG = RULE_CONFIG["risk"]
 SCREENING_CONFIG = RULE_CONFIG["screening"]
@@ -67,7 +69,9 @@ RISK_CHECKED_VALUES = frozenset({RISK_CLEAN, RISK_WATCH, RISK_AVOID})
 
 TZ = ZoneInfo("Asia/Shanghai")
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) daily-stock-analysis/1.0"
-SSL_CONTEXT = ssl._create_unverified_context()
+# 默认做完整证书校验（实测所有行情主机证书链有效）。需要自签 CA 时配置
+# A_SHARE_CA_BUNDLE 而不是关掉校验；证书失败按数据不可用处理。
+SSL_CONTEXT = tls_context.build_context()
 import network_path  # 多路径实测延迟择优（直连+候选代理端口），软件无关
 
 # ── Per-host circuit breaker ──────────────────────────────────────────
@@ -102,7 +106,7 @@ def _mark_host_ok(url: str) -> None:
 # When ALL hosts fail in a run, record the timestamp.  Subsequent runs
 # within _EM_COOLDOWN seconds skip East Money entirely and go straight
 # to the Sina fallback, saving ~30 s of wasted retry time.
-_EM_COOLDOWN_FILE = SCRIPT_DIR / ".em_cooldown"
+_EM_COOLDOWN_FILE = runtime_paths.state_file(".em_cooldown")
 # 指数退避：第1次封 120s → 第2次 300s → 第3次起 600s
 _EM_COOLDOWN_BACKOFF = [120, 300, 600]
 
@@ -230,7 +234,7 @@ MARKET_FETCH_STATUS: Dict[str, Any] = {
     "retrieved_rows": 0,
 }
 NETWORK_MODE = "auto"
-ANNOUNCEMENT_CACHE_FILE = SCRIPT_DIR / ".announcement_risk_cache.json"
+ANNOUNCEMENT_CACHE_FILE = runtime_paths.state_file(".announcement_risk_cache.json")
 _ANNOUNCEMENT_RISK_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 ANNOUNCEMENT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS = 4
@@ -238,7 +242,7 @@ ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS = 4
 # The raw dual-pool intersection remains an audit signal.  This second layer
 # tracks whether that signal is new, confirmed, late, or actually eligible
 # for a new position.  It never reads holdings.json or uses simulated trades.
-INTERSECTION_STATE_FILE = SCRIPT_DIR / "intersection_state.json"
+INTERSECTION_STATE_FILE = runtime_paths.state_file("intersection_state.json")
 INTERSECTION_CALIBRATION_FILE = SCRIPT_DIR / "intersection_calibration.json"
 DEFAULT_INTERSECTION_CONFIG = get_rule_config()["intersection"]
 INTERSECTION_CONFIG_VERSION = "default-v2"
@@ -366,7 +370,8 @@ def fetch_json(url: str, params: Dict[str, Any], timeout: int = 6, retries: int 
                 }
                 for label, session in sessions:
                     try:
-                        resp = session.get(url, params=params, headers=headers, timeout=timeout, verify=False)
+                        resp = session.get(url, params=params, headers=headers, timeout=timeout,
+                                           verify=tls_context.requests_verify())
                         resp.raise_for_status()
                         _mark_host_ok(url)
                         return resp.json()
@@ -567,11 +572,59 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def valid_main_board(row: Dict[str, Any]) -> bool:
-    code = str(row.get("f12", ""))
-    name = str(row.get("f14", ""))
-    if not code.startswith(("60", "00")):
+# ── 交易板分类 ───────────────────────────────────────────────────────
+# 取值与 dashboard_settings.BOARD_* 一致，但在此独立定义：筛选引擎与 CLI 都要用，
+# 不该反向依赖看板配置模块。这里的“板”是交易板（上市板块），与按行业计算的
+# 「板块共振」是两个概念。
+BOARD_MAIN = "main"
+BOARD_CHINEXT = "chinext"
+BOARD_STAR = "star"
+BOARD_UNKNOWN = "unknown"
+BOARD_ORDER = (BOARD_MAIN, BOARD_CHINEXT, BOARD_STAR)
+BOARD_LABELS = {
+    BOARD_MAIN: "沪深主板",
+    BOARD_CHINEXT: "创业板",
+    BOARD_STAR: "科创板",
+    BOARD_UNKNOWN: "未知板",
+}
+
+
+def board_of(code: Any) -> str:
+    """按代码前缀判定交易板；不确定的一律 unknown，由调用方排除。
+
+    沪深主板 60/00（含 001/002/003）、创业板 300/301、科创板 688/689。
+    北交所（43/83/87/920 等）与其它代码暂不在选项内 → unknown。
+    """
+    text = str(code or "").strip()
+    if text.startswith(("60", "00")):
+        return BOARD_MAIN
+    if text.startswith(("300", "301")):
+        return BOARD_CHINEXT
+    if text.startswith(("688", "689")):
+        return BOARD_STAR
+    return BOARD_UNKNOWN
+
+
+def normalize_boards(boards: Any) -> List[str]:
+    """把外部传入的交易板集合归一为固定顺序、去重、剔除未知值。
+
+    非法输入（空、未知值、类型错误）一律回退 ``["main"]``：失败时取**最窄**范围，
+    而不是悄悄放宽到全部交易板。
+    """
+    if isinstance(boards, str):
+        boards = [boards]
+    if not isinstance(boards, (list, tuple, set)):
+        return [BOARD_MAIN]
+    chosen = {str(item) for item in boards}
+    ordered = [board for board in BOARD_ORDER if board in chosen]
+    return ordered or [BOARD_MAIN]
+
+
+def valid_board_row(row: Dict[str, Any], boards: Any = (BOARD_MAIN,)) -> bool:
+    """所选交易板内、且字段齐全的非 ST/退市行情行。"""
+    if board_of(row.get("f12")) not in set(normalize_boards(boards)):
         return False
+    name = str(row.get("f14", ""))
     if "ST" in name.upper() or name.startswith("*") or "退" in name:
         return False
     required = ["f2", "f3", "f5", "f6", "f8", "f10", "f15", "f18", "f21"]
@@ -581,6 +634,11 @@ def valid_main_board(row: Dict[str, Any]) -> bool:
     if row.get("_source") == "sina_fallback":
         required.remove("f10")
     return all(row.get(k) not in (None, "-") for k in required)
+
+
+def valid_main_board(row: Dict[str, Any]) -> bool:
+    """兼容旧调用点：等价于只筛沪深主板。"""
+    return valid_board_row(row, (BOARD_MAIN,))
 
 
 def is_a_share_row(row: Dict[str, Any]) -> bool:
@@ -1155,9 +1213,9 @@ def _load_announcement_risk_cache() -> Dict[str, Dict[str, Any]]:
 
 def _save_announcement_risk_cache(cache: Dict[str, Dict[str, Any]]) -> None:
     try:
-        ANNOUNCEMENT_CACHE_FILE.write_text(
-            json.dumps(cache, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        # 原子写入：轮次被中断/进程被杀时不留下半截 JSON（读取侧会整体丢弃坏文件）。
+        state_commit.atomic_write_text(
+            ANNOUNCEMENT_CACHE_FILE, json.dumps(cache, ensure_ascii=False, indent=2)
         )
     except Exception:
         # A cache write failure must never turn a valid screening result into
@@ -1196,6 +1254,33 @@ def announcement_label(row: Dict[str, Any]) -> str:
     return risk
 
 
+# ── 公告风险政策（唯一语义，依据 选股框架.md「一、信号与建仓门禁」）──────────
+# clean：正常；watch_risk：仅减分，不阻断正式资格；avoid/unknown：一票否决。
+# 所有模块（双池交集状态机、准交集、观察池突破、资金排名、输出标签）都必须读这里，
+# 不得各自把“非 clean”当成硬否决——那是把软风险和框架一票否决混为一谈。
+RISK_HARD_VETO = frozenset({RISK_AVOID, RISK_UNKNOWN})
+
+
+def risk_blocks_formal_qualification(risk: Any) -> bool:
+    """avoid/unknown 一票否决；clean/watch_risk 不因“非 clean”被否决。"""
+    return str(risk or RISK_UNKNOWN) in RISK_HARD_VETO
+
+
+def risk_allows_state_qualification(risk: Any) -> bool:
+    """状态资格（可否推进到 ENTRY_ELIGIBLE 等）只看是否触及一票否决。"""
+    return not risk_blocks_formal_qualification(risk)
+
+
+def risk_note_text(risk: Any) -> str:
+    """人类可读风险标注：软风险与一票否决必须分开表述。"""
+    status = str(risk or RISK_UNKNOWN)
+    if status == RISK_CLEAN:
+        return ""
+    if status == RISK_WATCH:
+        return f"公告{RISK_WATCH}（仅减分，非一票否决）"
+    return f"公告风险否决({status})"
+
+
 def append_risk_text(existing: str, extra: str) -> str:
     if not extra:
         return existing
@@ -1204,6 +1289,16 @@ def append_risk_text(existing: str, extra: str) -> str:
     if extra in existing:
         return existing
     return f"{existing}/{extra}"
+
+
+# 参与公告核验的栏目：公告查询范围 = 这些栏目里出现的全部代码（去重）。
+# 不含 trend_diagnostics：那是仅供解释的近似命中行，不能把它变成一人一次请求。
+ANNOUNCEMENT_SECTIONS = (
+    "strict_ultra", "trend_observation", "strict_trend", "dual_pool",
+    "capital_rank", "dual_pool_raw", "low_ultra", "low_trend", "watchlist",
+    "pre_intersection",   # 准交集表必须与其它表读到同一份风险结果
+    "negative_super_observations",  # 负超单观察行展示的公告状态须与其它表同源
+)
 
 
 def attach_announcement_risks(
@@ -1218,11 +1313,7 @@ def attach_announcement_risks(
     # They are for explanation only, so they must not turn one checkbox into
     # one network request per near-miss stock. Check only visible/actionable
     # sections; matching diagnostic rows are annotated from this same map.
-    for section in (
-        "strict_ultra", "trend_observation", "strict_trend", "dual_pool",
-        "capital_rank", "dual_pool_raw", "low_ultra", "low_trend", "watchlist",
-        "pre_intersection",   # 准交集表必须与其它表读到同一份风险结果
-    ):
+    for section in ANNOUNCEMENT_SECTIONS:
         rows.extend(result.get(section) or [])
     codes = sorted({str(r.get("code")) for r in rows if r.get("code")})
     result["announcement_total_count"] = len(codes)
@@ -1657,9 +1748,12 @@ def fetch_kline(code: str, limit: int = 90) -> Tuple[List[Dict[str, float]], str
     raise RuntimeError(f"all kline sources failed for {code}")
 
 
-def enrich(row: Dict[str, Any]) -> Optional[Enriched]:
+def enrich(
+    row: Dict[str, Any],
+    fetch_kline_fn: Optional[Callable[..., Tuple[List[Dict[str, float]], str]]] = None,
+) -> Optional[Enriched]:
     r = normalize_row(row)
-    rows, source = fetch_kline(r["code"], 90)
+    rows, source = (fetch_kline_fn or fetch_kline)(r["code"], 90)
     if len(rows) < 65:
         return None
     closes = [x["close"] for x in rows]
@@ -1712,9 +1806,24 @@ def enrich(row: Dict[str, Any]) -> Optional[Enriched]:
     )
 
 
-def sector_stats(rows: List[Dict[str, Any]], breadth: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+def sector_stats(
+    rows: List[Dict[str, Any]],
+    breadth: Optional[Dict[str, Any]] = None,
+    boards: Any = (BOARD_MAIN,),
+) -> Dict[str, Dict[str, Any]]:
+    """行业统计。
+
+    口径（2026-09-30 起）：
+    - **行业上涨比例、平均涨幅**（``adv`` / ``sum`` / ``n``）继续用全市场 A 股背景，
+      只按行业聚合，不随交易板范围变化；
+    - **行业强势股数量**（``strong``）只统计**本轮所选交易板**内的股票，因此同行业
+      可以跨主板、创业板、科创板形成共振；默认只选主板时与历史口径逐值一致。
+    - 注意：``resonance_cfg["main_board_prefixes"]`` **不在这里使用**——它仍服务于
+      `market_summary` 的「主板涨停／跌停」统计，两个用途必须分开（否则扩大交易板
+      范围会悄悄改变"主板涨跌停"的分母）。
+    """
     resonance_cfg = SCREENING_CONFIG["resonance"]
-    main_board_prefixes = tuple(str(prefix) for prefix in resonance_cfg["main_board_prefixes"])
+    selected = set(normalize_boards(boards))
     stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"n": 0, "adv": 0, "strong": 0, "sum": 0.0})
     for row in rows:
         if not is_a_share_row(row) or not is_number(row.get("f3")):
@@ -1725,7 +1834,7 @@ def sector_stats(rows: List[Dict[str, Any]], breadth: Optional[Dict[str, Any]] =
         if row.get("f3", 0) > 0:
             stats[sec]["adv"] += 1
         if (
-            str(row.get("f12", "")).startswith(main_board_prefixes)
+            board_of(row.get("f12")) in selected
             and row.get("f3", 0) >= float(resonance_cfg["strong_change_min_inclusive"])
             and is_number(row.get("f6")) and row.get("f6") >= float(resonance_cfg["strong_amount_min_inclusive"])
         ):
@@ -1734,6 +1843,7 @@ def sector_stats(rows: List[Dict[str, Any]], breadth: Optional[Dict[str, Any]] =
     stats["__meta__"] = {
         "resonance_usable": bool(quality.get("resonance_usable", True)),
         "quality_reason": quality.get("quality_reason", ""),
+        "strong_scope_boards": list(selected),
     }
     return stats
 
@@ -2242,11 +2352,23 @@ def market_summary(
     }
 
 
-def filter_prefetch(rows: List[Dict[str, Any]], modes: List[str]) -> List[Dict[str, Any]]:
+def filter_prefetch(
+    rows: List[Dict[str, Any]],
+    modes: List[str],
+    boards: Any = (BOARD_MAIN,),
+) -> List[Dict[str, Any]]:
+    """按模块与交易板预筛候选。
+
+    ``boards`` 默认只含沪深主板，因此默认输出与历史基线逐行一致。所选的创业板／
+    科创板行与主板行**同样进入正式链路**（资金增量与状态 → 超短池／趋势池 →
+    双池交集 → 资金优选／低吸／明日观察池 → 状态机），使用同一套门槛与排名：
+    本文只负责按范围放行，不放宽也不收紧任何策略条件。未选的交易板在这里就被
+    挡掉，正式池因此不会混入未选交易板的股票。
+    """
     ultra_cfg = SCREENING_CONFIG["strict_ultra"]
     trend_cfg = SCREENING_CONFIG["strict_trend"]
     observation_cfg = SCREENING_CONFIG["trend_observation"]
-    valid = [r for r in rows if valid_main_board(r)]
+    valid = [r for r in rows if valid_board_row(r, boards)]
     has_all = "all" in modes
     has_strict = has_all or "strict" in modes
     has_low = has_all or "low" in modes
@@ -2293,11 +2415,15 @@ def filter_prefetch(rows: List[Dict[str, Any]], modes: List[str]) -> List[Dict[s
     return list(dedup.values())
 
 
-def enrich_all(rows: List[Dict[str, Any]], workers: int) -> Tuple[List[Enriched], List[str]]:
+def enrich_all(
+    rows: List[Dict[str, Any]],
+    workers: int,
+    fetch_kline_fn: Optional[Callable[..., Tuple[List[Dict[str, float]], str]]] = None,
+) -> Tuple[List[Enriched], List[str]]:
     out: List[Enriched] = []
     errors: List[str] = []
     with futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        future_map = {pool.submit(enrich, r): str(r.get("f12")) for r in rows}
+        future_map = {pool.submit(enrich, r, fetch_kline_fn): str(r.get("f12")) for r in rows}
         for fut in futures.as_completed(future_map):
             code = future_map[fut]
             try:
@@ -2313,7 +2439,7 @@ def enrich_all(rows: List[Dict[str, Any]], workers: int) -> Tuple[List[Enriched]
 
 # ── snapshot & flow classification ──────────────────────────────────────
 
-FLOW_SNAPSHOT_PATH = Path(__file__).resolve().parent / "flow_snapshot.json"
+FLOW_SNAPSHOT_PATH = runtime_paths.state_file("flow_snapshot.json")
 
 
 def load_flow_history() -> Dict[str, List[Dict[str, Any]]]:
@@ -2333,13 +2459,19 @@ def load_flow_history() -> Dict[str, List[Dict[str, Any]]]:
     return {}
 
 
-def save_flow_history(enriched: List[Enriched], history: Dict[str, List[Dict[str, Any]]]) -> None:
-    """Save current query's capital flow data, appending to history. Keep last 30 minutes."""
+def save_flow_history(
+    enriched: List[Enriched],
+    history: Dict[str, List[Dict[str, Any]]],
+    commit: Optional[state_commit.RoundCommit] = None,
+) -> None:
+    """Save current query's capital flow data, appending to history. Keep last 30 minutes.
+
+    ``commit`` 非空时只暂存（超时轮会被丢弃），为空时立即原子落盘（CLI/单测行为）。
+    """
     import time as _t
     now = _t.time()
     flow_cfg = SCREENING_CONFIG["flow"]
     cutoff = now - float(flow_cfg["history_retention_seconds"])
-    entry = {"ts": now}
     for e in enriched:
         if e.code not in history:
             history[e.code] = []
@@ -2357,10 +2489,9 @@ def save_flow_history(enriched: List[Enriched], history: Dict[str, List[Dict[str
         # Also remove the placeholder entry we added at the start
     # Remove codes with no valid entries
     history = {k: v for k, v in history.items() if v}
-    try:
-        FLOW_SNAPSHOT_PATH.write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    state_commit.write_or_stage(
+        commit, FLOW_SNAPSHOT_PATH, json.dumps(history, ensure_ascii=False)
+    )
 
 
 def apply_flow_increments(enriched: List[Enriched], history: Dict[str, List[Dict[str, Any]]]) -> None:
@@ -2854,6 +2985,24 @@ def flow_veto_suffix(row: Dict[str, Any]) -> str:
     return f"；❌{row['flow_veto']}" if row.get("flow_veto") else ""
 
 
+def shadow_badge_text(badge: Optional[Dict[str, Any]]) -> str:
+    """负超单观察行的影子徽标文案。
+
+    徽标由报告落盘后的只读判定器（tools/detect_divergence_leader）回填；
+    未回填、历史不足或该股不在判定器的低吸表中，一律显示“未完成判定”，
+    不得显示成“不符合”。
+    """
+    if not isinstance(badge, dict):
+        return "未完成判定"
+    status = badge.get("status")
+    if status == "triggered":
+        when = badge.get("trigger_time") or "-"
+        return f"今日已触发影子条件 · 触发时间 {when}"
+    if status == "not_triggered":
+        return "未触发（判定完成）"
+    return "未完成判定"
+
+
 def flow_status_cell(row: Dict[str, Any]) -> str:
     """资金状态单元格：拼上一票否决标记。
 
@@ -2868,6 +3017,80 @@ def capital_data_label(e: Enriched, has_5m: bool) -> str:
     if not has_5m:
         return "仅当前快照"
     return "含分钟序列" if e.flow_baseline_source == "fflow" else "含连续快照"
+
+
+def is_negative_super(e: Any) -> bool:
+    """是否属于「超大单为负」样本：必须是有限数值且为负。
+
+    缺失、NaN、±inf 一律不算负值样本，也不得视为通过门槛。
+    """
+    super_net = getattr(e, "super_net", None)
+    if not is_number(super_net):
+        return False
+    value = float(super_net)
+    return math.isfinite(value) and value < 0
+
+
+def count_negative_super_observations(enriched: List["Enriched"]) -> int:
+    """只统计数量、不构造观察行、不触发任何公告查询。
+
+    严格模式（负超单观察未开启）用它报告“影响数量”，避免为隐藏列表白跑公告接口。
+    """
+    return sum(1 for e in enriched if is_negative_super(e))
+
+
+def build_negative_super_observations(
+    enriched: List["Enriched"],
+    stats: Dict[str, Dict[str, Any]],
+    flow_history: Optional[Dict[str, List[Dict[str, Any]]]],
+    ts,
+) -> List[Dict[str, Any]]:
+    """负超单观察：独立的观察列表，不进入任何真实仓/模拟仓资格。
+
+    与生产否决标记同源（``super_net < 0``），但这里只如实展示事实与卡点：
+      - 只收 ``is_negative_super`` 的行；缺失或非数值一律不算负值样本。
+      - 逐项列出未通过的门槛（超大单为负一票否决、非 absolute 主导），
+        不伪造 absolute/coalition 标签，也不写成“仅差一个条件即可买”。
+    """
+    rows: List[Dict[str, Any]] = []
+    data_time = ts.strftime("%Y-%m-%d %H:%M:%S") if ts is not None else ""
+    for e in enriched:
+        if not is_negative_super(e):
+            continue
+        dom_type, dom_label = evaluate_dominance_type(e, flow_history)
+        blockers: List[str] = []
+        if e.flow_veto:
+            blockers.append(f"{e.flow_veto}（框架一票否决）")
+        if dom_type != "absolute":
+            blockers.append(f"主导标签 {dom_label}，不满足 absolute（真实仓资格）")
+        rows.append({
+            "code": e.code,
+            "name": e.name,
+            "data_time": data_time,
+            "price": e.price,
+            "change": e.change,
+            "turnover": e.turnover,
+            "amount": e.amount,
+            "industry": e.industry,
+            "super_net": e.super_net,
+            "main_net": e.main_net,
+            "big_net": e.big_net,
+            "main_pct": e.main_pct,
+            "flow_5m_inc": e.flow_5m_inc,
+            "vwap_state": e.vwap_state,
+            "price_above_vwap": e.price_above_vwap,
+            "resonance": "是" if has_resonance(e, stats) else "否",
+            "flow_status": e.flow_status,
+            "flow_veto": e.flow_veto,
+            "risk_status": e.risk_status,
+            "dominance_type": dom_type,
+            "dominance_label": dom_label,
+            "blockers": blockers,
+            # 报告落盘后由只读判定器回填影子徽标；未回填一律视为“未完成判定”。
+            "shadow_badge": None,
+        })
+    rows.sort(key=lambda r: r["super_net"])
+    return rows
 
 
 def classify_flow(e: Enriched, stats: Dict[str, Dict[str, Any]], has_snapshot: bool) -> str:
@@ -3325,20 +3548,23 @@ def load_intersection_state() -> Dict[str, Any]:
     return {"date": "", "items": {}}
 
 
-def save_intersection_state(items: Dict[str, Dict[str, Any]], date_text: str) -> None:
-    """按交易日原子写入（tmp + os.replace），进程被杀不产生半截文件。"""
-    try:
-        for item in items.values():
-            if isinstance(item, dict):
-                item.setdefault("trade_date", date_text)
-        tmp = INTERSECTION_STATE_FILE.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps({"date": date_text, "items": items}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(tmp, INTERSECTION_STATE_FILE)
-    except Exception:
-        pass
+def save_intersection_state(
+    items: Dict[str, Dict[str, Any]],
+    date_text: str,
+    commit: Optional[state_commit.RoundCommit] = None,
+) -> None:
+    """按交易日原子写入（tmp + os.replace），进程被杀不产生半截文件。
+
+    ``commit`` 非空时只暂存：看板超时/失败的一轮不得提交交集状态。
+    """
+    for item in items.values():
+        if isinstance(item, dict):
+            item.setdefault("trade_date", date_text)
+    state_commit.write_or_stage(
+        commit,
+        INTERSECTION_STATE_FILE,
+        json.dumps({"date": date_text, "items": items}, ensure_ascii=False, indent=2),
+    )
 
 
 def _parse_intersection_datetime(value: Any) -> Optional[datetime]:
@@ -3388,8 +3614,8 @@ def _intersection_rejection_reasons(row: Dict[str, Any]) -> List[str]:
         reasons.append("无板块共振")
 
     risk = _row_risk_status(row)
-    if risk != RISK_CLEAN:
-        reasons.append(f"公告风险非clean({risk})")
+    if risk_blocks_formal_qualification(risk):
+        reasons.append(f"公告风险否决({risk})")
 
     deduped: List[str] = []
     for reason in reasons:
@@ -3606,8 +3832,9 @@ def compute_pre_intersection(
     diag_by_code: Dict[str, Dict[str, Any]],
     cfg: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """准交集预警：超短池 + 距趋势确认(质量条件)仅差1项 + 四道门槛（相位由 evaluate 决定）。
+    """准交集预警：超短池 + 距趋势确认(质量条件)仅差1项 + 前置门槛通过（相位由 evaluate 决定）。
 
+    前置门槛为 主力净额 / 5分钟资金 / 均价线上；板块共振已降为参考项，不单独否决。
     缺失条件与"差一项"判定直接用行内字段（价格相对MA/MA20斜率/当日涨幅/5日涨幅/
     距60高/换手/成交/量能），不含价格区间与流通市值（已由超短池约束），避免错误
     排除哈药(~5.8)等低价强势股。候选行携带 preintersection_missing 与 trigger_price。
@@ -3676,7 +3903,7 @@ def compute_pre_intersection(
         row["gate_failures"] = gate_failures
         row["gate_failure_text"] = "；".join(gate_failures) if gate_failures else "全部通过"
         row["risk_note"] = (
-            f"公告风险仅观察({risk})" if (phase in ("准交集", "等待转强") and risk != RISK_CLEAN) else ""
+            risk_note_text(risk) if (phase in ("准交集", "等待转强") and risk != RISK_CLEAN) else ""
         )
         out.append(row)
     return out
@@ -3744,15 +3971,18 @@ def evaluate_intersection_states(
             return status if status else RISK_UNKNOWN
         return _row_risk_status(row)
 
-    def _entry_allowed(risk: str) -> Tuple[bool, str]:
-        """新开仓资格 = 公告clean + 未过14:20 + 市场环境非CASH。
+    def _entry_allowed(risk: str, flow_veto: str = "") -> Tuple[bool, str]:
+        """新开仓资格 = 公告非一票否决 + 超大单非负 + 未过14:20 + 市场环境非CASH。
 
-        watch_risk 可预警可观察但不得新开仓；avoid/unknown 均否决。
+        框架一票否决有两条在这台状态机上生效：公告 avoid/unknown，以及超大单为负。
+        watch_risk 仅减分，不阻断状态资格（见 选股框架.md「一、信号与建仓门禁」）。
         DOWNGRADE 环境的附加条件（clean+共振+回踩确认）已是 ENTRY_ELIGIBLE
         的必要条件；CASH 一律禁止。
         """
-        if risk != RISK_CLEAN:
+        if risk_blocks_formal_qualification(risk):
             return False, f"公告风险否决({risk})"
+        if flow_veto:
+            return False, f"{flow_veto}（框架一票否决）"
         if past_deadline:
             return False, "已过新开仓截止，仅供明日观察"
         if market_mode == "CASH":
@@ -3775,12 +4005,12 @@ def evaluate_intersection_states(
         phase_code = _canonical_phase(item.get("phase"))
         label = display_label or PHASE_LABELS.get(phase_code, phase_code)
         risk = item.get("risk_status") or _risk_for(code, row)
-        risk_clean = risk == RISK_CLEAN
         first = _parse_intersection_datetime(item.get("first_intersection_at")) or now
         age = round(max(0.0, (now - first).total_seconds() / 60), 1)
         minute_info = minute_map.get(code)
         fresh, m_age, m_status, _m_block = _minute_freshness(minute_info, cfg)
-        allowed, block = _entry_allowed(risk)
+        flow_veto = str(row.get("flow_veto") or "")
+        allowed, block = _entry_allowed(risk, flow_veto)
         eligible = phase_code == PHASE_ENTRY and allowed
         entry_block = item.get("entry_block_reason") or ("" if allowed else block)
         row.update({
@@ -3812,7 +4042,7 @@ def evaluate_intersection_states(
             "new_open_eligible": eligible,
             "new_entry_allowed": allowed,
             "entry_block_reason": entry_block,
-            "risk_note": "" if risk_clean else f"公告风险仅观察({risk})",
+            "risk_note": risk_note_text(risk),
             "announcement_risk": risk,
             "risk_status": risk,
             "minute_data_fresh": fresh,
@@ -3915,7 +4145,7 @@ def evaluate_intersection_states(
             and is_number(flow5) and flow5 > 0
             and is_number(flow15) and flow15 > 0
             and resonance
-            and risk == RISK_CLEAN
+            and risk_allows_state_qualification(risk)   # avoid/unknown 一票否决；watch_risk 仅减分
         )
         if not fresh:
             retest_confirmed = False
@@ -3935,7 +4165,7 @@ def evaluate_intersection_states(
                 item["phase"] = PHASE_WAIT_RETEST    # 确认中断，回到等待并重新计数
                 return
             if count >= retest_need:                 # 连续第2次确认（不同快照）
-                allowed, block = _entry_allowed(risk)
+                allowed, block = _entry_allowed(risk, str(row.get("flow_veto") or ""))
                 if allowed and not past_deadline:    # 两次确认都必须在14:20前完成
                     item["phase"] = PHASE_ENTRY
                     item["entry_confirmed_at"] = now_text
@@ -4137,7 +4367,7 @@ def _sanitize_for_json(obj: Any) -> Any:
     return obj
 
 
-WATCHLIST_BREAKOUT_STATE_PATH = Path(__file__).resolve().parent / "watchlist_breakout_state.json"
+WATCHLIST_BREAKOUT_STATE_PATH = runtime_paths.state_file("watchlist_breakout_state.json")
 
 
 def load_watchlist_breakout_state() -> Dict[str, Dict[str, Any]]:
@@ -4152,13 +4382,16 @@ def load_watchlist_breakout_state() -> Dict[str, Dict[str, Any]]:
     return {}
 
 
-def save_watchlist_breakout_state(items: Dict[str, Dict[str, Any]], date_str: str) -> None:
-    """持久化保存观察池突破状态机。"""
-    try:
-        payload = {"date": date_str, "items": items}
-        WATCHLIST_BREAKOUT_STATE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+def save_watchlist_breakout_state(
+    items: Dict[str, Dict[str, Any]],
+    date_str: str,
+    commit: Optional[state_commit.RoundCommit] = None,
+) -> None:
+    """持久化保存观察池突破状态机（临时文件 + os.replace 原子写入）。"""
+    payload = {"date": date_str, "items": items}
+    state_commit.write_or_stage(
+        commit, WATCHLIST_BREAKOUT_STATE_PATH, json.dumps(payload, ensure_ascii=False, indent=2)
+    )
 
 
 def evaluate_watchlist_breakout_states(
@@ -4255,6 +4488,14 @@ def evaluate_watchlist_breakout_states(
             breakout_class = "INVALID"
             confirm_count = 0
             status_note = f"公告风控 {RISK_AVOID} 否决"
+        elif risk == RISK_UNKNOWN:
+            # 公告 unknown 与 avoid 同为一票否决语义：可以继续展示“数据不足”的观察信息，
+            # 但不得输出 TRIGGERED/CONFIRMED/B_BREAKOUT/A_STRICT 等看似升级的状态
+            # （选股框架.md：公告 unknown 禁止正式买入建议）。
+            confirm_count = 0
+            cur_phase = "WATCHING"
+            breakout_class = "WATCHING"
+            status_note = "公告检查不可用（unknown），仅观察不升级"
         elif cur_price > no_chase_price:
             cur_phase = "OVER_CHASE"
             breakout_class = "WATCHING"
@@ -4445,6 +4686,17 @@ def render_markdown(result: Dict[str, Any]) -> str:
     lines: List[str] = []
     meta = result["meta"]
     lines.append(f"数据时间：{meta['timestamp']}，状态：{meta['status']}，耗时 {meta.get('elapsed_seconds', '?')}s。来源：{meta['source']}。")
+    # 交易板范围：报告必须能追溯本轮实际筛了什么范围，避免把扩展板沉默地混进主板结论。
+    if meta.get("enabled_boards_label"):
+        lines.append(
+            f"筛选范围（交易板）：{meta['enabled_boards_label']}"
+            + ("（默认，仅沪深主板）" if list(meta.get("enabled_boards") or []) == [BOARD_MAIN] else "")
+            + "；所选交易板统一参与正式筛选（同一门槛、同一排名、同一条状态机）。"
+        )
+    # 范围结论在结果顶层（引擎/CLI 同位置），旧结果可能把它放在 meta 里。
+    scope_note = result.get("board_scope_note") or meta.get("board_scope_note")
+    if scope_note:
+        lines.append(scope_note)
     b = result["breadth"]
     fetch_status = result.get("market_fetch_status") or {}
     if fetch_status.get("source") == "sina_fallback":
@@ -4510,7 +4762,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
 
     if result.get("capital_rank"):
         rows = [[
-            r["capital_class"], r.get("pool_source", ""), r["code"], r["name"], _fmt(r.get("price")),
+            r["capital_class"], r.get("pool_source", ""), r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")),
             pct(r.get("change")), range_position_cell(r), f"{_fmt(r.get('capital_score'), 1)}",
             flow_amount_str(r.get("main_net", 0)), f"{r.get('main_pct', 0):.1f}%",
             flow_amount_str(r.get("super_net", 0)),
@@ -4519,14 +4771,14 @@ def render_markdown(result: Dict[str, Any]) -> str:
             r.get("capital_data", ""), r.get("capital_reason", ""),
         ] for r in result["capital_rank"]]
         lines += ["", "## 主力资金优选（候选池二次排序）", markdown_table(
-            ["资金类", "原始来源", "代码", "名称", "现价", "涨幅", "区间分位", "资金评分", "主力净额",
+            ["资金类", "原始来源", "代码", "名称", "交易板", "现价", "涨幅", "区间分位", "资金评分", "主力净额",
              "主力净占比", "超大单", "5分钟增量", "均价线", "板块共振",
              "数据完整度", "评分依据"], rows)]
 
     raw_dual_pool = result.get("dual_pool_raw") if "dual_pool_raw" in result else result.get("dual_pool") or []
     if raw_dual_pool:
-        rows = [[r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), range_position_cell(r), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], f"{r.get('main_pct',0):.1f}%", flow_status_cell(r), announcement_label(r)] for r in raw_dual_pool]
-        lines += ["", "## 双池交集（超短池 ∩ 趋势确认池，启动事件）", "注：交集仅代表启动确认，不是买点；真正买点由交集后的缩量回踩产生（见下方状态机）。", markdown_table(["代码", "名称", "现价", "涨幅", "区间分位", "换手率", "成交额", "板块", "主力净占比", "资金状态", "公告风险"], rows)]
+        rows = [[r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), range_position_cell(r), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], f"{r.get('main_pct',0):.1f}%", flow_status_cell(r), announcement_label(r)] for r in raw_dual_pool]
+        lines += ["", "## 双池交集（超短池 ∩ 趋势确认池，启动事件）", "注：交集仅代表启动确认，不是买点；真正买点由交集后的缩量回踩产生（见下方状态机）。", markdown_table(["代码", "名称", "交易板", "现价", "涨幅", "区间分位", "换手率", "成交额", "板块", "主力净占比", "资金状态", "公告风险"], rows)]
     elif "dual_pool" in result:
         lines += ["", "## 双池交集（超短池 ∩ 趋势确认池，启动事件）", "无"]
 
@@ -4551,7 +4803,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
         # ── 准交集预警 ──
         if pre_rows_md:
             pre_table = [[
-                r.get("code", ""), r.get("name", ""), f"{r.get('price', 0):.2f}", pct(r.get("change")),
+                r.get("code", ""), r.get("name", ""), r.get("board_label", ""), f"{r.get('price', 0):.2f}", pct(r.get("change")),
                 r.get("intersection_phase", ""),
                 r.get("preintersection_missing", "-"),
                 (f"{r['trigger_price']:.2f}" if is_number(r.get("trigger_price")) else "—"),
@@ -4559,22 +4811,22 @@ def render_markdown(result: Dict[str, Any]) -> str:
                 r.get("risk_note") or announcement_label(r),
             ] for r in pre_rows_md if r.get("intersection_phase") in ("准交集", "等待转强")]
             if pre_table:
-                lines += ["", "### 【准交集预警】", "距趋势确认仅差1项 + 四道门槛（主力净流入/5分资金正/均价线上/板块共振）全部通过。公告风险非clean者仅观察，不给新开仓资格。", markdown_table(
-                    ["代码", "名称", "现价", "涨幅", "相位", "缺失条件", "预计触发价", "主力净占比", "资金状态", "板块共振", "公告风险"], pre_table)]
+                lines += ["", "### 【准交集预警】", "距趋势确认仅差1项，并通过主力净额、5分钟资金和均价线前置检查；板块共振在此阶段用于参考，不单独否决。准交集仍是观察信号。公告 avoid/unknown 一票否决（不给新开仓资格），watch_risk 仅减分。", markdown_table(
+                    ["代码", "名称", "交易板", "现价", "涨幅", "相位", "缺失条件", "预计触发价", "主力净占比", "资金状态", "板块共振", "公告风险"], pre_table)]
             # 被前置门槛排除的标的：透明输出未通过门槛，便于核对
             excluded_table = [[
-                r.get("code", ""), r.get("name", ""), f"{r.get('price', 0):.2f}", pct(r.get("change")),
+                r.get("code", ""), r.get("name", ""), r.get("board_label", ""), f"{r.get('price', 0):.2f}", pct(r.get("change")),
                 r.get("preintersection_missing", "-"),
                 r.get("gate_failure_text", "-"),
             ] for r in pre_rows_md if r.get("intersection_phase") == "观察中"]
             if excluded_table:
-                lines += ["", "### 【观察中·门槛未过】", "趋势条件只差1项但四道前置门槛未全过，不进入准交集预警。", markdown_table(
-                    ["代码", "名称", "现价", "涨幅", "缺失趋势条件", "未通过前置门槛"], excluded_table)]
+                lines += ["", "### 【观察中·门槛未过】", "趋势条件只差1项，但前置门槛（主力净额/5分钟资金/均价线）未全过，不进入准交集预警。板块共振不单独否决。", markdown_table(
+                    ["代码", "名称", "交易板", "现价", "涨幅", "缺失趋势条件", "未通过前置门槛"], excluded_table)]
         # ── 已触发·等待回踩 ──
         active_states = [r for r in state_rows if r.get("late_flag") is not True and r.get("intersection_phase") in ("首次交集", "等待回踩", "回踩确认", "可试错")]
         if active_states:
             act_table = [[
-                r.get("code", ""), r.get("name", ""), r.get("first_intersection_at", ""),
+                r.get("code", ""), r.get("name", ""), r.get("board_label", ""), r.get("first_intersection_at", ""),
                 (f"{r['trigger_price']:.2f}" if is_number(r.get("trigger_price")) else "—"),
                 (f"{r['trigger_vwap']:.2f}" if is_number(r.get("trigger_vwap")) else "—"),
                 flow_amount_str(r.get("trigger_flow_5m")) if is_number(r.get("trigger_flow_5m")) else "—",
@@ -4583,34 +4835,34 @@ def render_markdown(result: Dict[str, Any]) -> str:
                 r.get("failure_reason", "-"),
             ] for r in active_states]
             lines += ["", "### 【已触发·等待回踩】", "交集后不追，等待缩量回踩至回踩区且5分资金仍正，方为买点。", markdown_table(
-                ["代码", "名称", "交集时间", "触发价", "当时VWAP", "5分资金", "回踩观察区", "相位", "有效性", "失效原因"], act_table)]
+                ["代码", "名称", "交易板", "交集时间", "触发价", "当时VWAP", "5分资金", "回踩观察区", "相位", "有效性", "失效原因"], act_table)]
         # ── 迟到交集 ──
         late_states = [r for r in state_rows if r.get("late_flag") is True]
         if late_states:
             late_table = [[
-                r.get("code", ""), r.get("name", ""), pct(r.get("change")),
+                r.get("code", ""), r.get("name", ""), r.get("board_label", ""), pct(r.get("change")),
                 "；".join(r.get("late_reasons", []) or []) or "无",
             ] for r in late_states]
             lines += ["", "### 【迟到交集·不追】", "首次交集即过热/无共振，已标记迟到，不提供买点。", markdown_table(
-                ["代码", "名称", "涨幅", "迟到原因"], late_table)]
+                ["代码", "名称", "交易板", "涨幅", "迟到原因"], late_table)]
         if not (pre_rows_md or active_states or late_states):
             lines.append("无（当前无准交集预警，也无正式交集；不为了制造信号而放宽原池条件）")
 
     if result.get("strict_enabled"):
-        rows = [[r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), _fmt(r.get("volume_ratio")), r["industry"], f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), announcement_label(r)] for r in result["strict_ultra"]]
-        content = markdown_table(["代码", "名称", "现价", "涨幅", "换手率", "成交额", "量比", "板块", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
+        rows = [[r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), _fmt(r.get("volume_ratio")), r["industry"], f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), announcement_label(r)] for r in result["strict_ultra"]]
+        content = markdown_table(["代码", "名称", "交易板", "现价", "涨幅", "换手率", "成交额", "量比", "板块", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
         if not rows:
             content = "无（当前没有满足超短池硬条件的标的）"
         lines += ["", "## 超短池", content]
     if result.get("strict_enabled"):
-        rows = [[r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], r.get("ma_state", ""), f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), announcement_label(r)] for r in result.get("trend_observation") or []]
-        content = markdown_table(["代码", "名称", "现价", "涨幅", "换手率", "成交额", "板块", "均线状态", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
+        rows = [[r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], r.get("ma_state", ""), f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), announcement_label(r)] for r in result.get("trend_observation") or []]
+        content = markdown_table(["代码", "名称", "交易板", "现价", "涨幅", "换手率", "成交额", "板块", "均线状态", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
         if not rows:
             content = "无（当前没有满足趋势观察条件的标的）\n\n说明：不以放宽趋势确认来凑数。"
         lines += ["", "## 趋势观察池", content]
     if result.get("strict_enabled"):
-        rows = [[r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), announcement_label(r)] for r in result["strict_trend"]]
-        content = markdown_table(["代码", "名称", "现价", "涨幅", "换手率", "成交额", "板块", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
+        rows = [[r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), announcement_label(r)] for r in result["strict_trend"]]
+        content = markdown_table(["代码", "名称", "交易板", "现价", "涨幅", "换手率", "成交额", "板块", "主力净占比", "5分钟增量", "资金状态", "公告风险"], rows)
         if not rows:
             content = "无（当前没有满足趋势确认硬条件的标的）"
         lines += ["", "## 趋势确认池", content]
@@ -4631,17 +4883,17 @@ def render_markdown(result: Dict[str, Any]) -> str:
     if result.get("low_ultra"):
         ind_counts = Counter(r.get("industry", "") for r in result["low_ultra"])
         rows = [[
-            r["class"], r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), range_position_cell(r), pct(r["turnover"]),
+            r["class"], r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), range_position_cell(r), pct(r["turnover"]),
             amount_yi(r["amount"]), _fmt(r.get("volume_ratio")), r["industry"], ind_counts.get(r.get("industry", ""), 0),
             r["resonance"], f"{_fmt(r.get('high_pull'))}pct", r["vwap_state"], f"{r.get('main_pct',0):.1f}%",
             flow_amount_str(r.get("super_net", 0)),
             r.get("dominance_label") or r.get("super_lead") or "未计算",
             flow_amount_str(r.get("flow_5m_inc", 0)), flow_status_cell(r), r["risk"], announcement_label(r),
         ] for r in result["low_ultra"]]
-        lines += ["", "## 低吸超短线 A/B/C", markdown_table(["类", "代码", "名称", "现价", "涨幅", "区间分位", "换手率", "成交额", "量比", "板块", "板块内候选", "共振", "高位回落", "均价线", "主力净占比", "超大单", "超单主导", "5分钟增量", "资金状态", "风险", "公告风险"], rows)]
+        lines += ["", "## 低吸超短线 A/B/C", markdown_table(["类", "代码", "名称", "交易板", "现价", "涨幅", "区间分位", "换手率", "成交额", "量比", "板块", "板块内候选", "共振", "高位回落", "均价线", "主力净占比", "超大单", "超单主导", "5分钟增量", "资金状态", "风险", "公告风险"], rows)]
     if result.get("low_trend"):
-        rows = [[r["class"], r["code"], r["name"], _fmt(r.get("price")), pct(r["change"]), range_position_cell(r), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], r["ma_state"], pct((r.get("five_ret") or 0) * 100), pct((r.get("ma20_dist") or 0) * 100), f"{_fmt(r.get('high_pull'))}pct", f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), r["risk"], announcement_label(r)] for r in result["low_trend"]]
-        lines += ["", "## 低吸短线趋势 A/B/C", markdown_table(["类", "代码", "名称", "现价", "涨幅", "区间分位", "换手率", "成交额", "板块", "均线状态", "近5日", "距20日线", "高位回落", "主力净占比", "5分钟增量", "资金状态", "风险", "公告风险"], rows)]
+        rows = [[r["class"], r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r["change"]), range_position_cell(r), pct(r["turnover"]), amount_yi(r["amount"]), r["industry"], r["ma_state"], pct((r.get("five_ret") or 0) * 100), pct((r.get("ma20_dist") or 0) * 100), f"{_fmt(r.get('high_pull'))}pct", f"{r.get('main_pct',0):.1f}%", flow_amount_str(r.get("flow_5m_inc",0)), flow_status_cell(r), r["risk"], announcement_label(r)] for r in result["low_trend"]]
+        lines += ["", "## 低吸短线趋势 A/B/C", markdown_table(["类", "代码", "名称", "交易板", "现价", "涨幅", "区间分位", "换手率", "成交额", "板块", "均线状态", "近5日", "距20日线", "高位回落", "主力净占比", "5分钟增量", "资金状态", "风险", "公告风险"], rows)]
     if result.get("low_open_wash"):
         rows = [[
             r["code"], r["name"],
@@ -4658,14 +4910,73 @@ def render_markdown(result: Dict[str, Any]) -> str:
         lines += ["", "## 低开洗盘（实验性观察补充 · 不计入主/次级信号 · 永不自动出手）",
                    "> ⚠️ 不在 7/30 收敛核心框架内。条件：低开≥2% + 翻红 + 站上均价线 + 当日主力净流入正 + 20日持续净流入。匹配即进观察，不参与主/次级判定，也绝不自动出手。",
                    markdown_table(["代码", "名称", "今开", "昨收", "低开%", "现价/涨幅", "主力净占比", "5分钟增量", "均价线", "20日累计净流入", "板块", "公告风险"], rows)]
+    # 历史快照兼容：旧结果带独立「扩展交易板观察」列表时按原口径原样渲染，
+    # **不把旧结果重新解释成完整筛选结果**。新结果不再有这一节——三板都进正式栏目。
+    if "extended_board_observations" in result:
+        legacy_status = result.get("extended_board_status", "ok")
+        legacy_rows = result.get("extended_board_observations") or []
+        lines += ["", "## 扩展交易板观察（历史口径 · 该快照生成时两板仅观察）",
+                  "> ⚠️ 本快照由旧口径生成：创业板/科创板当时只进观察列表、不参与正式池。"
+                  "当前设置已是「所选交易板统一参与正式筛选」，勿按本表判断候选强弱。"]
+        if legacy_status != "ok":
+            lines.append("> ⚠️ 该快照当轮数据不可用，未产出观察列表。")
+        elif not legacy_rows:
+            lines.append("无")
+        else:
+            lines.append(markdown_table(
+                ["交易板", "代码", "名称", "现价", "涨幅", "换手率", "成交额", "量比"],
+                [[r.get("board_label", ""), r.get("code", ""), r.get("name", ""),
+                  _fmt(r.get("price")), f"{_fmt(r.get('change'))}%",
+                  f"{_fmt(r.get('turnover'))}%", flow_amount_str(r.get("amount")),
+                  _fmt(r.get("vol_ratio"), 2)] for r in legacy_rows]))
+
+    if meta.get("negative_super_view") == "observe":
+        neg_status = result.get("negative_super_status", "ok")
+        neg_rows = result.get("negative_super_observations") or []
+        lines += ["", "## 负超单观察（独立列表 · 仅观察 · 真实仓一票否决不变）"]
+        if neg_status != "ok":
+            reason = {"degraded": "行情降级（新浪备用源）", "incomplete": "行情快照不完整"}.get(
+                neg_status, neg_status)
+            lines.append(
+                f"> ⚠️ {reason}，本轮未产出负超单观察列表；列表为空不代表“今天没有负超单标的”。"
+            )
+        elif not neg_rows:
+            lines.append("无")
+        else:
+            rows = [[
+                r.get("code", ""), r.get("name", ""), r.get("data_time", ""),
+                flow_amount_str(r.get("super_net", 0)),
+                flow_amount_str(r.get("main_net", 0)),
+                flow_amount_str(r.get("big_net", 0)),
+                flow_amount_str(r.get("flow_5m_inc", float("nan"))),
+                f"{_fmt(r.get('price'))} / {r.get('vwap_state', '')}",
+                r.get("resonance", "否"),
+                r.get("dominance_label", "✗"),
+                r.get("flow_status", ""),
+                announcement_label(r),
+                "；".join(r.get("blockers") or []),
+                shadow_badge_text(r.get("shadow_badge")),
+            ] for r in neg_rows]
+            lines.append("> ⚠️ 仅观察，真实仓一票否决不变；逐项未通过门槛如实列出，不得当作“仅差一个条件即可买”。")
+            lines.append(markdown_table(
+                ["代码", "名称", "数据时间", "超大单", "主力净额", "大单净额", "5分钟增量",
+                 "现价/均价线", "板块共振", "生产主导标签", "资金状态", "公告风险",
+                 "未通过门槛", "影子徽标"], rows))
     if result.get("watchlist"):
+        # 观察池突破状态机只在 CLI 路径运行；实时看板链路不产出 breakout_phase。
+        # 未评估时如实标「未评估 / —」，不默认 WATCHING、0次、✗（那等于伪造状态）。
+        breakout_evaluated = any(r.get("breakout_phase") for r in result["watchlist"])
         rows = [[
-            r["code"], r["name"], _fmt(r.get("price")), pct(r.get("change")), range_position_cell(r), r["industry"], r["structure"],
-            r["trigger"], r.get("breakout_phase", "WATCHING"), f"{r.get('confirm_count', 0)}次",
-            r.get("dominance_label", "✗"), r["buy_zone"], r["invalid"], r["no_chase"],
+            r["code"], r["name"], r.get("board_label", ""), _fmt(r.get("price")), pct(r.get("change")), range_position_cell(r), r["industry"], r["structure"],
+            r["trigger"], r.get("breakout_phase") or "未评估",
+            (f"{r['confirm_count']}次" if r.get("confirm_count") is not None else "—"),
+            r.get("dominance_label") or "—", r["buy_zone"], r["invalid"], r["no_chase"],
             (r.get("status_note", "") or "") + flow_veto_suffix(r), announcement_label(r)
         ] for r in result["watchlist"]]
-        lines += ["", "## 明日观察池（含突破升级状态机）", markdown_table(["代码", "名称", "当前价", "涨幅", "区间分位", "板块", "结构", "触发价", "突破状态", "确认次数", "超单主导", "低吸区", "失效", "追高禁区", "状态说明", "公告风险"], rows)]
+        watchlist_title = (
+            "## 明日观察池（含突破升级状态机）" if breakout_evaluated else "## 明日观察池"
+        )
+        lines += ["", watchlist_title, markdown_table(["代码", "名称", "交易板", "当前价", "涨幅", "区间分位", "板块", "结构", "触发价", "突破状态", "确认次数", "超单主导", "低吸区", "失效", "追高禁区", "状态说明", "公告风险"], rows)]
     if result.get("sector_indices"):
         sectors = sorted(result["sector_indices"], key=lambda s: s["change"], reverse=True)
         rows = [[s["name"], pct(s["change"]), f"{s['price']:.2f}" if s.get("price") else "-",
@@ -4699,55 +5010,243 @@ def render_markdown(result: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="A-share screening query helper for daily-stock-analysis")
-    parser.add_argument("--mode", nargs="+", choices=["all", "strict", "low", "watchlist"], default=["strict"], help="screening modules to output (default: original dual screen)")
-    parser.add_argument("--format", choices=["md", "json"], default="md", help="output format")
-    parser.add_argument("--workers", type=int, default=6, help="concurrent K-line workers")
-    parser.add_argument("--top", type=int, default=10, help="max rows per section")
-    parser.add_argument("--save", type=Path, help="also save output to file")
-    parser.add_argument("--skip-announcements", action="store_true", help="skip latest-announcement risk check")
-    parser.add_argument("--skip-capital-ranking", action="store_true", help="skip capital-flow secondary ranking")
-    parser.add_argument("--announcement-page-size", type=int, default=8, help="latest announcement rows per stock")
-    parser.add_argument("--network-mode", choices=["auto", "direct", "proxy"], default="auto",
-                        help="connection strategy: auto (measure latency of direct+proxy paths, pick fastest), direct, or proxy")
-    args = parser.parse_args()
-    set_network_mode(args.network_mode)
-    MARKET_WARNINGS.clear()
 
-    # Normalize mode list: "all" expands to all three individual modules
-    modes = set(args.mode)
+# 需要在每行标注交易板的正式栏目（与公告检查的可见栏目清单一致，另含双池明细与状态机）
+BOARD_STAMPED_SECTIONS = (
+    "strict_ultra", "trend_observation", "strict_trend", "dual_pool", "dual_pool_raw",
+    "capital_rank", "low_ultra", "low_trend", "watchlist", "pre_intersection",
+    "intersection_states", "negative_super_observations",
+)
+
+
+def stamp_board_fields(result: Dict[str, Any]) -> None:
+    """给各正式栏目每一行补上「交易板」字段（由代码判定，不依赖行内已有值）。
+
+    创业板/科创板加入正式筛选后，同一张表里会同时出现三板的股票，
+    因此每行都必须能看出它属于哪个交易板；用 setdefault 保留既有值，
+    便于历史快照按原样渲染。
+    """
+    for section in BOARD_STAMPED_SECTIONS:
+        for row in result.get(section) or []:
+            if not isinstance(row, dict):
+                continue
+            board = board_of(row.get("code") or row.get("f12"))
+            row.setdefault("board", board)
+            row.setdefault("board_label", BOARD_LABELS.get(board, board))
+
+
+def board_scope_note(status: str, selected: Any, candidate_total: int) -> str:
+    """本轮范围的结论说明：必须能区分「未符合条件」与「数据不可用」。
+
+    ``candidate_total`` 是本轮所选交易板范围内各候选池**去重后的候选股票数**
+    （CLI 与实时引擎同一口径）。数据完整且为 0 时才是「没有符合现有门槛的候选」；
+    数据降级/不完整时无论是否为 0 都只能报「本轮结果不完整」。
+    """
+    boards = normalize_boards(selected)
+    label = " + ".join(BOARD_LABELS.get(board, board) for board in boards)
+    if status != "ok":
+        reason = {"degraded": "行情降级（备用源，字段不完整）", "incomplete": "行情快照不完整"}.get(status, status)
+        return f"筛选范围：{label}；{reason}，本轮结果不完整——无候选不等于「未符合条件」。"
+    if candidate_total == 0:
+        return f"筛选范围：{label}；数据完整，本轮该范围内没有符合现有门槛的候选（正常筛选结果）。"
+    return f"筛选范围：{label}；数据完整，本轮范围内产生 {candidate_total} 条候选。"
+
+
+def load_holding_codes() -> set:
+    """读取本机持仓文件里的股票代码。
+
+    只用于「取消某个交易板后，已持仓股票的监控不能停」这一条；不参与任何买入判定。
+    文件结构可能变化，因此递归找 6 位代码，而不是依赖固定字段名。
+    """
+    path = SCRIPT_DIR / "holdings.json"
+    codes: set = set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return codes
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif isinstance(node, str):
+            text = node.strip()
+            if text.isdigit() and len(text) == 6:
+                codes.add(text)
+
+    walk(payload)
+    return codes
+
+
+def prune_state_by_boards(
+    items: Dict[str, Any], boards: Any = (BOARD_MAIN,), keep_codes: Any = ()
+) -> Dict[str, Any]:
+    """把**不在所选交易板内**的旧候选从连续状态里剔除。
+
+    切换交易板范围后，旧范围留下的锁存/等待回踩/突破状态不能继续生效（否则等于绕过了
+    本次范围设置）；但已持仓股票必须保留——监控不能因为取消某个交易板而停止。
+    """
+    selected = set(normalize_boards(boards))
+    keep = {str(code) for code in (keep_codes or ())}
+    return {
+        str(code): item
+        for code, item in (items or {}).items()
+        if str(code) in keep or board_of(code) in selected
+    }
+
+
+def count_by_board(rows: List[Any]) -> Dict[str, int]:
+    """按板别计数；命中不了的归入 unknown（用于报告/meta 的口径记录）。"""
+    counts = {board: 0 for board in BOARD_ORDER}
+    counts[BOARD_UNKNOWN] = 0
+    for item in rows:
+        code = item.get("f12") if isinstance(item, dict) else getattr(item, "code", None)
+        counts[board_of(code)] = counts.get(board_of(code), 0) + 1
+    return counts
+
+
+def board_scope_status_for(
+    fallback_snapshot: bool, fetch_status: Optional[Dict[str, Any]] = None
+) -> str:
+    """本轮交易板范围结果的可用性判定（CLI 与引擎共用同一口径，避免各自缺省成 ok）。
+
+    - ``degraded``：行情走了新浪备用源（字段降级）；
+    - ``incomplete``：快照分页不完整；
+    - ``ok``：可产出所选交易板的正式筛选结果。
+
+    降级/不完整时结果不可用，报告要区分「未符合条件」与「数据不可用」。
+    """
+    if fallback_snapshot:
+        return "degraded"
+    if (fetch_status or {}).get("complete") is False:
+        return "incomplete"
+    return "ok"
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 共享筛选核心
+#
+# CLI（本文件 main）与看板/工作台（realtime_engine.run_screening）都调用
+# run_screening_core。规则计算、公告门禁、资金排名、两条状态机只在这里跑一次，
+# 避免两套实现漂移。入口差异（网络模式、K 线缓存、进度回调、分钟量能、温度计）
+# 通过 ScreeningHooks 显式注入，不靠调用方身份分支，也不 monkey-patch 全局函数。
+#
+# ``top`` 只影响本函数最后的展示裁剪；完整候选集合、公告核验范围、双池交集、
+# 准交集、观察池突破与交集状态推进一律读全量内部集合。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class ScreeningParams:
+    """一次筛选的机器参数（CLI、看板、工作台共用同一套）。"""
+
+    modes: frozenset
+    workers: int = 6
+    top: int = 10
+    skip_announcements: bool = False
+    skip_capital_ranking: bool = False
+    network_mode: str = "auto"
+    announcement_page_size: int = 8
+    enabled_boards: Tuple[str, ...] = (BOARD_MAIN,)
+
+
+@dataclass
+class ScreeningHooks:
+    """入口差异注入点。
+
+    - ``state_commit``：运行状态提交门。非空时资金基准/交集状态/观察池突破状态
+      只暂存，由调度器在确认本轮有效后统一提交；超时/失败的一轮不得落盘。
+    - ``fetch_kline_fn``：K 线取数（看板注入带缓存与限速的实现）。
+    - ``build_extras``：公告核验前追加的看板专有列表（如负超单观察），其行会被
+      同一份公告查询覆盖。
+    - ``minute_map_provider``：状态机分钟线输入（看板专有）。市场环境分级在核心内
+      统一计算，不再由入口注入。
+    """
+
+    announce_progress: Optional[Callable[[int, int, str, str, str], None]] = None
+    state_commit: Optional[state_commit.RoundCommit] = None
+    fetch_kline_fn: Optional[Callable[..., Any]] = None
+    source_suffix: str = ""
+    extra_meta: Any = None                      # dict 或返回 dict 的可调用对象
+    build_extras: Optional[Callable[..., Dict[str, Any]]] = None
+    save_kline_cache: Optional[Callable[[], None]] = None
+    minute_map_provider: Optional[Callable[..., Dict[str, Any]]] = None
+    on_enriched: Optional[Callable[[Dict[str, "Enriched"]], None]] = None
+    snapshot_id: Optional[str] = None
+    log: Optional[Callable[[str], None]] = None
+
+    def log_line(self, message: str) -> None:
+        if self.log is not None:
+            try:
+                self.log(message)
+            except Exception:
+                pass
+
+
+def _display_rows(rows: Optional[List[Dict[str, Any]]], top: int) -> List[Dict[str, Any]]:
+    """展示截取：只改变可见行数，不改变任何上游计算结果。"""
+    if not rows:
+        return []
+    return list(rows[: max(0, int(top))])
+
+
+def run_screening_core(
+    params: ScreeningParams,
+    hooks: Optional[ScreeningHooks] = None,
+) -> Dict[str, Any]:
+    """执行一次完整筛选并返回核心结果。
+
+    阶段固定为：行情与质量判定 → 丰富数据 → 资金基准/否决 → 完整候选池 →
+    公告核验及风险映射 → 资金排名 → 观察池突破 → 双池交集/准交集 →
+    交集状态机 → 展示裁剪。看板专有的分钟量能、温度计、进出场建议由调用方附加。
+
+    行情不可用时抛 ``NetworkUnavailable``，由调用方决定输出形式。
+    """
+    hooks = hooks or ScreeningHooks()
+    modes = set(params.modes)
     if "all" in modes:
         modes = {"strict", "low", "watchlist"}
+    if not modes:
+        modes = {"strict"}
+
+    set_network_mode(params.network_mode)
+    MARKET_WARNINGS.clear()
 
     t0 = time.time()
-    try:
-        market, total = fetch_market()
-    except NetworkUnavailable as exc:
-        print(format_network_failure(exc), file=sys.stderr)
-        return 2
-    t_market = time.time() - t0
-    print(f"[计时] 行情分页: {t_market:.1f}s  ({len(market)} 条)", file=sys.stderr)
+    market, total = fetch_market()
     market_fetch_status = get_market_fetch_status()
     fallback_snapshot = market_fetch_status.get("source") == "sina_fallback"
+    hooks.log_line(f"[计时] 行情分页: {time.time() - t0:.1f}s  ({len(market)} 条)")
+
     if fallback_snapshot:
-        indices_raw = []
-        sector_boards = []
+        indices_raw: List[Dict[str, Any]] = []
+        sector_boards: List[Dict[str, Any]] = []
         MARKET_WARNINGS.append("备用行情模式跳过东方财富指数和板块接口，避免主源故障导致二次等待")
     else:
         indices_raw = fetch_indices()
         sector_boards = fetch_sector_indices()
-    prefetch = filter_prefetch(market, args.mode)
-    enriched, errors = enrich_all(prefetch, max(1, args.workers))
-    t_enrich = time.time() - t0 - t_market
-    print(f"[计时] K线增强: {t_enrich:.1f}s  ({len(enriched)} 只)", file=sys.stderr)
+
+    boards_in_use = normalize_boards(params.enabled_boards)
+    mode_list = ["all"] if modes == {"strict", "low", "watchlist"} else sorted(modes)
+    prefetch = filter_prefetch(market, mode_list, boards=boards_in_use)
+    enriched, errors = enrich_all(prefetch, max(1, params.workers), hooks.fetch_kline_fn)
+    hooks.log_line(f"[计时] K线增强: {time.time() - t0:.1f}s  ({len(enriched)} 只)")
+    if hooks.on_enriched is not None:
+        hooks.on_enriched({e.code: e for e in enriched})
+    if hooks.save_kline_cache is not None:
+        hooks.save_kline_cache()
+
     if fallback_snapshot:
         MARKET_WARNINGS.append(
             "备用行情缺少兼容量比、主力资金和行业字段：趋势池仅供观察；"
             "超短池、双池交集、资金优选和低吸买点不会输出。"
         )
     breadth = market_summary(market, total, market_fetch_status)
-    stats = sector_stats(market, breadth)
+    stats = sector_stats(market, breadth, boards=boards_in_use)
 
     # --- capital flow: load history, compute increments, classify ---
     flow_history = load_flow_history()
@@ -4757,9 +5256,9 @@ def main() -> int:
     reset_flow_minute_round(ts.strftime("%Y-%m-%d"))
     apply_flow_increments(enriched, flow_history)
     # 快照基准缺失时（冷启动/断点重启/隔日首轮）用东财分钟序列补齐，否则资金门槛无法评估。
-    # 期望交易日取行情快照自身的时间戳，隔日序列按过期拒绝。
     flow_minute_filled = fill_flow_increments_from_fflow(
-        enriched, expected_date=ts.strftime("%Y-%m-%d"))
+        enriched, expected_date=ts.strftime("%Y-%m-%d")
+    )
     if flow_minute_filled:
         MARKET_WARNINGS.append(
             f"本地快照无可用基准，已用东财当日累计分钟序列为 {flow_minute_filled} 只候选补齐 5/15 分钟增量"
@@ -4773,35 +5272,57 @@ def main() -> int:
         MARKET_WARNINGS.append(
             "超大单为负（框架一票否决，禁止正式买入建议）：" + "、".join(vetoed_codes)
         )
-    save_flow_history(enriched, flow_history)
-    print(
+    save_flow_history(enriched, flow_history, hooks.state_commit)
+    hooks.log_line(
         f"[计时] 资金流向: 历史{'有' if has_snapshot else '无'} ({len(flow_history)} 只)"
-        f"；分钟序列补齐 {flow_minute_filled} 只",
-        file=sys.stderr,
+        f"；分钟序列补齐 {flow_minute_filled} 只"
     )
 
     after_1420 = is_after_tail_risk(ts)
 
-    strict_ultra_all = [] if fallback_snapshot else sorted([e for e in enriched if strict_ultra(e)], key=lambda e: e.change, reverse=True)
-    strict_ultra_items = strict_ultra_all[:args.top]
-    trend_observation_items = sorted(
+    # ── 完整候选池：排序后保留全量，top 只在最后裁剪展示 ──────────────
+    strict_ultra_all = (
+        []
+        if fallback_snapshot
+        else sorted([e for e in enriched if strict_ultra(e)], key=lambda e: e.change, reverse=True)
+    )
+    trend_observation_all = sorted(
         [e for e in enriched if trend_observation(e)],
         key=lambda e: (not strict_trend(e), -e.change, e.dist60),
-    )[:args.top]
-    strict_trend_items = sorted([e for e in enriched if strict_trend(e)], key=lambda e: e.change, reverse=True)[:args.top]
+    )
+    strict_trend_all = sorted(
+        [e for e in enriched if strict_trend(e)], key=lambda e: e.change, reverse=True
+    )
 
-    class_order = {"A": 0, "B": 1, "C": 2}
-    low_ultra_rows = []
-    low_trend_rows = []
+    strict_ultra_all_rows: List[Dict[str, Any]] = [
+        {**asdict(e), "resonance": "是" if has_resonance(e, stats) else "否"}
+        for e in strict_ultra_all
+    ] if "strict" in modes else []
+    trend_observation_all_rows: List[Dict[str, Any]] = [
+        {
+            **asdict(e),
+            "ma_state": "MA5/10/20上方" if e.price > e.ma5 and e.price > e.ma10 and e.price > e.ma20 else "MA20上方，短均线修复中",
+        }
+        for e in trend_observation_all
+    ] if "strict" in modes else []
+    strict_trend_all_rows: List[Dict[str, Any]] = [
+        asdict(e) for e in strict_trend_all
+    ] if "strict" in modes else []
+    trend_diagnostics = [
+        trend_condition_diagnosis(e, stats) for e in strict_ultra_all
+    ] if "strict" in modes else []
+
+    low_ultra_all_rows: List[Dict[str, Any]] = []
+    low_trend_all_rows: List[Dict[str, Any]] = []
     if "low" in modes and not fallback_snapshot:
         for e in enriched:
-            exclude, reason = _should_exclude_from_low_absorb(e, flow_history)
+            exclude, _reason = _should_exclude_from_low_absorb(e, flow_history)
             if exclude:
                 continue  # 硬黑名单或高位派发降权，不进入低吸候选
             cls, tags, score = low_ultra_class(e, stats, after_1420)
             dom_type, dom_label = evaluate_dominance_type(e, flow_history)
             if low_ultra_output_eligible(e, cls):
-                low_ultra_rows.append({
+                low_ultra_all_rows.append({
                     **asdict(e),
                     "class": cls,
                     "risk": "/".join(tags) if tags else "无",
@@ -4813,7 +5334,7 @@ def main() -> int:
                 })
             cls2, tags2, score2 = low_trend_class(e, stats, after_1420)
             if low_trend_output_eligible(e, cls2):
-                low_trend_rows.append({
+                low_trend_all_rows.append({
                     **asdict(e),
                     "class": cls2,
                     "risk": "/".join(tags2) if tags2 else "无",
@@ -4829,22 +5350,14 @@ def main() -> int:
                 f"低吸高位派发核验：{unverified} 只满足高位条件但既无本地快照也无分钟序列，"
                 "派发信号未能核验、按未触发处理，建议人工复查。"
             )
-        low_ultra_rows = sorted(low_ultra_rows, key=low_ultra_sort_key)[: max(args.top, 15)]
-        low_trend_rows = sorted(low_trend_rows, key=low_trend_sort_key)[: max(args.top, 15)]
+        low_ultra_all_rows = sorted(low_ultra_all_rows, key=low_ultra_sort_key)
+        low_trend_all_rows = sorted(low_trend_all_rows, key=low_trend_sort_key)
 
-    strict_ultra_rows = [
-        {**asdict(e), "resonance": "是" if has_resonance(e, stats) else "否"}
-        for e in strict_ultra_items
-    ] if "strict" in modes else []
-    trend_observation_rows = [
-        {**asdict(e), "ma_state": "MA5/10/20上方" if e.price > e.ma5 and e.price > e.ma10 and e.price > e.ma20 else "MA20上方，短均线修复中"}
-        for e in trend_observation_items
-    ] if "strict" in modes else []
-    strict_trend_rows = [asdict(e) for e in strict_trend_items] if "strict" in modes else []
-    trend_diagnostics = [trend_condition_diagnosis(e, stats) for e in strict_ultra_all] if "strict" in modes else []
-    ultra_codes = {r["code"] for r in strict_ultra_rows}
-    observation_codes = {r["code"] for r in trend_observation_rows}
-    confirmation_codes = {r["code"] for r in strict_trend_rows}
+    raw_watchlist = build_watchlist(enriched, stats) if "watchlist" in modes else []
+
+    ultra_codes = {r["code"] for r in strict_ultra_all_rows}
+    observation_codes = {r["code"] for r in trend_observation_all_rows}
+    confirmation_codes = {r["code"] for r in strict_trend_all_rows}
     relaxed_confirm_codes = {e.code for e in enriched if trend_confirm_relaxed(e)}
     enriched_by_code_for_pool = {e.code: e for e in enriched}
 
@@ -4856,14 +5369,13 @@ def main() -> int:
             "resonance": "是" if has_resonance(enriched_by_code_for_pool[r["code"]], stats) else "否",
             "sector_change": (board_by_code_for_pool.get(r.get("industry"), {}) or {}).get("change"),
         }
-        for r in strict_ultra_rows
+        for r in strict_ultra_all_rows
         if r["code"] in relaxed_confirm_codes
     ]
     dual_pool_raw_rows = [dict(r) for r in dual_pool_rows]
 
-    # --- sector indices for relevant industries ---
     relevant_industries: set = set()
-    for r in strict_ultra_rows + trend_observation_rows + strict_trend_rows:
+    for r in strict_ultra_all_rows + trend_observation_all_rows + strict_trend_all_rows:
         ind = r.get("industry", "")
         if ind and ind != "-":
             relevant_industries.add(ind)
@@ -4887,7 +5399,9 @@ def main() -> int:
                 "source": "筛选",
             })
 
-    intersection_config, intersection_config_meta = resolve_intersection_config(load_intersection_calibration())
+    intersection_config, intersection_config_meta = resolve_intersection_config(
+        load_intersection_calibration()
+    )
     intersection_runtime_config = {
         **intersection_config,
         "version": intersection_config_meta["version"],
@@ -4896,21 +5410,36 @@ def main() -> int:
 
     diag_by_code = {d["code"]: d for d in trend_diagnostics} if "strict" in modes else {}
     pre_intersection_rows = (
-        compute_pre_intersection(strict_ultra_rows, relaxed_confirm_codes, diag_by_code, intersection_runtime_config)
+        compute_pre_intersection(
+            strict_ultra_all_rows, relaxed_confirm_codes, diag_by_code, intersection_runtime_config
+        )
         if "strict" in modes else []
     )
 
-    raw_watchlist = build_watchlist(enriched, stats) if "watchlist" in modes else []
+    # 范围结论：区分「未符合条件」与「数据不可用」（与引擎共用同一判定）。
+    # 候选数读**完整**内部集合，不能被 top 截短（否则 top 小的时候会误报"无候选"）。
+    board_scope_status = board_scope_status_for(fallback_snapshot, market_fetch_status)
+    board_scope_candidates = len({
+        str(row.get("code"))
+        for rows in (
+            strict_ultra_all_rows, trend_observation_all_rows, strict_trend_all_rows,
+            low_ultra_all_rows, low_trend_all_rows, raw_watchlist,
+        )
+        for row in (rows or [])
+        if row.get("code")
+    })
 
-    result = {
+    extra_meta = hooks.extra_meta
+    if callable(extra_meta):
+        extra_meta = extra_meta()
+    result: Dict[str, Any] = {
         "meta": {
             "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
             "status": current_status(ts),
             "source": (
                 "新浪财经实时备用快照（字段降级）"
                 if fallback_snapshot else "东方财富push2实时/快照"
-            ) + " + " + kline_source_summary(enriched)
-            + ("" if args.skip_announcements else " + 东方财富公告"),
+            ) + " + " + kline_source_summary(enriched) + hooks.source_suffix,
             "total_rows": len(market),
             "provider_total": total,
             "market_fetch_complete": market_fetch_status.get("complete"),
@@ -4918,6 +5447,15 @@ def main() -> int:
             "enriched_rows": len(enriched),
             "elapsed_seconds": round(time.time() - t0, 1),
             "market_data_degraded": fallback_snapshot,
+            # 交易板范围：本轮实际筛选范围（只决定筛哪些股票供观察，不授予买入资格）
+            "enabled_boards": list(boards_in_use),
+            "enabled_boards_label": " + ".join(BOARD_LABELS.get(b, b) for b in boards_in_use),
+            "board_counts": {
+                "market": count_by_board(market),
+                "prefetch": count_by_board(prefetch),
+                "strict_rows": count_by_board(enriched),
+            },
+            **(extra_meta or {}),
         },
         "breadth": breadth,
         "market_fetch_status": market_fetch_status,
@@ -4925,10 +5463,14 @@ def main() -> int:
         "errors": errors,
         "warnings": MARKET_WARNINGS,
         "announcement_errors": [],
+        "board_scope_status": board_scope_status,
+        "board_scope_candidates": board_scope_candidates,
+        "board_scope_note": board_scope_note(board_scope_status, boards_in_use, board_scope_candidates),
         "strict_enabled": "strict" in modes,
-        "strict_ultra": strict_ultra_rows,
-        "trend_observation": trend_observation_rows,
-        "strict_trend": strict_trend_rows,
+        # 以下候选池在公告核验期间保持全量；展示裁剪在函数末尾统一进行。
+        "strict_ultra": strict_ultra_all_rows,
+        "trend_observation": trend_observation_all_rows,
+        "strict_trend": strict_trend_all_rows,
         "trend_diagnostics": trend_diagnostics,
         "dual_pool": dual_pool_rows,
         "dual_pool_raw": dual_pool_raw_rows,
@@ -4937,8 +5479,8 @@ def main() -> int:
         "intersection_config": intersection_runtime_config,
         "intersection_config_meta": intersection_config_meta,
         "capital_rank": [],
-        "low_ultra": low_ultra_rows if "low" in modes and not fallback_snapshot else [],
-        "low_trend": low_trend_rows if "low" in modes and not fallback_snapshot else [],
+        "low_ultra": low_ultra_all_rows,
+        "low_trend": low_trend_all_rows,
         "watchlist": raw_watchlist,
         "sector_indices": sector_indices,
         "has_snapshot": has_snapshot,
@@ -4946,20 +5488,32 @@ def main() -> int:
         "low_open_wash": low_open_wash_rows(enriched, flow_history),
     }
 
+    # 看板专有列表（负超单观察等）在公告核验前并入，确保它们与正式池读到同一份风险结果。
+    if hooks.build_extras is not None:
+        extras = hooks.build_extras(
+            enriched=enriched,
+            stats=stats,
+            flow_history=flow_history,
+            ts=ts,
+            fallback_snapshot=fallback_snapshot,
+            market_fetch_status=market_fetch_status,
+        )
+        if extras:
+            result.update(extras)
+
     # --- flow detail for key candidates (strict top 5 + low A-class top 5 + holdings) ---
     detail_codes: set = set()
     flow_detail: List[Dict[str, Any]] = []
-    for e in (strict_ultra_items[:5] + trend_observation_items[:5] + strict_trend_items[:5]):
+    for e in (strict_ultra_all[:5] + trend_observation_all[:5] + strict_trend_all[:5]):
         if e.code not in detail_codes:
             detail_codes.add(e.code)
             flow_detail.append(asdict(e))
-    for r in low_ultra_rows if "low" in modes else []:
+    for r in low_ultra_all_rows if "low" in modes else []:
         if r.get("class") == "A" and r["code"] not in detail_codes:
             detail_codes.add(r["code"])
             flow_detail.append(r)
             if len([d for d in flow_detail if d.get("class") == "A"]) >= 5:
                 break
-    # Add holdings to flow detail
     holdings_file = SCRIPT_DIR / "holdings.json"
     enriched_by_code = {e.code: e for e in enriched}
     try:
@@ -4979,29 +5533,21 @@ def main() -> int:
     result["flow_detail"] = flow_detail
 
     # --- 公告风控查询与统一门槛处理 ---
-    if not args.skip_announcements:
+    if not params.skip_announcements:
         t_ann_start = time.time()
-        def announcement_progress(done: int, total: int, code: str, status: str, source: str) -> None:
-            source_label = "缓存" if source == "cache" else "查询"
-            print(f"[公告] {done}/{total} {code} {source_label}={status}", file=sys.stderr, flush=True)
-
         result["announcement_errors"] = attach_announcement_risks(
             result,
-            args.announcement_page_size,
-            args.workers,
-            progress_callback=announcement_progress,
+            params.announcement_page_size,
+            params.workers,
+            progress_callback=hooks.announce_progress,
         )
         apply_announcement_pool_gates(result)
-        t_ann = time.time() - t_ann_start
-        print(f"[计时] 公告检查: {t_ann:.1f}s", file=sys.stderr)
+        hooks.log_line(f"[计时] 公告检查: {time.time() - t_ann_start:.1f}s")
     else:
         result["announcement_check_available"] = False
         result["announcement_unknown_codes"] = sorted({
             str(row.get("code"))
-            for section in (
-                "strict_ultra", "trend_observation", "strict_trend", "dual_pool", "dual_pool_raw",
-                "trend_diagnostics", "low_ultra", "low_trend", "watchlist",
-            )
+            for section in ANNOUNCEMENT_SECTIONS
             for row in (result.get(section) or [])
             if _row_risk_status(row) == RISK_UNKNOWN
         })
@@ -5009,36 +5555,32 @@ def main() -> int:
 
     # 汇总统一公告风控字典。公告查询结果是唯一权威来源；其它池子只
     # 用来补齐查询结果缺失的代码，且缺失状态一律 unknown（fail-closed）。
-    valid_risk_statuses = RISK_STATUS_VALUES
     risk_map: Dict[str, str] = {
-        str(code): (status if isinstance(status, str) and status in valid_risk_statuses else RISK_UNKNOWN)
+        str(code): (status if isinstance(status, str) and status in RISK_STATUS_VALUES else RISK_UNKNOWN)
         for code, status in (result.get("announcement_risk_map") or {}).items()
         if code
     }
-    for section in (
-        "watchlist", "strict_ultra", "trend_observation", "strict_trend", "dual_pool",
-        "dual_pool_raw", "pre_intersection", "capital_rank", "trend_diagnostics",
-        "low_ultra", "low_trend", "low_open_wash",
-    ):
+    for section in ANNOUNCEMENT_SECTIONS:
         for row in (result.get(section) or []):
             code = str(row.get("code") or "")
             if code:
                 risk_map.setdefault(code, _row_risk_status(row))
 
-    # 将确切的公告风控状态同步赋给 Enriched 实例
+    # 将确切的公告风控状态同步赋给 Enriched 实例（资金排名读它判 clean 加分）。
     for e in enriched:
         e.risk_status = risk_map.get(e.code, RISK_UNKNOWN)
 
     # --- 在公告检查之后统一执行主力资金优选排序（确保 clean 硬门槛生效） ---
+    # 候选集合读**完整**内部池；avoid/unknown 一票否决不进排名，watch_risk 保留。
     strict_candidate_codes = {
         r["code"]
         for r in (result.get("strict_ultra") or []) + (result.get("trend_observation") or [])
-        if _row_risk_status(r) not in {RISK_AVOID, RISK_UNKNOWN}
+        if not risk_blocks_formal_qualification(_row_risk_status(r))
     }
-    capital_rank = [] if args.skip_capital_ranking or fallback_snapshot else rank_capital_candidates(
+    capital_rank_full = [] if params.skip_capital_ranking or fallback_snapshot else rank_capital_candidates(
         [e for e in enriched if e.code in strict_candidate_codes], stats, flow_history
-    )[:args.top]
-    for row in capital_rank:
+    )
+    for row in capital_rank_full:
         in_ultra = row["code"] in ultra_codes
         in_observation = row["code"] in observation_codes
         in_confirmation = row["code"] in confirmation_codes
@@ -5048,18 +5590,22 @@ def main() -> int:
             row["pool_source"] = "超短池"
         else:
             row["pool_source"] = "趋势确认池" if in_confirmation else "趋势观察池"
-    result["capital_rank"] = capital_rank
+    result["capital_rank"] = capital_rank_full
     # capital_rank 是公告查询完成后新生成的派生池，必须再次走同一套
     # fail-closed 门槛，避免 avoid/unknown 通过重新排名重新出现。
     apply_announcement_pool_gates(result)
 
     # 观察池构建与突破状态机评估（在公告检查之后执行，接入真实风控）
+    # 持仓代码只用于状态剔除时保留监控（取消交易板不等于停止监控已持仓）
+    holding_codes = load_holding_codes()
     wl_state_payload = load_watchlist_breakout_state()
-    prev_wl_items = wl_state_payload.get("items") or {}
+    prev_wl_items = prune_state_by_boards(
+        wl_state_payload.get("items") or {}, boards_in_use, holding_codes
+    )
     is_today = (wl_state_payload.get("date") == ts.strftime("%Y-%m-%d"))
     if not is_today and prev_wl_items:
         # 跨日：保留昨日设定的触发价基准，重置日内确认计数为0
-        for code, itm in prev_wl_items.items():
+        for _code, itm in prev_wl_items.items():
             itm["confirm_count"] = 0
             itm["phase"] = "WATCHING"
             itm["breakout_class"] = "WATCHING"
@@ -5067,26 +5613,107 @@ def main() -> int:
         raw_watchlist, enriched_by_code_for_pool, stats, flow_history, prev_wl_items, ts, risk_map
     )
     result["watchlist"] = watchlist_evaluated
-    save_watchlist_breakout_state(next_wl_items, ts.strftime("%Y-%m-%d"))
+    save_watchlist_breakout_state(next_wl_items, ts.strftime("%Y-%m-%d"), hooks.state_commit)
 
     if result.get("strict_enabled"):
         state_payload = load_intersection_state()
-        previous_items = state_payload.get("items") or {}
+        previous_items = prune_state_by_boards(
+            state_payload.get("items") or {}, boards_in_use, holding_codes
+        )
         if state_payload.get("date") != ts.strftime("%Y-%m-%d"):
             previous_items = {}
+        minute_map: Dict[str, Dict[str, Any]] = {}
+        if hooks.minute_map_provider is not None and not fallback_snapshot:
+            try:
+                minute_map = hooks.minute_map_provider(result, previous_items) or {}
+            except Exception as exc:  # noqa: BLE001
+                result.setdefault("warnings", []).append(f"状态机分钟线拉取失败：{exc}")
+        # 市场环境分级（宽度/指数极端）在核心内统一计算：CLI 与看板必须用同一
+        # 口径判定 NORMAL/LIGHT/DOWNGRADE/CASH，CASH 一律禁止新开仓。
+        market_context = resolve_market_mode(
+            breadth, result.get("indices") or [], intersection_runtime_config
+        )
+        result["market_context"] = market_context
         state_rows, next_items = evaluate_intersection_states(
             result.get("dual_pool_raw") or [],
             result.get("pre_intersection") or [],
             previous_items,
             ts,
             intersection_runtime_config,
+            snapshot_id=hooks.snapshot_id or ts.strftime("%Y-%m-%d %H:%M:%S"),
             risk_map=risk_map,
+            minute_map=minute_map,
+            market_context=market_context,
         )
         result["intersection_states"] = state_rows
-        save_intersection_state(next_items, ts.strftime("%Y-%m-%d"))
+        if minute_map:
+            result["minute_fetch_log"] = minute_map
+        save_intersection_state(next_items, ts.strftime("%Y-%m-%d"), hooks.state_commit)
 
-    t_total = time.time() - t0
-    print(f"[计时] 总计: {t_total:.1f}s", file=sys.stderr)
+    # ── 展示裁剪：top 至此才生效，只改变可见行数 ──────────────────────
+    result["strict_ultra"] = _display_rows(result.get("strict_ultra"), params.top)
+    result["trend_observation"] = _display_rows(result.get("trend_observation"), params.top)
+    result["strict_trend"] = _display_rows(result.get("strict_trend"), params.top)
+    result["low_ultra"] = _display_rows(result.get("low_ultra"), max(params.top, 15))
+    result["low_trend"] = _display_rows(result.get("low_trend"), max(params.top, 15))
+    result["capital_rank"] = _display_rows(result.get("capital_rank"), params.top)
+
+    # 每行标注交易板（三板同表时必须可辨）。放在最后：资金优选、交集状态机、
+    # 观察池突破升级后的观察池都是在此之后才生成的派生栏目，早标注会漏掉它们。
+    stamp_board_fields(result)
+    result["meta"]["elapsed_seconds"] = round(time.time() - t0, 1)
+    hooks.log_line(f"[计时] 总计: {result['meta']['elapsed_seconds']:.1f}s")
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="A-share screening query helper for daily-stock-analysis")
+    parser.add_argument("--mode", nargs="+", choices=["all", "strict", "low", "watchlist"], default=["strict"], help="screening modules to output (default: original dual screen)")
+    parser.add_argument("--format", choices=["md", "json"], default="md", help="output format")
+    parser.add_argument("--workers", type=int, default=6, help="concurrent K-line workers")
+    parser.add_argument("--top", type=int, default=10, help="max display rows per section")
+    parser.add_argument("--save", type=Path, help="also save output to file")
+    parser.add_argument("--skip-announcements", action="store_true", help="skip latest-announcement risk check")
+    parser.add_argument("--skip-capital-ranking", action="store_true", help="skip capital-flow secondary ranking")
+    parser.add_argument("--announcement-page-size", type=int, default=8, help="latest announcement rows per stock")
+    parser.add_argument("--network-mode", choices=["auto", "direct", "proxy"], default="auto",
+                        help="network mode: auto (measured fastest) / direct / proxy")
+    parser.add_argument("--boards", nargs="+", choices=list(BOARD_ORDER), default=[BOARD_MAIN],
+                        help="交易板范围（默认 main=仅沪深主板）。可任意非空组合；所选交易板"
+                             "统一参与完整筛选（同一门槛/排名/状态机）。未勾选的交易板不进入新增候选。"
+                             "本参数只决定筛选范围，不授予任何买入资格。")
+    args = parser.parse_args()
+
+    modes = set(args.mode)
+    if "all" in modes:
+        modes = {"strict", "low", "watchlist"}
+
+    params = ScreeningParams(
+        modes=frozenset(modes),
+        workers=args.workers,
+        top=args.top,
+        skip_announcements=args.skip_announcements,
+        skip_capital_ranking=args.skip_capital_ranking,
+        network_mode=args.network_mode,
+        announcement_page_size=args.announcement_page_size,
+        enabled_boards=tuple(args.boards),
+    )
+
+    def announcement_progress(done: int, total: int, code: str, status: str, source: str) -> None:
+        source_label = "缓存" if source == "cache" else "查询"
+        print(f"[公告] {done}/{total} {code} {source_label}={status}", file=sys.stderr, flush=True)
+
+    hooks = ScreeningHooks(
+        announce_progress=announcement_progress,
+        source_suffix="" if args.skip_announcements else " + 东方财富公告",
+        log=lambda message: print(message, file=sys.stderr),
+    )
+
+    try:
+        result = run_screening_core(params, hooks)
+    except NetworkUnavailable as exc:
+        print(format_network_failure(exc), file=sys.stderr)
+        return 2
 
     if args.format == "json":
         output = json.dumps(_sanitize_for_json(result), ensure_ascii=False, indent=2)

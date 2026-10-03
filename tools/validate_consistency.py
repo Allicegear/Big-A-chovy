@@ -271,57 +271,111 @@ def _progress_line(text: str, marker: str) -> Optional[str]:
     return None
 
 
+# 实验登记表的项目名（框架第六节）。用于核对“框架是否声明了目标与方法”。
+PROGRESS_MARKERS = {
+    "coalition": "⑥合力主升主导验证",
+    "breakout": "⑦观察池突破状态机",
+    "sector_boost": "⑧主线板块协同加分器",
+    "divergence": "⑨龙头分歧识别",
+}
+
+# 框架必须保留的两条声明：进度只在本地维护；达标前仅模拟。
+FRAMEWORK_PROGRESS_LOCAL_ONLY = "只在本地影子库维护"
+FRAMEWORK_SIMULATED_UNTIL_TARGET = "各自达到20个完整结算样本并完成转正评估前仅模拟运行"
+
+# 公开框架里**不得**出现的本地进度写法（出现即说明进度被写回了公开文档）。
+_FRAMEWORK_PROGRESS_LEAK = re.compile(r"已采集\s*\d+|完整结算\s*\d+\s*/\s*\d+")
+
+
 def check_framework_progress(
     project_root: Path = PROJECT_ROOT,
     db: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, List[Dict[str, str]]]:
-    """分别核对采集数和完整结算进度，未结算不得计入 x/20。"""
+    """核对框架的验证目标与权限声明，并把真实进度从本地影子库读出来。
+
+    进度数字**不进公开框架**：框架第六节明确“样本采集与结算进度、单笔案例及金额
+    只在本地影子库维护；公开框架只列验证目标和方法”。所以这里不再去解析框架里的
+    x/20（那既要求把私有进度公开，也会让框架与本地库各存一份互相漂移），而是分两步：
+
+    1. 框架侧：每类实验必须声明验证目标（``target_samples`` 个完整结算样本）与验证
+       方法，并保留「进度只在本地影子库维护」与「达标前仅模拟运行」两条声明；框架里
+       一旦出现 ``已采集 N`` / ``完整结算 N/M`` 这类进度写法即判 FAIL。
+    2. 影子库侧：按统一完整结算口径（:func:`is_complete_shadow_result`）算出实际进度
+       并通报，同时核对影子库的类别与目标值和共享配置一致。未结算样本不计入进度。
+    """
     result = _empty_result()
     framework = _read_text(project_root / "选股框架.md")
     if framework is None:
-        _add(result, "fail", "无法读取选股框架，不能对账影子进度")
-        return result
-    if db is None:
-        _add(result, "warn", "影子样本库不可用，跳过框架进度对账")
+        _add(result, "fail", "无法读取选股框架，不能核对验证目标与权限声明")
         return result
 
-    markers = {
-        "coalition": "⑥合力主升主导验证",
-        "breakout": "⑦观察池突破状态机",
-        "sector_boost": "⑧主线板块协同加分器",
-        "divergence": "⑨龙头分歧识别",
-    }
-    samples = db.get("samples") or {}
-    targets = db.get("targets") or {}
-    for category, marker in markers.items():
+    configured_target = int(RULE_CONFIG["shadow"]["target_samples"])
+
+    # ── 1. 框架侧：目标 + 方法 + 权限声明，且不得夹带本地进度 ──
+    for category, marker in PROGRESS_MARKERS.items():
         line = _progress_line(framework, marker)
         if line is None:
             _add(result, "fail", f"选股框架缺少待验证项：{category}")
             continue
-        configured_target = int(RULE_CONFIG["shadow"]["target_samples"])
-        match = re.search(r"完整结算\s*(\d+)\s*/\s*(\d+)", line)
-        collected = re.search(r"已采集\s*(\d+)", line)
-        if not match or not collected:
-            _add(result, "fail", f"选股框架必须分开标注 {category} 的已采集数与完整结算进度")
-            continue
-        reported_count, reported_target = int(match[1]), int(match[2])
-        rows = samples.get(category) or []
-        actual_count = sum(is_complete_shadow_result(row.get("t1_result")) for row in rows if isinstance(row, dict))
-        if int(collected[1]) != len(rows):
-            _add(result, "fail", f"{category} 采集数不一致：框架{collected[1]}，影子库{len(rows)}")
-        if reported_count != actual_count or reported_target != configured_target:
+        if f"{configured_target}个完整结算样本" not in line:
             _add(
                 result,
                 "fail",
-                f"{category} 进度不一致：框架 {reported_count}/{reported_target}，"
-                f"影子库 {actual_count}/{configured_target}",
+                f"{category} 未声明验证目标：应为「{configured_target}个完整结算样本」",
             )
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 3 or not cells[2]:
+            _add(result, "fail", f"{category} 只登记了目标，缺少验证方法")
         else:
-            db_target = (targets.get(category) or {}).get("target_samples")
-            if db_target != configured_target:
-                _add(result, "fail", f"{category} 影子库目标值为 {db_target}，配置要求 {configured_target}")
-            else:
-                _add(result, "pass", f"{category} 完整结算进度一致：{actual_count}/{configured_target}，已采集{len(rows)}")
+            _add(result, "pass", f"{category} 已在框架登记验证目标与方法")
+
+    if FRAMEWORK_PROGRESS_LOCAL_ONLY not in framework:
+        _add(result, "fail", "选股框架未声明“进度只在本地影子库维护”，公开文档有变成进度台账的风险")
+    elif FRAMEWORK_SIMULATED_UNTIL_TARGET not in framework:
+        _add(result, "fail", "选股框架未声明实验达标前的权限规则（达标前仅模拟运行）")
+    else:
+        _add(result, "pass", "选股框架声明了本地维护进度与达标前仅模拟的权限规则")
+
+    leaked = sorted(set(_FRAMEWORK_PROGRESS_LEAK.findall(framework)))
+    if leaked:
+        _add(
+            result,
+            "fail",
+            "公开框架出现本地进度数字（应只存在于本地影子库）：" + "、".join(leaked),
+        )
+
+    # ── 2. 影子库侧：实际进度按统一完整结算口径读取，未结算不计入 ──
+    if db is None:
+        _add(result, "warn", "本地影子库不可用，只核对了框架声明，无法读取实际进度")
+        return result
+
+    samples = db.get("samples") or {}
+    targets = db.get("targets") or {}
+    for category in PROGRESS_MARKERS:
+        rows = samples.get(category)
+        if not isinstance(rows, list):
+            _add(result, "fail", f"本地影子库缺少 {category} 的样本数组")
+            continue
+        db_target = (targets.get(category) or {}).get("target_samples")
+        if db_target != configured_target:
+            _add(
+                result,
+                "fail",
+                f"{category} 影子库目标值为 {db_target}，共享配置要求 {configured_target}",
+            )
+            continue
+        complete = sum(
+            1
+            for row in rows
+            if isinstance(row, dict) and is_complete_shadow_result(row.get("t1_result"))
+        )
+        _add(
+            result,
+            "pass",
+            f"{category} 实际进度（本地影子库）：完整结算 {complete}/{configured_target}；"
+            f"已采集 {len(rows)}（未结算不计入）",
+        )
     return result
 
 

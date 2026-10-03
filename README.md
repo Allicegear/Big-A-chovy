@@ -159,6 +159,21 @@ python3 daily-stock-analysis/scripts/a_share_daily_screen.py \
 | `--network-mode direct` | 强制直连 |
 | `--skip-announcements` | 跳过公告风险检查，不建议日常使用 |
 | `--skip-capital-ranking` | 跳过资金排名辅助模块 |
+| `--boards main chinext star` | 交易板范围，默认 `main`（仅沪深主板）。可任意非空组合；勾选后该交易板股票**统一参与完整筛选**（同一门槛、同一排名、同一条状态机），未勾选的交易板不进入新增候选（见下） |
+
+### 交易板范围（默认只筛沪深主板）
+
+`--boards` 与看板配置里的 `enabled_boards` 决定**哪些交易板进入本轮筛选**；它与按行业计算的「板块共振」是两个概念，故不叫“板块”。
+
+- **所选交易板统一参与完整筛选**：资金增量与状态 → 超短池／趋势池 → 双池交集 → 资金优选／低吸／明日观察池 → 现有状态机，**同一套门槛与排名**（三板都读 `tools/rule_config.py`，暂不单独放大创业板/科创板阈值）。因此超出当前涨幅或价格区间的两板股票被排除，属正常筛选结果。
+- 默认只选**沪深主板**，输出与历史基线一致；勾选创业板（`300/301`）或科创板（`688/689`）后，两板股票直接出现在正常栏目中，**每行带「交易板」字段**。
+- **未勾选的交易板不进入新增候选**；切换范围后旧范围留下的锁存／等待回踩／突破状态不继续生效，**已持仓股票的监控不受影响**。
+- 行业共振的强势股计数按所选交易板统计，行业上涨比例与平均涨幅仍用全市场背景；「主板涨停／跌停」统计仍只指沪深主板。
+- 公告、超大单为负、主导资格、数据完整性等门禁对三板**一视同仁**；数据降级或快照不完整时，报告会区分「未符合条件」与「数据不可用」。
+- 北交所与其它代码不在选项内（归 `unknown`，一律排除）；ST/退市与字段不全的股票照旧排除。
+- 范围在**每轮开始时冻结**：运行中改配置只影响下一轮；报告头部与结果（`meta.enabled_boards`／`board_scope_note`）记录本轮实际范围、各板计数与范围结论——数据完整且无候选是「未符合条件」，降级/快照不完整是「本轮结果不完整」，两者不会混为一谈。
+
+> 历史快照说明：2026-09-30 之前的快照里，创业板/科创板只进过独立的「扩展交易板观察」列表。这类旧快照仍按原口径展示并标注为历史口径，**不要与当前「三板统一筛选」的结果直接比较**。
 
 ### 3. 启动实时看板
 
@@ -343,6 +358,21 @@ python3 -m py_compile \
 python3 -m unittest discover -s daily-stock-analysis/scripts -p 'test_*.py'
 ```
 
+### 端到端验证必须隔离运行状态
+
+盘中状态机依赖持久化的运行状态文件（交集锁存／等待回踩、观察池突破确认次数、资金 5/15 分钟基准），验证跑会覆盖它们。**任何实跑验证（含 `--boards` 范围验证、手动跑引擎、起看板）都要先把状态与报告定向到临时目录**：
+
+```bash
+A_SHARE_STATE_DIR=/tmp/e2e/state A_SHARE_REPORT_DIR=/tmp/e2e/reports \
+python3 daily-stock-analysis/scripts/a_share_daily_screen.py --boards main chinext --top 5
+```
+
+- `A_SHARE_STATE_DIR`：`flow_snapshot.json`、`intersection_state.json`、`watchlist_breakout_state.json`、`.kline_cache.json`、`.announcement_risk_cache.json`、`.em_cooldown`、`last_valid_result.json`。
+- `A_SHARE_REPORT_DIR`：看板与工作台的报告归档目录（默认 `筛选结果/`）。验证产物混进当日报告序列会污染 `scan_reports` 与「继续看筛选」的结论。
+- 用户配置与输入**不**跟随这两个变量：`dashboard_settings.json`、`holdings.json`、`proxy_ports.json`、`intersection_calibration.json` 仍在原位。
+- 变量在**进程启动时**读取一次，必须在启动前设置；测试套件同样不得写入真实运行状态（`test_network_diagnostics` 已按此挡住状态落盘）。
+- 单元测试默认不联网、不启动服务，因此不需要该变量；它是给**实跑**用的。
+
 ## 八、模型使用建议（当前测试记录）
 
 以下结论来自当前实际使用体验，属于经验记录，不代表模型的客观性能排名。
@@ -384,11 +414,31 @@ python3 -m unittest discover -s daily-stock-analysis/scripts -p 'test_*.py'
    - 历史坑：旧版脚本硬编码 7897 并 `open -a "Clash Verge"`，会与新代理软件争夺系统代理、关掉 Verge 就断网。
    - 2026-09-08 实测行情接口直连可达（0.08~0.2s），旧结论"直连会被封锁"已不成立。
 3. **Windows 报告目录名提取（本地修补，待 Windows 复验）**：`tools/scan_reports.py` 和 `tools/track_stock.py` 原先用 `split('/')[-2]`，在 Windows 反斜杠路径上会触发 `IndexError`；当前工作副本已改为 `os.path.basename(os.path.dirname(...))`。线下反馈报告该补丁可正常扫描 88 份报告；本环境未重复运行验证。
+4. **交易板范围（2026-10-01 验收通过）**：`enabled_boards` 支持沪深主板／创业板／科创板任意非空组合，所选交易板统一参与完整筛选（资金增量与状态 → 超短池／趋势池 → 双池交集 → 资金优选／低吸／明日观察池 → 状态机），默认仅主板。验收记录：仅主板／仅创业板／仅科创板／三板四种范围实跑均能进入正常池并运行状态机，未选交易板零混入（引擎实测科创板在快照中 621 只、预筛 0 只），两板的超大单为负一票否决与公告门禁正常生效，报告与两个页面口径一致。验收同时修掉六处缺陷，其中 `a_share_daily_screen.py` 的标注调用排在 `result` 赋值之前会让 CLI 每次成功运行都以 `UnboundLocalError` 收尾。
+5. **一致性检查改为从本地影子库读进度（2026-10-01）**：`tools/validate_consistency.py` 原先要求 `选股框架.md` 写明「已采集X；完整结算Y/20」，与框架第六节「进度与金额只在本地影子库维护」相矛盾。现在框架侧只核对验证目标、验证方法与权限声明（并**禁止**框架出现进度数字），实际进度按统一完整结算口径从 `tools/shadow_data/shadow_samples.json` 读取，未结算不计入。
+6. **测试套件不再污染状态（2026-10-01）**：两处跨用例污染已修，`python3 -m unittest discover` 由「7 个失败」转为全绿（353 个用例）。
+   - `test_network_diagnostics` 跑真实 `main()` 却漏挡 `save_watchlist_breakout_state`，每跑一次套件就把**盘中观察池突破状态**按当天日期覆盖（已补 patch，与同处已有的交集/资金挡板一致）。
+   - `test_kline_source_chain` 在整套 discover 下会全部误判：`realtime_engine` 导入时会把 `screen.fetch_kline` 换成带缓存的包装函数，缓存一命中用例就走不到取数链（单跑不导入引擎，所以单跑正常）。已在 setUp 锁死无缓存的原始链。
+   - 环境状态文件现由 `runtime_paths.py` 统一解析，端到端验证的隔离开关见「七、开发和测试」。
+7. **CLI 与看板收敛到同一条筛选流水线（2026-10-03，详见 [`docs/daily-stock-analysis-重构交付记录.md`](docs/daily-stock-analysis-重构交付记录.md)）**：
+   - 新增共享核心 `a_share_daily_screen.run_screening_core`；CLI 的 `main()` 与 `realtime_engine.run_screening` 都调用它。出口差异（K 线缓存、分钟线、负超单观察、温度计、5 分钟量能）改为显式注入，删除了 `realtime_engine` 导入时 monkey-patch `screen.fetch_kline` 的全局副作用。
+   - **`top` 只影响展示行数**：此前严格超短池先被 `top` 截短再算双池交集/准交集/资金优选/公告核验范围，页面显示条数会改变状态机输入。现在内部候选保留全量，展示裁剪放在最后。
+   - **公告政策集中一处**：`avoid`/`unknown` 一票否决、`watch_risk` 仅减分不否决。修正了交集状态机把 `watch_risk` 当硬否决的行为（原 `test_intersection_state_machine` 断言了错误行为，已更新并注明依据）。
+   - 观察池突破状态机改为两个入口共跑；`unknown` 不再升级为 `CONFIRMED`/`B_BREAKOUT`/`A_STRICT`。
+   - 资金优选统一在公告核验后、同步 `Enriched.risk_status` 后再排名，并传入同一份 `flow_history`（此前看板提前排名且缺历史，`sector_boost` 可能少加分）。
+   - 市场环境分级（`CASH` 禁止新开仓）在核心统一计算（此前仅看板计算）。
+   - 新增回合状态提交门 `state_commit.py`：看板/工作台超时或失败的一轮**不得**提交资金基准/交集状态/观察池突破/K 线缓存，降级快照不清空上一份有效状态；状态全部改为临时文件 + `os.replace` 原子写入。
+   - 超大单为负的框架一票否决现在也作用于交集状态机的新开仓门禁（此前只在报告里打标）。
+   - TLS：新增 `tls_context.py` 统一做证书校验（2026-10-03 实测东财/腾讯/新浪全部行情主机证书链有效，直连与经代理开启校验都可取数）；移除全部 `verify=False`/`_create_unverified_context`。确有自签 CA 需求时配置 `A_SHARE_CA_BUNDLE`，而不是关闭校验。
+   - 测试：新增合成行情夹具 `testing_fixtures.py` 与 30 个行为用例（`top` 不变性、风险矩阵、两个状态机、CLI/看板对照、超时并发、TLS）；`unittest discover` 由 353 增至 383 个用例全绿。
 
 ### 待处理
 
 1. **工作台的网络前置检查可能跳过新浪全市场备用（2026-09-28 记录）**：`a_share_daily_screen.fetch_market()` 已有新浪备用；但 `realtime_dashboard.ScreeningScheduler.run_screening()` 在 `network_path.has_working_path()` 为假时会提前返回并保留旧快照，不调用筛选引擎。若东财探测全失败、但新浪仍可用，已有备用逻辑可能到不了。修复目标：全网断开时继续快速失败；东财路径不可用但新浪可达时，仍允许进入备用行情流程，并在结果中明确标注降级。待下一个交易时段做真实联调；盘后可先用模拟/受控故障场景验证。
 2. **影子样本扫描会丢失历史累计（线下反馈，2026-09-28）**：`tools/shadow_tracker.py:scan_and_update()` 每次都把 `coalition`、`breakout`、`sector_boost` 三类样本先重建为空；`get_report_files(reports_dir, None)` 又只返回最新一天的报告。每天执行扫描会让样本只剩当天内容，20 样本验证门槛无法累计，已有结算也可能丢失。修复目标是遍历历史报告并按样本键增量合并，同时保持原有业务规则函数不变。修复验证前禁止直接运行 `python3 tools/shadow_tracker.py` 或带 `--date` 扫描；`--report` 只读。当前工作副本没有线下反馈提到的 `shadow_sample.py` / `每日收盘.bat`，临时绕行方案需先同步确认。
+3. **运行状态被验证跑覆盖（2026-10-01 记录，内容不可恢复）**：交易板范围验收期间的实跑改写了三个运行时状态文件（`flow_snapshot.json`、`intersection_state.json`、`watchlist_breakout_state.json`），**盘中原始内容已丢失且没有备份可回退**；现存的 9/30 收盘版本只作为验收数据保留，不能当作原始盘中状态。当时的口径记录：交集状态与观察池状态均为 9/30 16:12 收盘快照按当次范围重新评估的结果，日期字段为 `2026-09-30`。
+   - **不能宣称当前状态"已恢复"或"完全干净"**：状态机的日期隔离依据的是**行情日期**而非自然日，假期重跑 9/30 旧行情仍会判定为同一交易日并读取同日状态，所以此次覆盖的影响面无法用日期判断排除。若后续发现盘中状态机行为异常（锁存／确认次数与预期不符），应优先怀疑这一条。
+   - **已加隔离**：`daily-stock-analysis/scripts/runtime_paths.py` 统一提供运行状态路径，端到端验证可通过 `A_SHARE_STATE_DIR`／`A_SHARE_REPORT_DIR` 把状态与报告定向到临时目录（用法见「七、开发和测试」）。此后所有实跑验证必须先设置这两个变量，被测代码与测试不得再写真实运行状态。
 
 ## 十、内置 Skill
 

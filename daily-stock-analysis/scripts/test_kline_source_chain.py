@@ -9,6 +9,7 @@
 本文件锁住：档位顺序、根数门槛、口径基准与逐轮标注。
 """
 
+import sys
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
@@ -58,6 +59,15 @@ class KlineSourceChainTests(unittest.TestCase):
         screen._kline_reference.clear()
         screen._kline_fallback_codes.clear()
         screen._kline_mismatch_codes.clear()
+        # 生产侧有个全局副作用：realtime_engine 被导入时会把 screen.fetch_kline 换成
+        # 带缓存的包装函数。整套 discover 跑时（别的用例会导入引擎）缓存一命中，本文件的
+        # 用例就走不到取数链，六个用例会一起误判成“落到东财/新浪”——单跑因为不导入引擎，
+        # 反而看不出问题。这里锁死无缓存的原始链：本文件测的是档位，不是缓存。
+        engine = sys.modules.get("realtime_engine")
+        uncached = getattr(engine, "_original_fetch_kline", screen.fetch_kline)
+        self._uncached_patch = patch.object(screen, "fetch_kline", uncached)
+        self._uncached_patch.start()
+        self.addCleanup(self._uncached_patch.stop)
 
     def _fetch_with(self, tencent=None, em=None, sina=None, captured=None):
         """按主机归属分发应答；None 表示该主机不可用（抛异常）。"""

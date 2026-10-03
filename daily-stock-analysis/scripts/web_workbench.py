@@ -71,7 +71,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import realtime_dashboard as dash  # noqa: E402  （导入时完成网络路径预热）
 
-REPORTS_DIR = PROJECT_ROOT / "筛选结果"
+# 报告归档目录与看板共用同一来源：两者都受 A_SHARE_REPORT_DIR 控制，
+# 避免“验证跑”把产物写进当日的 筛选结果/ 序列。
+REPORTS_DIR = dash.MD_OUTPUT_DIR
 WORKBENCH_STATIC = SCRIPT_DIR / "workbench_static"
 SCREENING_TIMEOUT_WB = 900  # 一次性筛选硬超时（秒）。Windows 冷缓存+SSL握手慢，实测数百秒；
 # 引擎 K 线缓存预热后，后续轮次会快很多
@@ -147,6 +149,7 @@ class ScreenJob:
     def __init__(self) -> None:
         self.state = "idle"  # idle | running | done | error
         self.params: dict = {}
+        self.config_snapshot: dict | None = None
         self.result: dict | None = None
         self.md_text: str | None = None
         self.md_path: str | None = None
@@ -160,6 +163,8 @@ class ScreenJob:
         if self.state == "running" or self.zombie:
             return {"status": "already_running" if self.state == "running" else "busy",
                     "reason": "上一次筛选仍在后台执行中，等它结束后再试" if self.zombie else None}
+        # 公告检查是一票否决门禁：不接受前端传来的关闭请求，一律按开启执行。
+        params = {k: v for k, v in (params or {}).items() if k != "skip_announcements"}
         # K线预热中不开新任务：预热会占满网络，并发筛选只会互相拖慢（实测两者一起跑双超时）
         if dash.scheduler.is_prewarming:
             return {"status": "busy", "reason": "K线预热中，请等预热完成后再试（首次启动约需几分钟）"}
@@ -168,6 +173,8 @@ class ScreenJob:
             return {"status": "busy", "reason": "看板正在自动刷新筛选，请稍后再试"}
         self._screening_lock_held = True
         self.params = params
+        # 配置在任务启动时固定：运行途中改参数配置只作用于下一轮筛选。
+        self.config_snapshot = dash.scheduler.config
         self.state = "running"
         self.error = None
         self.result = None
@@ -185,17 +192,32 @@ class ScreenJob:
 
             modes = set(self.params.get("modes") or ["strict", "low", "watchlist"])
             ctx: dict = {}
+            round_commit = dash.state_commit.RoundCommit(f"workbench-{time.strftime('%H%M%S')}")
 
             def _worker() -> None:
                 try:
                     t0 = time.time()
+                    config = self.config_snapshot or dash.scheduler.config
                     ctx["result"] = engine_run(
                         modes=modes,
                         workers=6,
                         top=int(self.params.get("top") or 15),
-                        skip_announcements=bool(self.params.get("skip_announcements")),
+                        # 服务端强制：正式筛选必须执行公告检查。跳过只保留给命令行诊断
+                        # （a_share_daily_screen --skip-announcements），不在买入选口上开放。
+                        skip_announcements=False,
                         skip_capital_ranking=bool(self.params.get("skip_capital_ranking")),
                         network_mode=self.params.get("network_mode") or "auto",
+                        settings_snapshot={
+                            "revision": int((config or {}).get("revision") or 1),
+                            "negative_super_view": dash.dashboard_settings.view_of(config),
+                            # 手动筛选默认继承看板配置里的交易板范围；请求体带 boards 时按本次覆盖
+                            # （覆盖值已在入口校验过，非法会直接 400，不会走到这里）。
+                            "enabled_boards": (
+                                self.params.get("boards")
+                                or dash.dashboard_settings.boards_of(config)
+                            ),
+                        },
+                        state_commit=round_commit,
                     )
                     ctx["elapsed"] = time.time() - t0
                 except Exception as e:  # noqa: BLE001
@@ -205,8 +227,10 @@ class ScreenJob:
             th.start()
             th.join(timeout=SCREENING_TIMEOUT_WB)
             if th.is_alive():
-                # Python 无法杀线程：引擎继续在后台跑完。锁不移交，由收割线程等
-                # 引擎真正结束后再释放，避免看板新任务与僵尸引擎竞争模块级状态。
+                # Python 无法杀线程：引擎继续在后台跑完，但本轮状态提交已中止，
+                # 僵尸引擎无法覆盖正式运行状态。锁不移交，由收割线程等引擎真正结束后
+                # 再释放，避免看板新任务与僵尸引擎竞争模块级状态。
+                round_commit.abort()
                 self._timeout_hit = True
                 self.state = "error"
                 self.error = (f"筛选超时（>{SCREENING_TIMEOUT_WB}s）。后台任务仍在执行中，"
@@ -227,20 +251,33 @@ class ScreenJob:
                 threading.Thread(target=_reap, daemon=True).start()
                 return  # 锁由 _reap 释放，不走 finally
             if "error" in ctx:
+                round_commit.abort()
                 self.state = "error"
                 self.error = str(ctx["error"])
                 return
             self.result = ctx["result"]
             self.elapsed = ctx.get("elapsed", 0.0)
             if "error" in (self.result or {}):
+                round_commit.abort()
                 self.state = "error"
                 self.error = str(self.result.get("error"))
+                return
+            # 本轮确认成功：统一提交暂存状态（资金基准/交集/观察池突破/K线缓存）。
+            try:
+                round_commit.commit()
+            except Exception as e:  # noqa: BLE001
+                print(f"[workbench] state commit failed: {e}", file=sys.stderr)
+                self.state = "error"
+                self.error = f"运行状态落盘失败：{e}"
                 return
             self._render_and_save_md()
             # 同步给看板：/api/data 与实时看板页面展示最新手动筛选结果
             dash.scheduler.latest_result = self.result
             self.state = "done"
         except Exception as e:  # noqa: BLE001
+            _rc = locals().get("round_commit")
+            if _rc is not None:
+                _rc.abort()
             self.state = "error"
             self.error = f"{type(e).__name__}: {e}"
         finally:
@@ -254,17 +291,28 @@ class ScreenJob:
     def _render_and_save_md(self) -> None:
         try:
             import a_share_daily_screen as screen
-            md = screen.render_markdown(self.result or {})
             min5 = dash.ScreeningScheduler._render_min5_table(self.result or {})
-            if min5:
-                md += "\n" + min5 + "\n"
-            self.md_text = md
+
+            def _render() -> str:
+                md = screen.render_markdown(self.result or {})
+                return md + ("\n" + min5 + "\n" if min5 else "")
+
+            self.md_text = _render()
             REPORTS_DIR.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M")
             path = REPORTS_DIR / f"A股筛选结果_{stamp}.md"
-            path.write_text(md, encoding="utf-8")
+            path.write_text(self.md_text, encoding="utf-8")
+            # 报告落盘后做只读影子判定回填徽标，并重写报告，保证页面与报告同口径。
+            if dash.ScreeningScheduler.refresh_shadow_badges(self.result or {}):
+                self.md_text = _render()
+                path.write_text(self.md_text, encoding="utf-8")
             # API 只返回项目内相对路径，避免把本机用户名/绝对路径暴露给浏览器。
-            self.md_path = str(path.relative_to(PROJECT_ROOT))
+            # 验证隔离时归档目录可能在项目外（A_SHARE_REPORT_DIR），取不到相对路径
+            # 就用绝对路径，不能让展示值把整个落盘流程带崩。
+            try:
+                self.md_path = str(path.relative_to(PROJECT_ROOT))
+            except ValueError:
+                self.md_path = str(path)
             dash.scheduler.latest_md_path = str(path)
             print(f"[workbench] markdown saved: {path}", file=sys.stderr)
         except Exception as e:  # noqa: BLE001
@@ -570,7 +618,21 @@ class WorkbenchHandler(dash.DashboardHandler):
             except json.JSONDecodeError:
                 self.send_error(400, "Invalid JSON")
                 return
-            self._serve_json(JOB.start(body if isinstance(body, dict) else {}))
+            if not isinstance(body, dict):
+                self._serve_json({"status": "error", "error": "请求体必须是对象"}, status=400)
+                return
+            # 交易板覆盖：**未提供**才继承已保存配置；**提供了但非法**必须 400。
+            # 静默回退到已保存值并不一定更窄——保存的是三板时，一个写错的请求照样跑三板，
+            # 用户却以为覆盖生效了，无从察觉。
+            override, boards_error = dash.dashboard_settings.parse_request_boards(body.get("boards"))
+            if boards_error:
+                self._serve_json({"status": "error", "error": boards_error}, status=400)
+                return
+            if override:
+                body["boards"] = override
+            else:
+                body.pop("boards", None)
+            self._serve_json(JOB.start(body))
         else:
             super().do_POST()
 

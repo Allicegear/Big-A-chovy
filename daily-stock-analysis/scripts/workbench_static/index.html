@@ -23,6 +23,7 @@
     <button class="tab-btn active" data-tab="screen">筛选任务</button>
     <button class="tab-btn" data-tab="reports">报告库</button>
     <button class="tab-btn" data-tab="tools">工具箱</button>
+    <button class="tab-btn" data-tab="config">参数配置</button>
   </nav>
 </header>
 
@@ -56,7 +57,7 @@
         </label>
       </div>
       <div class="form-row">
-        <label class="toggle" title="关闭后公告 avoid/unknown 的一票否决门禁失效"><input type="checkbox" id="check-announcements" checked> 公告检查</label>
+        <span class="rule-chip" title="公告 avoid/unknown 是框架一票否决门禁，任何入口都不能关闭">公告检查：强制开启</span>
         <label class="toggle" title="关闭后不做资金排名，候选按其他条件排序"><input type="checkbox" id="rank-capital" checked> 资金排名</label>
         <span id="dashboard-options-hint" class="meta-text"></span>
       </div>
@@ -150,6 +151,75 @@
         </div>
         <div id="track-out" class="tool-out"></div>
       </div>
+    </div>
+  </section>
+
+  <!-- ============ 参数配置 ============ -->
+  <section id="tab-config" class="tab-panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>参数配置</h2>
+        <span class="scope-chip" title="看板持久口径，对下一轮筛选生效；不改变任何买入权限">全局口径</span>
+      </div>
+      <p class="hint">这里只调整看板的展示与运行口径，不能授予模拟仓或真实仓买入权限。买卖裁决以《选股框架.md》为准。</p>
+
+      <div id="config-status" class="config-status"></div>
+      <div id="config-error" class="config-error hidden"></div>
+
+      <fieldset class="config-block">
+        <legend>负超单观察</legend>
+        <label class="toggle"><input type="radio" name="neg-view" value="strict"> 严格展示（默认，只显示现有正式列表）</label>
+        <label class="toggle"><input type="radio" name="neg-view" value="observe"> 开启观察（增加独立的负超单观察列表）</label>
+        <p class="hint">两档都维持真实仓否决：超大单为负 = 禁止正式买入建议。观察列表只展示事实与卡点，原有正式列表、排名和资格不变。</p>
+      </fieldset>
+
+      <fieldset class="config-block">
+        <legend>交易板范围</legend>
+        <div class="form-row">
+          <label class="toggle"><input type="checkbox" id="cfg-board-main"> 沪深主板</label>
+          <label class="toggle"><input type="checkbox" id="cfg-board-chinext"> 创业板</label>
+          <label class="toggle"><input type="checkbox" id="cfg-board-star"> 科创板</label>
+        </div>
+        <p class="hint">
+          默认只选沪深主板（与历史基线一致）。勾选后，该交易板的股票<b>统一参与完整筛选</b>：资金增量与状态 →
+          超短池／趋势池 → 双池交集 → 资金优选／低吸／明日观察池 → 现有状态机，使用<b>同一套门槛与排名</b>
+          （三板都读 <code>tools/rule_config.py</code>，暂不单独放大两板阈值；超出现有涨幅/价格区间的股票被排除属正常筛选结果）。
+          取消勾选则该板不参与新增候选；已持仓股票的监控不受影响。北交所暂不在选项内。<b>至少选择一个交易板。</b>
+        </p>
+        <p class="hint">此设置对本实例的所有访问者生效（单实例共享配置）。切换范围后，旧范围留下的锁存/等待回踩状态会被剔除（已持仓保留监控）。</p>
+      </fieldset>
+
+      <fieldset class="config-block">
+        <legend>固定规则（只读）</legend>
+        <ul class="rule-list">
+          <li>超大单为负：禁止正式买入建议（真实仓一票否决）</li>
+          <li>真实仓主导资格须为 <code>absolute</code></li>
+          <li>公告 <code>avoid</code>/<code>unknown</code>：一票否决</li>
+        </ul>
+        <p class="hint">规则语义以《选股框架.md》为准；本页不能改变这些门禁，也没有普通开关可关掉它们。</p>
+      </fieldset>
+
+      <fieldset class="config-block">
+        <legend>看板运行参数</legend>
+        <div class="form-row">
+          <label>输出条数 <input type="number" id="cfg-top" min="3" max="50" class="num"></label>
+          <label>刷新间隔(秒) <input type="number" id="cfg-interval" min="10" max="600" class="num"></label>
+          <label>网络模式
+            <select id="cfg-network">
+              <option value="auto">auto（实测择优）</option>
+              <option value="direct">direct（强制直连）</option>
+              <option value="proxy">proxy（仅代理）</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint">公告检查与正式资金排序属规则要求，不提供普通运行开关。</p>
+      </fieldset>
+
+      <div class="form-row">
+        <button id="config-apply" class="btn btn-primary">应用配置</button>
+        <span id="config-apply-state" class="meta-text"></span>
+      </div>
+      <p class="hint" id="config-impact"></p>
     </div>
   </section>
 </main>

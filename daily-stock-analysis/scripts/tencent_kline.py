@@ -12,10 +12,11 @@
 from __future__ import annotations
 
 import json
-import ssl
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
+
+import tls_context  # 同目录：TLS 校验上下文唯一来源
 
 # 按可用性排序；2026-09-26 实测前两个正常，第三个被 WAF 拦截但保留以便恢复后自动启用。
 TENCENT_KLINE_URLS: Tuple[str, ...] = (
@@ -71,7 +72,7 @@ def fetch_kline_json(
         try:
             req = urllib.request.Request(url, headers=request_headers)
             with urllib.request.urlopen(
-                req, context=ssl._create_unverified_context(), timeout=timeout
+                req, context=tls_context.build_context(), timeout=timeout
             ) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
             payload = json.loads(body)

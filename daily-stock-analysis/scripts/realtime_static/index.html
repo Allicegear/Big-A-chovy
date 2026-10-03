@@ -21,9 +21,9 @@
     <span id="elapsed-time" class="meta-text"></span>
   </div>
   <div class="topbar-right">
-    <span class="topbar-group-label" title="看板默认设置：保存后对每一轮自动刷新生效">看板默认</span>
-    <label class="toggle" title="关闭后公告 avoid/unknown 的一票否决门禁失效"><input type="checkbox" id="skip-ann" checked> 公告检查</label>
-    <label class="toggle" title="关闭后不做资金排名，候选按其他条件排序"><input type="checkbox" id="skip-capital" checked> 资金排名</label>
+    <a id="config-chip" class="config-chip" href="/workbench#config"
+       title="口径入口：在「筛选工作台 → 参数配置」中调整，看板不直接改规则">配置加载中…</a>
+    <button id="glossary-btn" class="btn" aria-haspopup="dialog" aria-controls="glossary">术语说明</button>
     <button id="prewarm-btn" class="btn">预热K线</button>
     <button id="refresh-btn" class="btn">立即刷新</button>
     <button id="force-refresh-btn" class="btn btn-warn">强制刷新</button>
@@ -90,6 +90,7 @@
       <button class="sub-tab" data-tab="low-trend">低吸趋势 <span class="sub-count" id="cnt-low-trend"></span></button>
       <button class="sub-tab" data-tab="low-open">低开洗盘 <span class="sub-count" id="cnt-low-open"></span></button>
       <button class="sub-tab" data-tab="watchlist">明日观察 <span class="sub-count" id="cnt-watchlist"></span></button>
+      <button class="sub-tab" data-tab="neg-super" id="tab-btn-neg-super" style="display:none">负超单观察 <span class="sub-count" id="cnt-neg-super"></span></button>
     </div>
   </div>
   <div class="tab-group" data-group="sector">
@@ -104,12 +105,27 @@
 </nav>
 
 <main class="content">
+  <!-- 权限提示常驻在表格重绘区之外：刷新不会把它带走 -->
+  <div id="permission-hint" class="permission-hint hidden" role="note"></div>
   <div id="table-container">
     <div class="placeholder">等待数据加载...</div>
   </div>
 </main>
 
 <footer class="footer" id="footer"></footer>
+
+<!-- 术语侧栏：放在表格容器之外，10 秒重绘不会关闭它 -->
+<aside id="glossary" class="glossary hidden" role="dialog" aria-modal="false" aria-labelledby="glossary-title">
+  <div class="glossary-backdrop" id="glossary-backdrop"></div>
+  <div class="glossary-panel" role="document">
+    <header class="glossary-head">
+      <h2 id="glossary-title">术语说明</h2>
+      <button id="glossary-close" class="btn" aria-label="关闭术语说明">✕ 关闭</button>
+    </header>
+    <p class="glossary-note">筛选标签用于发现和解释证据；真实仓建议仍须按《选股框架.md》完成全部核验。</p>
+    <div id="glossary-body" class="glossary-body"></div>
+  </div>
+</aside>
 
 <script src="/common.js"></script>
 <script src="/app.js"></script>

@@ -31,7 +31,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import ssl
 import subprocess
 import sys
 import threading
@@ -41,6 +40,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+import tls_context  # 同目录：TLS 校验上下文唯一来源
 
 try:
     import requests
@@ -190,7 +191,7 @@ def _probe_requests(proxy_url: Optional[str]) -> Dict[str, Optional[float]]:
         try:
             t0 = time.perf_counter()
             resp = session.get(url, params=params, headers=PROBE_HEADERS,
-                               timeout=PROBE_TIMEOUT, verify=False)
+                               timeout=PROBE_TIMEOUT, verify=tls_context.requests_verify())
             resp.raise_for_status()
             data = resp.json()
             latency = (time.perf_counter() - t0) * 1000.0
@@ -203,7 +204,7 @@ def _probe_requests(proxy_url: Optional[str]) -> Dict[str, Optional[float]]:
 def _probe_urllib(proxy_url: Optional[str]) -> Dict[str, Optional[float]]:
     """无 requests 环境用标准库探测（与引擎 urllib 兜底同一传输方式）。"""
     result: Dict[str, Optional[float]] = {}
-    ssl_ctx = ssl._create_unverified_context()
+    ssl_ctx = tls_context.build_context()
     for name, url, params in PROBE_ENDPOINTS:
         try:
             handlers = [urllib.request.HTTPSHandler(context=ssl_ctx)]

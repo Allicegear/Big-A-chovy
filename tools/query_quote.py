@@ -7,7 +7,6 @@
 
 import sys
 import json
-import ssl
 import urllib.request
 import argparse
 from pathlib import Path
@@ -17,8 +16,9 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "daily-stock-analysis" /
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 import tencent_kline  # noqa: E402  腾讯日 K 主机列表单一来源
+import tls_context  # noqa: E402  TLS 校验上下文唯一来源（默认校验证书）
 
-ssl_ctx = ssl._create_unverified_context()
+ssl_ctx = tls_context.build_context()
 
 def normalize_code(code: str) -> str:
     """自动添加市场前缀 sh / sz"""

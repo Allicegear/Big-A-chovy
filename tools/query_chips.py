@@ -11,11 +11,16 @@ tools/query_chips.py - 主力筹码与分时价格-成交量分布 (Volume-by-Pr
 
 import sys
 import json
-import ssl
 import urllib.request
 import argparse
+from pathlib import Path
 
-ssl_ctx = ssl._create_unverified_context()
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "daily-stock-analysis" / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+import tls_context  # noqa: E402  TLS 校验上下文唯一来源（默认校验证书）
+
+ssl_ctx = tls_context.build_context()
 
 def normalize_code(code: str) -> str:
     code_clean = code.strip().lower()

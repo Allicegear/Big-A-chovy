@@ -94,9 +94,42 @@
     }
     if (st.em_in_cooldown) flags.push({ text: "东财冷却中", tone: "warn", title: "东财入口被限流，冷却结束前不参与请求轮换" });
     if (st.proxy_unavailable) flags.push({ text: "代理断开", tone: "bad", title: "本机代理不可用，行情可能取不到" });
-    // 防呆：公告检查是一票否决门禁，关闭时必须常驻可见。
-    if (settings.skip_announcements) flags.push({ text: "公告检查已关闭", tone: "bad", title: "公告 avoid/unknown 一票否决门禁失效，本轮结论不可作为真实仓依据" });
+    // 防呆：公告检查是一票否决门禁。判据是"这份快照实际有没有跳过公告检查"
+    // （announcement_check_skipped，由结果 meta 记录、/api/status 暴露），
+    // 不是"当前设置"——设置与快照执行口径是两回事，不能混为一谈。
+    if (st.announcement_check_skipped) {
+      flags.push({ text: "本快照公告检查已跳过", tone: "bad", title: "本快照公告检查已跳过，本轮结论不可作为真实仓依据" });
+    }
     if (settings.skip_capital_ranking) flags.push({ text: "资金排名已关闭", tone: "warn", title: "未做资金排序，候选按其他条件排序" });
+    // 交易板范围：同样跟随**快照**而不是当前设置。范围含扩展板时必须可见，
+    // 便于把本轮结果与范围对应起来；旧快照没有该字段时如实标「范围未记录」。
+    var boards = st.enabled_boards;
+    var scopeNote = st.board_scope_note;
+    if (boards === null || boards === undefined) {
+      flags.push({ text: "范围未记录", tone: "warn", title: "该快照生成时还没有交易板范围口径（旧版本产物），无法追溯本轮实际筛选范围" });
+    } else if (boards.length && !(boards.length === 1 && boards[0] === "main")) {
+      flags.push({
+        text: "范围：" + (st.enabled_boards_label || boards.join(" + ")),
+        tone: "info",
+        title: scopeNote || "本轮筛选的交易板范围；所选交易板统一参与正式筛选（同一门槛、同一排名、同一条状态机）",
+      });
+    }
+    // 范围结论：必须能区分「范围内没有符合条件的候选」与「本轮数据不可用」。
+    // 一律按**快照**的结论显示，不按当前设置推断。范围默认（仅主板）时也显示，
+    // 否则用户会把“数据不可用”误读成“今天没候选”。
+    if (st.board_scope_status && st.board_scope_status !== "ok") {
+      flags.push({
+        text: "本轮范围内结果不可用",
+        tone: "bad",
+        title: scopeNote || "行情降级或快照不完整：本轮没有候选**不等于**范围内没有符合条件的标的",
+      });
+    } else if (st.board_scope_status === "ok" && st.board_scope_candidates === 0) {
+      flags.push({
+        text: "范围内无符合条件的候选",
+        tone: "info",
+        title: scopeNote || "数据完整，本轮交易板范围内没有符合现有门槛的候选（属正常筛选结果，不是数据问题）",
+      });
+    }
     return flags;
   }
 

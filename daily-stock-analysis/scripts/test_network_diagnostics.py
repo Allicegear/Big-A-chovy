@@ -179,6 +179,10 @@ class NetworkDiagnosticsTests(unittest.TestCase):
     @patch("a_share_daily_screen.filter_prefetch", return_value=[])
     @patch("a_share_daily_screen.save_intersection_state")
     @patch("a_share_daily_screen.load_intersection_state", return_value={})
+    # 观察池突破状态与交集状态一样必须挡住：这条用例跑的是真实的 main()，
+    # 漏挡会把**本机真实运行状态**按今天的日期覆盖掉（盘中状态机依赖该文件）。
+    @patch("a_share_daily_screen.save_watchlist_breakout_state")
+    @patch("a_share_daily_screen.load_watchlist_breakout_state", return_value={})
     @patch("a_share_daily_screen.save_flow_history")
     @patch("a_share_daily_screen.load_flow_history", return_value={})
     @patch("a_share_daily_screen.enrich_all", return_value=([], []))

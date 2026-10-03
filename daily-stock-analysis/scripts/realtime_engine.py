@@ -25,11 +25,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import a_share_daily_screen as screen
+import dashboard_settings  # 观察模式取值单一来源（strict / observe）
+import runtime_paths  # 运行状态路径唯一来源（A_SHARE_STATE_DIR 可定向到临时目录）
+import state_commit as state_commit_mod  # 回合状态提交门（超时轮不得提交运行状态）
 
 REALTIME_CONFIG = screen.RULE_CONFIG["realtime"]
 EM_TRENDS_URL = "https://push2.eastmoney.com/webguest/api/qt/stock/trends2/get"
 
-KLINE_CACHE_FILE = SCRIPT_DIR / ".kline_cache.json"
+KLINE_CACHE_FILE = runtime_paths.state_file(".kline_cache.json")
 KLINE_CACHE_TTL = 1800  # 30 min — MAs are slow-moving, don't need tick-level freshness
 
 # 每个条目单独记抓取时间：code -> {"fetched_at": ts, "data": result}
@@ -108,14 +111,24 @@ def _load_kline_cache() -> None:
         _kline_cache_date = ""
 
 
-def _save_kline_cache() -> None:
-    """写出缓存。**不得改写条目的 fetched_at**，否则 TTL 会被每轮重置（2026-09-26 修正点）。"""
+def _save_kline_cache(commit: "state_commit_mod.RoundCommit | None" = None) -> None:
+    """写出缓存。**不得改写条目的 fetched_at**，否则 TTL 会被每轮重置（2026-09-26 修正点）。
+
+    ``commit`` 非空时只暂存：看板超时/失败的一轮不得提交 K 线缓存。
+    """
     global _kline_cache_date
-    try:
-        today = _today()
-        _kline_cache_date = today
+    today = _today()
+    _kline_cache_date = today
+
+    def _writer() -> None:
         data = {"date": today, "timestamp": time.time(), "data": _kline_cache}
-        KLINE_CACHE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        state_commit_mod.atomic_write_text(KLINE_CACHE_FILE, json.dumps(data, ensure_ascii=False))
+
+    if commit is not None:
+        commit.stage(KLINE_CACHE_FILE, _writer)
+        return
+    try:
+        _writer()
     except Exception:
         pass
 
@@ -176,7 +189,9 @@ def _cached_fetch_kline(code: str, *args, **kwargs):
         raise
 
 
-screen.fetch_kline = _cached_fetch_kline
+# 注意：这里**不再** monkey-patch ``screen.fetch_kline``。缓存版通过
+# ``run_screening(fetch_kline_fn=...)`` 显式注入核心，避免"导入即改写全局函数"
+# 让所有调用点（含单测）的含义随导入顺序漂移。
 _load_kline_cache()
 
 
@@ -195,7 +210,9 @@ def get_cache_stats() -> Dict[str, Any]:
     }
 
 
-def prewarm_kline_cache(workers: int = 6, progress_callback=None) -> Dict[str, Any]:
+def prewarm_kline_cache(
+    workers: int = 6, progress_callback=None, boards: Any = (screen.BOARD_MAIN,)
+) -> Dict[str, Any]:
     """Pre-fetch K-line for all stocks that pass the prefetch filter.
 
     Call this before the first screening to warm the cache.
@@ -215,7 +232,7 @@ def prewarm_kline_cache(workers: int = 6, progress_callback=None) -> Dict[str, A
     except screen.NetworkUnavailable as exc:
         return {"error": str(exc), "elapsed": round(time.time() - t0, 1)}
 
-    prefetch = screen.filter_prefetch(market, ["all"])
+    prefetch = screen.filter_prefetch(market, ["all"], boards=boards)
     # 2026-09-26 修正：按"条目是否仍在 TTL 内"逐个判断。原先只判断"代码是否在缓存里"，
     # 于是当天已过期（>30 分钟）的条目不会被预热刷新，预热统计也失真。
     codes_to_fetch = [
@@ -288,7 +305,8 @@ def _build_market_thermometer(breadth: dict, indices_raw: list) -> dict:
     idx_up = 0
     idx_down = 0
     for x in indices_raw:
-        chg = x.get("f3")
+        # 兼容两种入参：原始东财行（f3）与结果里归一化后的指数行（change）。
+        chg = x.get("f3", x.get("change"))
         if isinstance(chg, (int, float)):
             if chg > 0:
                 idx_up += 1
@@ -937,6 +955,30 @@ def build_minute_map(result: dict, prev_items: dict) -> Dict[str, Dict[str, Any]
     return minute_map
 
 
+def build_negative_super_payload(
+    enriched: List[Any],
+    stats: Dict[str, Any],
+    flow_history: Any,
+    ts: Any,
+    status: str,
+    view: str,
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """负超单观察的产出策略：严格模式只报数量，开启观察才构造行。
+
+    观察行会进入公告查询列表（每只一次请求）。严格模式下列表是隐藏的，因此只
+    统计数量，不把隐藏代码带进公告检查，避免白跑接口。
+    """
+    if status != "ok":
+        return 0, []
+    count = screen.count_negative_super_observations(enriched)
+    rows = (
+        screen.build_negative_super_observations(enriched, stats, flow_history, ts)
+        if view == dashboard_settings.VIEW_OBSERVE
+        else []
+    )
+    return count, rows
+
+
 def run_screening(
     modes: Set[str] | None = None,
     workers: int = 6,
@@ -945,10 +987,20 @@ def run_screening(
     skip_capital_ranking: bool = False,
     network_mode: str = "auto",
     announcement_page_size: int = 8,
+    settings_snapshot: Dict[str, Any] | None = None,
+    state_commit: "state_commit_mod.RoundCommit | None" = None,
 ) -> Dict[str, Any]:
     """Run a single screening pass and return the result dict.
 
-    Mirrors a_share_daily_screen.main() but returns data instead of printing.
+    核心规则计算全部委托给 ``screen.run_screening_core``（与 CLI 同一条生产链）；
+    本函数只负责看板专有的依赖注入与附加展示字段：缓存版 K 线取数、负超单观察、
+    状态机分钟线、市场环境分级、大盘温度计、资金交叉验证/进出场建议、5 分钟量能。
+
+    ``settings_snapshot``（配置版本 + 观察模式 + 交易板范围）在一轮开始时固定，
+    运行途中修改只作用于下一轮。
+
+    ``state_commit``：看板/工作台传入自己的回合提交门，由调度器在确认本轮成功后
+    统一提交、超时/失败则中止。为空时本函数自建并在返回前提交（命令行/单测行为）。
     """
     global _kline_fetch_count, _kline_cache_hit_count, _kline_fail_count
     _kline_fetch_count = 0
@@ -960,380 +1012,109 @@ def run_screening(
     if "all" in modes:
         modes = {"strict", "low", "watchlist"}
 
-    screen.set_network_mode(network_mode)
-    screen.MARKET_WARNINGS.clear()
+    snapshot = settings_snapshot or {}
+    enabled_boards = screen.normalize_boards(snapshot.get("enabled_boards"))
+    negative_super_view = str(snapshot.get("negative_super_view") or "strict")
+
+    own_commit = state_commit is None
+    commit = state_commit if state_commit is not None else state_commit_mod.RoundCommit("engine-standalone")
 
     t0 = time.time()
+    captured: Dict[str, Any] = {}
+
+    def _capture_enriched(enriched_by_code: Dict[str, Any]) -> None:
+        captured["enriched_by_code"] = enriched_by_code
+
+    def _build_extras(**kw: Any) -> Dict[str, Any]:
+        """公告核验前并入负超单观察：与生产否决同源（super_net<0），独立成表。"""
+        fallback = bool(kw["fallback_snapshot"])
+        fetch_status = kw["market_fetch_status"] or {}
+        if fallback:
+            status = "degraded"
+        elif fetch_status.get("complete") is False:
+            status = "incomplete"
+        else:
+            status = "ok"
+        count, rows = build_negative_super_payload(
+            kw["enriched"], kw["stats"], kw["flow_history"], kw["ts"], status, negative_super_view
+        )
+        return {
+            "negative_super_observations": rows,
+            "negative_super_status": status,
+            "negative_super_count": count,
+        }
+
+    def _minute_map_provider(result: Dict[str, Any], previous_items: Dict[str, Any]) -> Dict[str, Any]:
+        return build_minute_map(result, previous_items)
+
+    params = screen.ScreeningParams(
+        modes=frozenset(modes),
+        workers=workers,
+        top=top,
+        skip_announcements=skip_announcements,
+        skip_capital_ranking=skip_capital_ranking,
+        network_mode=network_mode,
+        announcement_page_size=announcement_page_size,
+        enabled_boards=tuple(enabled_boards),
+    )
+    hooks = screen.ScreeningHooks(
+        state_commit=commit,
+        fetch_kline_fn=_cached_fetch_kline,
+        source_suffix=" (公告已跳过)" if skip_announcements else "",
+        extra_meta=lambda: {
+            # 本轮实际执行口径：公告检查是否被跳过。页面据此判断"这份快照能不能作为
+            # 真实仓依据"，与当前设置无关。
+            "announcement_check_skipped": bool(skip_announcements),
+            "kline_cache_stats": get_cache_stats(),
+            # 本轮开始时固定的配置快照：配置版本 + 观察模式。恢复旧快照时保留它
+            # 原来的版本，不按当前开关重解释。
+            "config_revision": snapshot.get("revision"),
+            "negative_super_view": negative_super_view,
+        },
+        build_extras=_build_extras,
+        save_kline_cache=lambda: _save_kline_cache(commit),
+        minute_map_provider=_minute_map_provider,
+        on_enriched=_capture_enriched,
+    )
 
     try:
-        market, total = screen.fetch_market()
+        result = screen.run_screening_core(params, hooks)
     except screen.NetworkUnavailable as exc:
+        if own_commit:
+            commit.abort()
         return {"error": screen.format_network_failure(exc)}
 
-    market_fetch_status = screen.get_market_fetch_status()
-    fallback_snapshot = market_fetch_status.get("source") == "sina_fallback"
-
-    if fallback_snapshot:
-        indices_raw: list = []
-        sector_boards: list = []
-        screen.MARKET_WARNINGS.append(
-            "备用行情模式跳过东方财富指数和板块接口，避免主源故障导致二次等待"
-        )
-    else:
-        indices_raw = screen.fetch_indices()
-        sector_boards = screen.fetch_sector_indices()
-
-    if modes == {"strict", "low", "watchlist"}:
-        mode_list = ["all"]
-    else:
-        mode_list = list(modes)
-
-    prefetch = screen.filter_prefetch(market, mode_list)
-    enriched, errors = screen.enrich_all(prefetch, max(1, workers))
-
-    _save_kline_cache()
-
-    if fallback_snapshot:
-        screen.MARKET_WARNINGS.append(
-            "备用行情缺少兼容量比、主力资金和行业字段：趋势池仅供观察；"
-            "超短池、双池交集、资金优选和低吸买点不会输出。"
-        )
-
-    breadth = screen.market_summary(market, total, market_fetch_status)
-    stats = screen.sector_stats(market, breadth)
-
-    flow_history = screen.load_flow_history()
-    has_snapshot = bool(flow_history)
-    latest_ts = max([r.get("f124") or 0 for r in market] or [0])
-    ts = datetime.fromtimestamp(latest_ts, screen.TZ) if latest_ts else datetime.now(screen.TZ)
-    # 2026-09-26：看板路径原先缺了 CLI 的三步，导致看板既没有 5/15 分钟兜底基准、
-    # 也没有超大单为负的否决标记，而且分钟序列请求预算不会被按轮重置（一轮用尽后永久失效）。
-    screen.reset_flow_minute_round(ts.strftime("%Y-%m-%d"))
-    screen.apply_flow_increments(enriched, flow_history)
-    flow_minute_filled = screen.fill_flow_increments_from_fflow(
-        enriched, expected_date=ts.strftime("%Y-%m-%d")
-    )
-    if flow_minute_filled:
-        screen.MARKET_WARNINGS.append(
-            f"本地快照无可用基准，已用东财当日累计分钟序列为 {flow_minute_filled} 只候选补齐 5/15 分钟增量"
-            "（来源 eastmoney_fflow_minutes）。"
-        )
-    for e in enriched:
-        e.flow_veto = screen.flow_veto_reason(e)
-        e.flow_status = screen.classify_flow(e, stats, has_snapshot)
-    vetoed_codes = sorted({e.code for e in enriched if e.flow_veto})
-    if vetoed_codes:
-        screen.MARKET_WARNINGS.append(
-            "超大单为负（框架一票否决，禁止正式买入建议）：" + "、".join(vetoed_codes)
-        )
-    screen.save_flow_history(enriched, flow_history)
-
-    after_1420 = screen.is_after_tail_risk(ts)
-
-    strict_ultra_all = (
-        []
-        if fallback_snapshot
-        else sorted([e for e in enriched if screen.strict_ultra(e)], key=lambda e: e.change, reverse=True)
-    )
-    strict_ultra_items = strict_ultra_all[:top]
-    trend_observation_items = sorted(
-        [e for e in enriched if screen.trend_observation(e)],
-        key=lambda e: (not screen.strict_trend(e), -e.change, e.dist60),
-    )[:top]
-    strict_trend_items = sorted(
-        [e for e in enriched if screen.strict_trend(e)], key=lambda e: e.change, reverse=True
-    )[:top]
-
-    class_order = {"A": 0, "B": 1, "C": 2}
-    low_ultra_rows: list = []
-    low_trend_rows: list = []
-    if "low" in modes and not fallback_snapshot:
-        for e in enriched:
-            exclude, reason = screen._should_exclude_from_low_absorb(e, flow_history)
-            if exclude:
-                continue  # 硬黑名单或高位派发降权，不进入低吸候选
-            cls, tags, score = screen.low_ultra_class(e, stats, after_1420)
-            dom_type, dom_label = screen.evaluate_dominance_type(e, flow_history)
-            if screen.low_ultra_output_eligible(e, cls):
-                low_ultra_rows.append(
-                    {
-                        **asdict(e),
-                        "class": cls,
-                        "risk": "/".join(tags) if tags else "无",
-                        "score": score,
-                        "resonance": "是" if screen.has_resonance(e, stats) else "否",
-                        "dominance_type": dom_type,
-                        "dominance_label": dom_label,
-                        "super_lead": dom_label,
-                    }
-                )
-            cls2, tags2, score2 = screen.low_trend_class(e, stats, after_1420)
-            if screen.low_trend_output_eligible(e, cls2):
-                low_trend_rows.append(
-                    {
-                        **asdict(e),
-                        "class": cls2,
-                        "risk": "/".join(tags2) if tags2 else "无",
-                        "score": score2,
-                        "ma_state": f"MA5/10/20上方,5日{'上行' if e.ma5 > e.prev_ma5 else '未上行'},10日{'走平上行' if e.ma10 >= e.prev_ma10 else '下行'}",
-                        "dominance_type": dom_type,
-                        "dominance_label": dom_label,
-                        "super_lead": dom_label,
-                    }
-                )
-        low_ultra_rows = sorted(low_ultra_rows, key=screen.low_ultra_sort_key)[: max(top, 15)]
-        low_trend_rows = sorted(low_trend_rows, key=screen.low_trend_sort_key)[: max(top, 15)]
-
-    watchlist = screen.build_watchlist(enriched, stats)[:top] if "watchlist" in modes else []
-
-    strict_ultra_rows = [
-        {**asdict(e), "resonance": "是" if screen.has_resonance(e, stats) else "否"}
-        for e in strict_ultra_items
-    ] if "strict" in modes else []
-    trend_observation_rows = [
-        {**asdict(e), "ma_state": "MA5/10/20上方" if e.price > e.ma5 and e.price > e.ma10 and e.price > e.ma20 else "MA20上方，短均线修复中"}
-        for e in trend_observation_items
-    ] if "strict" in modes else []
-    strict_trend_rows = [asdict(e) for e in strict_trend_items] if "strict" in modes else []
-    trend_diagnostics = [screen.trend_condition_diagnosis(e, stats) for e in strict_ultra_all] if "strict" in modes else []
-
-    ultra_codes = {r["code"] for r in strict_ultra_rows}
-    observation_codes = {r["code"] for r in trend_observation_rows}
-    confirmation_codes = {r["code"] for r in strict_trend_rows}
-    # 交集状态机基准：超短池 ∩ 趋势确认(质量条件，不含价格区间/流通市值)
-    relaxed_confirm_codes = {e.code for e in enriched if screen.trend_confirm_relaxed(e)}
-    enriched_by_code_for_pool = {e.code: e for e in enriched}
-    # 双池交集基准：超短池 ∩ 趋势确认(质量条件)。交集即"启动事件"，
-    # 真正买点由交集后的缩量回踩产生（见 evaluate_intersection_states 四阶段状态机）。
-    board_by_code_for_pool = {}
-    for b in sector_boards:
-        if b.get("name"):
-            board_by_code_for_pool[b["name"]] = b
-    dual_pool_rows = [
-        {
-            **r,
-            "resonance": "是" if screen.has_resonance(enriched_by_code_for_pool[r["code"]], stats) else "否",
-            "sector_change": (board_by_code_for_pool.get(r.get("industry"), {}) or {}).get("change"),
-        }
-        for r in strict_ultra_rows
-        if r["code"] in relaxed_confirm_codes
-    ]
-    dual_pool_raw_rows = [dict(r) for r in dual_pool_rows]
-    strict_candidate_codes = {r["code"] for r in strict_ultra_rows + trend_observation_rows}
-    capital_rank = (
-        []
-        if skip_capital_ranking or fallback_snapshot
-        else screen.rank_capital_candidates(
-            [e for e in enriched if e.code in strict_candidate_codes], stats
-        )[:top]
-    )
-    for row in capital_rank:
-        in_ultra = row["code"] in ultra_codes
-        in_observation = row["code"] in observation_codes
-        in_confirmation = row["code"] in confirmation_codes
-        if in_ultra and in_observation:
-            row["pool_source"] = "双池交集 + 趋势确认" if in_confirmation else "双池交集"
-        elif in_ultra:
-            row["pool_source"] = "超短池"
-        else:
-            row["pool_source"] = "趋势确认池" if in_confirmation else "趋势观察池"
-
-    relevant_industries: set = set()
-    for r in strict_ultra_rows + trend_observation_rows + strict_trend_rows:
-        ind = r.get("industry", "")
-        if ind and ind != "-":
-            relevant_industries.add(ind)
-    board_by_name = {b["name"]: b for b in sector_boards}
-    sector_indices: List[Dict[str, Any]] = []
-    for ind in sorted(relevant_industries):
-        board = board_by_name.get(ind)
-        if not board:
-            for bn, bd in board_by_name.items():
-                if ind in bn or bn in ind:
-                    board = bd
-                    break
-        if board:
-            sector_indices.append(
-                {
-                    "name": board["name"],
-                    "change": board["change"],
-                    "price": board["price"],
-                    "up_count": board["up_count"],
-                    "down_count": board["down_count"],
-                    "turnover": board["turnover"],
-                    "source": "筛选",
-                }
-            )
-
-    intersection_config, intersection_config_meta = screen.resolve_intersection_config(
-        screen.load_intersection_calibration()
-    )
-    intersection_runtime_config = {
-        **intersection_config,
-        "version": intersection_config_meta["version"],
-        "source": intersection_config_meta["source"],
-    }
-
-    # 准交集候选：超短池 + 距趋势确认仅差1项 + 四道门槛（相位由状态机判定）
-    diag_by_code = {d["code"]: d for d in trend_diagnostics} if "strict" in modes else {}
-    pre_intersection_rows = (
-        screen.compute_pre_intersection(
-            strict_ultra_rows, relaxed_confirm_codes, diag_by_code, intersection_runtime_config
-        )
-        if "strict" in modes
-        else []
-    )
-
-    result = {
-        "meta": {
-            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
-            "status": screen.current_status(ts),
-            "source": (
-                "新浪财经实时备用快照（字段降级）"
-                if fallback_snapshot
-                else "东方财富push2实时/快照"
-            )
-            + " + " + screen.kline_source_summary(enriched)
-            + ("" if not skip_announcements else " (公告已跳过)"),
-            "total_rows": len(market),
-            "provider_total": total,
-            "market_fetch_complete": market_fetch_status.get("complete"),
-            "prefetch_rows": len(prefetch),
-            "enriched_rows": len(enriched),
-            "elapsed_seconds": round(time.time() - t0, 1),
-            "market_data_degraded": fallback_snapshot,
-            "kline_cache_stats": get_cache_stats(),
-        },
-        "breadth": breadth,
-        "market_fetch_status": market_fetch_status,
-        "indices": [
-            {"code": x.get("f12"), "name": x.get("f14"), "price": x.get("f2"), "change": x.get("f3")}
-            for x in indices_raw
-        ],
-        "errors": errors,
-        "warnings": list(screen.MARKET_WARNINGS),
-        "announcement_errors": [],
-        "strict_enabled": "strict" in modes,
-        "strict_ultra": strict_ultra_rows,
-        "trend_observation": trend_observation_rows,
-        "strict_trend": strict_trend_rows,
-        "trend_diagnostics": trend_diagnostics,
-        "dual_pool": dual_pool_rows,
-        "dual_pool_raw": dual_pool_raw_rows,
-        "pre_intersection": pre_intersection_rows,
-        "intersection_states": [],
-        "intersection_config": intersection_runtime_config,
-        "intersection_config_meta": intersection_config_meta,
-        "capital_rank": capital_rank,
-        "low_ultra": low_ultra_rows if "low" in modes and not fallback_snapshot else [],
-        "low_trend": low_trend_rows if "low" in modes and not fallback_snapshot else [],
-        "watchlist": watchlist,
-        "sector_indices": sector_indices,
-        "has_snapshot": has_snapshot,
-        # 低开洗盘模块：低开≥2% + 翻红 + 站上均价线 + 当日主力净流入 + 20日持续净流入
-        "low_open_wash": screen.low_open_wash_rows(enriched, flow_history),
-    }
-
-    detail_codes: set = set()
-    flow_detail: list = []
-    for e in strict_ultra_items[:5] + trend_observation_items[:5] + strict_trend_items[:5]:
-        if e.code not in detail_codes:
-            detail_codes.add(e.code)
-            flow_detail.append(asdict(e))
-    for r in low_ultra_rows if "low" in modes else []:
-        if r.get("class") == "A" and r["code"] not in detail_codes:
-            detail_codes.add(r["code"])
-            flow_detail.append(r)
-            if len([d for d in flow_detail if d.get("class") == "A"]) >= 5:
-                break
-    holdings_file = screen.SCRIPT_DIR / "holdings.json"
-    enriched_by_code = {e.code: e for e in enriched}
-    try:
-        if holdings_file.exists():
-            holdings_data = json.loads(holdings_file.read_text(encoding="utf-8"))
-            for h in holdings_data:
-                code = h.get("code", "")
-                if code and code not in detail_codes:
-                    detail_codes.add(code)
-                    e = enriched_by_code.get(code)
-                    if e:
-                        d = asdict(e)
-                        d["_holding"] = True
-                        flow_detail.append(d)
-    except Exception:
-        pass
-    result["flow_detail"] = flow_detail
-
-    if not skip_announcements:
-        def _noop_progress(done, total, code, status, source):
-            pass
-
-        result["announcement_errors"] = screen.attach_announcement_risks(
-            result, announcement_page_size, workers, progress_callback=_noop_progress
-        )
-        screen.apply_announcement_pool_gates(result)
-    else:
-        result["announcement_check_available"] = False
-        result["announcement_unknown_codes"] = sorted(
-            {
-                str(row.get("code"))
-                for section in (
-                    "strict_ultra", "trend_observation", "strict_trend", "dual_pool", "dual_pool_raw",
-                    "capital_rank", "trend_diagnostics", "low_ultra", "low_trend", "watchlist",
-                )
-                for row in (result.get(section) or [])
-                if screen._row_risk_status(row) == screen.RISK_UNKNOWN
-            }
-        )
-        screen.apply_announcement_pool_gates(result)
-
-    if result.get("strict_enabled"):
-        state_payload = screen.load_intersection_state()
-        previous_items = state_payload.get("items") or {}
-        if state_payload.get("date") != ts.strftime("%Y-%m-%d"):
-            previous_items = {}
-        # 需求10：状态机前按优先级拉取分钟线（准交集→锁存/等待回踩→双池交集→低吸A）
-        minute_map: Dict[str, Dict[str, Any]] = {}
-        if not fallback_snapshot:
-            try:
-                minute_map = build_minute_map(result, previous_items)
-            except Exception as exc:
-                result.setdefault("warnings", []).append(f"状态机分钟线拉取失败：{exc}")
-        # 需求8：市场环境分级（宽度/指数极端），CASH 一律禁止新开仓
-        market_context = screen.resolve_market_mode(
-            breadth, result.get("indices") or [], intersection_runtime_config
-        )
-        result["market_context"] = market_context
-        state_rows, next_items = screen.evaluate_intersection_states(
-            result.get("dual_pool_raw") or [],
-            result.get("pre_intersection") or [],
-            previous_items,
-            ts,
-            intersection_runtime_config,
-            snapshot_id=ts.strftime("%Y-%m-%d %H:%M:%S"),
-            risk_map=result.get("announcement_risk_map") or {},
-            minute_map=minute_map,
-            market_context=market_context,
-        )
-        result["intersection_states"] = state_rows
-        result["minute_fetch_log"] = minute_map
-        screen.save_intersection_state(next_items, ts.strftime("%Y-%m-%d"))
+    enriched_by_code = captured.get("enriched_by_code") or {}
 
     # ── 1. 大盘温度计 ──────────────────────────────────────
-    result["market_thermometer"] = _build_market_thermometer(breadth, indices_raw)
+    result["market_thermometer"] = _build_market_thermometer(
+        result.get("breadth") or {}, result.get("indices") or []
+    )
 
     # ── 2. 资金交叉验证 + 3. 进出场建议 ────────────────────
     _enrich_result_rows(result, enriched_by_code)
 
     # ── 4. 5分钟量能（交集/超短/低吸A/B，≤20只，60s缓存）────
-    if not fallback_snapshot:
+    if not (result.get("meta") or {}).get("market_data_degraded"):
         try:
             enrich_min5(result)
         except Exception as exc:  # 量能失败不影响主流程
             result.setdefault("warnings", []).append(f"5分钟量能获取失败：{exc}")
 
-    _save_kline_cache()
+    # K 线缓存最后再存一次（暂存则由提交门在确认本轮成功后落盘）
+    _save_kline_cache(commit)
+
+    # 每行标注交易板。核心已标注过；这里覆盖 min5/交叉验证新增或替换的行。
+    screen.stamp_board_fields(result)
+
+    if own_commit:
+        # 独立调用（命令行/单测）：本轮到此确认成功，统一提交暂存状态。
+        # 落盘失败必须可诊断，但不能把一轮有效筛选结果整个丢掉。
+        try:
+            commit.commit()
+        except Exception as exc:  # noqa: BLE001
+            result.setdefault("warnings", []).append(f"运行状态落盘失败：{exc}")
+            print(f"[engine] state commit failed: {exc}", file=sys.stderr)
 
     result["meta"]["elapsed_seconds"] = round(time.time() - t0, 1)
-    result = screen._sanitize_for_json(result)
-    return result
+    return screen._sanitize_for_json(result)

@@ -48,7 +48,6 @@ def _fetch_sector_boards() -> dict[str, dict]:
             url = f"https://{host}/webguest/api/qt/clist/get?{query}"
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                ctx = ssl._create_unverified_context()
                 with build_url_opener(NETWORK_MODE).open(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 boards = ((data.get("data") or {}).get("diff") or [])
@@ -96,7 +95,6 @@ def _fetch_stock_industries(codes: list[str]) -> dict[str, str]:
     for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            ctx = ssl._create_unverified_context()
             with build_url_opener(NETWORK_MODE).open(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             result = {}
@@ -419,7 +417,6 @@ class App:
             for url in urls:
                 try:
                     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                    ctx = ssl._create_unverified_context()
                     with build_url_opener(NETWORK_MODE).open(req, timeout=10) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
                     break
@@ -480,7 +477,6 @@ class App:
                 url = f"https://{host}/webguest/api/qt/ulist.np/get?{query}"
                 try:
                     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                    ctx = ssl._create_unverified_context()
                     with build_url_opener(NETWORK_MODE).open(req, timeout=10) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
                     price_map: dict[str, float] = {}
