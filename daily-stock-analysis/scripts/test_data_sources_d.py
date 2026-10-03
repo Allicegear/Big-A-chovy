@@ -66,6 +66,9 @@ class TDXParserTests(unittest.TestCase):
             HTTPClient(opener=BrokenOpener()).get("https://example.invalid/missing", retries=0)
         self.assertEqual(captured.exception.code, "http_status")
         self.assertEqual(captured.exception.status, 404)
+        cause = captured.exception.__cause__
+        if cause is not None and hasattr(cause, "close"):
+            cause.close()
 
     def test_parser_reads_identity_units_and_market_rows(self) -> None:
         rows = parse_tdx_daily_package(
