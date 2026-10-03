@@ -48,6 +48,8 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from tools.rule_config import RULE_CONFIG, get_rule_config, hhmm_to_minutes  # noqa: E402
+from tools.data_sources.announcements import fetch_announcement_evidence  # noqa: E402
+from tools.data_sources.cninfo import CNInfoAnnouncementSource  # noqa: E402
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -1171,15 +1173,39 @@ def collect_announcement_titles(obj: Any) -> List[str]:
 
 
 def fetch_announcements(code: str, page_size: int = 8) -> List[str]:
-    data = fetch_json(ANNOUNCEMENT_URL, {
-        "sr": -1,
-        "page_size": page_size,
-        "page_index": 1,
-        "ann_type": "A",
-        "client_source": "web",
-        "stock_list": code,
-    }, timeout=ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS, retries=0)
-    return collect_announcement_titles(data)[:page_size]
+    """Return announcement titles while preserving the existing risk API.
+
+    Eastmoney remains the primary source because it is already part of the
+    screening path.  A structurally valid empty response stays empty; network
+    or schema failures try CNINFO.  If both sources fail an exception is
+    raised so ``attach_announcement_risks`` keeps the last-known avoid or
+    marks the stock unknown instead of upgrading it to clean.
+    """
+    def _primary() -> Dict[str, Any]:
+        data = fetch_json(ANNOUNCEMENT_URL, {
+            "sr": -1,
+            "page_size": page_size,
+            "page_index": 1,
+            "ann_type": "A",
+            "client_source": "web",
+            "stock_list": code,
+        }, timeout=ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS, retries=0)
+        if isinstance(data, list):
+            return {"rows": [{"title": title} for title in collect_announcement_titles(data)], "source_url": ANNOUNCEMENT_URL}
+        if not isinstance(data, dict):
+            raise RuntimeError("东财公告响应不是对象")
+        known_keys = {"data", "result", "total", "totalCount", "announcements", "list"}
+        if not (known_keys & set(data)):
+            raise RuntimeError("东财公告响应缺少已知结构字段")
+        titles = collect_announcement_titles(data)[:page_size]
+        return {"rows": [{"title": title} for title in titles], "source_url": ANNOUNCEMENT_URL}
+
+    evidence = fetch_announcement_evidence(code, primary=_primary, fallback=CNInfoAnnouncementSource(), page_size=page_size)
+    if evidence.status not in {"ok", "empty"}:
+        error = evidence.error if isinstance(evidence.error, dict) else {}
+        raise RuntimeError(error.get("message") or "公告源不可用")
+    payload = evidence.data if isinstance(evidence.data, dict) else {}
+    return [str(row.get("title")) for row in (payload.get("rows") or []) if isinstance(row, dict) and row.get("title")][:page_size]
 
 
 def classify_announcement_risk(titles: List[str]) -> Dict[str, Any]:
