@@ -16,6 +16,7 @@
 | D | `14e50b9` | 通达信盘后日线 ZIP；可选 BaoStock 历史估值/ST/停牌；申万行业历史导入与时点选择；跨日筹码估算 |
 | 文档 | `0ce229a` | README、工作台 API 说明、发现层/盘中 skill、上游许可证说明、官方日历 CLI |
 | 修正 | `eb4007c` | 保留 urllib HTTP 状态码，使未发布/非交易日明确为 `missing_date`，而不是泛化为网络错误 |
+| 测试 | `3d0b9b6` | 关闭合成 HTTP 错误夹具，保持最终回归无 ResourceWarning |
 
 ## 2. 统一合同与缓存
 
