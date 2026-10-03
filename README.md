@@ -238,6 +238,26 @@ python3 tools/track_stock.py 601666 --date 20260824
 # 查询实时行情、五档、分时和近期日 K
 python3 tools/query_quote.py 600188 000768 --minute --kline
 
+# 按需核验：腾讯约3秒聚合分笔（B/S/M、5/15分钟窗口）
+python3 tools/query_ticks.py 600519 --json
+
+# 建仓前财务证据：已披露利润表与动态/TTM PE分开显示
+python3 tools/query_financials.py 600519 --json
+
+# 隔夜事件、市场情绪和官方交易日历
+python3 tools/query_events.py 600519 --date 2026-10-03 --json
+python3 tools/query_sentiment.py --date 2026-10-03 --json
+python3 tools/query_calendar.py --date 2026-10-03 --json
+
+# 按需上下文：topic 可选 monitor/anomaly/themes/news/research/interaction/dragon_tiger/commodity
+python3 tools/query_context.py 600519 --topic news --date 2026-10-03 --json
+
+# 离线历史日线研究（通达信官网盘后 ZIP；非交易日/未发布会明确返回 unavailable）
+python3 tools/query_history.py --date 2026-10-03 --code 600519 --json
+
+# 显式启用跨日筹码估算；输入需有 date/high/low/close/turn，结果始终标注“筹码估算”
+python3 tools/query_chips.py --history-json /path/to/history.json --code 600519 --decay 0.9 --json
+
 # 读取决策记录中的持仓、观察池和 T+1 计划
 python3 tools/get_position.py
 python3 tools/get_position.py --date 20260824 --json
@@ -248,6 +268,8 @@ python3 tools/watch_sector.py 600219 有色金属 --date 20260824 --from 1005
 # 验证指定日期观察池的 T+1 早盘表现
 python3 tools/verify_t1.py 20260824
 ```
+
+这些新增查询均是证据/研究工具，不自动改变筛选评分、状态机、真实仓权限或个人决策记录。历史估值/ST/停牌查询的 BaoStock 依赖是可选的；未安装时返回 `unsupported`。通达信日线包使用股、元单位，跨日筹码模型要求换手率和复权口径可核验；缺失或混口径会拒绝推演。
 
 ### 影子验证工具
 
@@ -280,6 +302,7 @@ python3 tools/detect_divergence_leader.py --date 20260824 --record
 | `daily-stock-analysis/scripts/flow_snapshot.json` | 最近 30 分钟资金快照 | 否，运行时自动重建 |
 | `daily-stock-analysis/scripts/intersection_state.json` | 交集状态机跨快照状态 | 否，运行时自动重建 |
 | `daily-stock-analysis/scripts/watchlist_breakout_state.json` | 观察池突破状态机 | 否，运行时自动重建 |
+| `daily-stock-analysis/scripts/.a_share_data_*.json` | 新数据源的按源缓存（日历、事件、上下文、分笔等） | 否，运行时自动重建 |
 | `tools/shadow_data/shadow_samples.json` | 影子验证样本和 T+1 结算 | 否 |
 
 这些文件不存在时，程序会使用空状态或重新拉取数据。删除缓存通常只会导致下一次运行较慢；删除持仓、决策记录或状态文件会丢失相应的本地信息，应先备份。

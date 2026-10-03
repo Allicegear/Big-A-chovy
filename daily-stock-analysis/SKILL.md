@@ -42,6 +42,21 @@ python3 daily-stock-analysis/scripts/a_share_daily_screen.py --mode all --skip-a
 
 普通筛选工具负责生成报告；实时看板负责展示数据。它们都不会自动下单，也不会替代 `盘中` skill 的最终裁决。
 
+## 数据证据与离线研究
+
+候选需要补证据时按需调用共享适配器，不能在每轮全市场筛选中逐只重型抓取：
+
+```bash
+python3 tools/query_ticks.py 600519 --json
+python3 tools/query_financials.py 600519 --json
+python3 tools/query_events.py 600519 --date 2026-10-03 --json
+python3 tools/query_context.py 600519 --topic news --date 2026-10-03 --json
+```
+
+分笔是腾讯约 3 秒聚合的 B/S/M 证据，不是 Level-2 原始委托；卖额为零、窗口覆盖不足、分页不完整或源失败都保持 `null`/明确失败状态。财务必须把已披露利润表与动态/TTM PE 分开，不能用正 PE 代替盈利证据。事件、情绪和上下文只作展示与核验，不自动加分、否决或放行真实仓。
+
+离线研究使用 `tools/query_history.py` 的通达信盘后 ZIP 和 `tools/query_chips.py --history-json/--history-csv` 的跨日估算。历史结果必须注明数据日、股/元单位、输入窗口、换手率与复权口径；所有跨日结果都标为“筹码估算”，不能称主力真实成本，也不进入生产筛选门槛。缺换手率、混合复权或 ZIP 结构异常时拒绝/返回不可用。
+
 ## 数据质量要求
 
 - 每次输出必须标注数据时间、交易状态和数据源；

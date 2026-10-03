@@ -69,7 +69,8 @@ python3 daily-stock-analysis/scripts/web_workbench.py
 |---|---|---|
 | 筛选任务 | 选模块（严格双池/低吸/观察池）、条数、网络模式，以及**本次任务**的 `公告检查`/`资金排名`（勾选=执行），后台执行+进度轮询，完成后在线渲染 Markdown 报告并落盘 `筛选结果/` | GUI 一次性筛选 / CLI `--mode all` |
 | 报告库 | 浏览 `筛选结果/**/*.md`，点击在线阅读（含表格渲染、红涨绿跌） | 手动翻文件 |
-| 工具箱 | 实时行情+五档、基本面查询（建仓前必验）、报告扫描（5/5、4/5）、持仓快照、T+1 观察池验证、单股全天跟踪 | `tools/query_quote.py` 等 6 个 CLI 工具 |
+| 工具箱 | 实时行情+五档、基本面查询（建仓前必验）、报告扫描（5/5、4/5）、持仓快照、T+1 观察池验证、单股全天跟踪 | `tools/query_quote.py` 等 CLI 工具 |
+| 证据核验舱 | 按需加载分笔、隔夜事件、情绪、官方日历及 monitor/anomaly/themes/news/research/interaction/dragon_tiger/commodity 上下文；每个 topic 独立显示源、时点、空/失败/过期状态 | `tools/query_ticks.py`、`query_events.py`、`query_context.py` 等 |
 | 实时看板 | 原版页面与逻辑保留，并挂上同一套导航与运行状态条 | `realtime_dashboard.py` |
 
 ## API 一览（工作台新增，均带 `/api/wb/` 前缀）
@@ -88,6 +89,11 @@ python3 daily-stock-analysis/scripts/web_workbench.py
 | GET | `/api/wb/verify_t1?date=` | T+1 验证 |
 | GET | `/api/wb/track?code=&date=` | 单股跟踪 |
 | GET | `/api/wb/financials?code=` | 基本面 |
+| GET | `/api/wb/ticks?code=&force=` | 腾讯约3秒聚合分笔；返回B/S/M、连续竞价窗口、覆盖和缓存状态 |
+| GET | `/api/wb/events?code=&date=&types=&force=` | 解禁、增减持、业绩预告、回购、质押；结构化事件不新增交易门槛 |
+| GET | `/api/wb/sentiment?date=&force=` | 涨停、炸板、跌停、连板和晋级背景；明确覆盖范围与分母 |
+| GET | `/api/wb/calendar?date=&action=is_open\|next\|session` | 深交所官方交易日历与下一交易日/时段；未确认时不伪造开市日 |
+| GET | `/api/wb/context?code=&topic=&date=&force=` | 白名单上下文 topic，禁止任意 URL 抓取；正文按不可信文本转义 |
 
 共用层静态资源（两个入口同源提供，路由挂在看板 handler 上）：
 
@@ -104,6 +110,7 @@ python3 daily-stock-analysis/scripts/web_workbench.py
 - 筛选超时（900s）不会杀死引擎线程（Python 无法杀线程），而是进入「僵尸收割」：锁由收割线程等引擎真正结束后释放，期间新任务返回明确的 busy 原因。
 - 报告读取和报告扫描严格限制在 `筛选结果/` 目录内，并拒绝符号链接越界；查询参数支持 UTF-8 与 GBK 双编码解码（兼容 Windows 中文命令行客户端）。
 - 工作台默认监听 `127.0.0.1`，不发送通配符 CORS；带 `Origin` 的跨源 API 请求会被拒绝。
+- 证据核验舱的详情请求是显式触发且按 topic 独立降级；附加数据失败不会阻塞下一轮筛选，也不会写入资金/交集/观察池状态。所有新接口沿用统一结果契约：`status` 区分 `ok/empty/partial/stale/unavailable/unsupported`，抓取时刻与数据时点分开。
 - 报告、持仓、决策记录仍只保存在本机，不会自动写入镜像或上传 GitHub（`.gitignore` 原样生效）；但工作台页面会按请求把这些本地数据展示给当前浏览器，因此不要在不可信网络使用 `--host 0.0.0.0`。
 
 ## Windows 性能注意（实测）

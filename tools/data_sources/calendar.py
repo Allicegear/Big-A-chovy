@@ -120,14 +120,14 @@ class TradingCalendarService:
             return result_error(ResultStatus.UNAVAILABLE, source=CALENDAR_SOURCE, source_url=SZSE_CALENDAR_URL, code="date_missing", message=f"日历没有 {normalized}")
         return Result(status=ResultStatus.OK, data={"date": normalized, "is_open": bool(found["is_open"])}, source=CALENDAR_SOURCE, source_url=month_result.source_url, data_date=normalized, freshness=month_result.freshness, cache=month_result.cache)
 
-    def next_trading_day(self, value: str | date | datetime, *, include_value: bool = False, max_days: int = 370) -> Result:
+    def next_trading_day(self, value: str | date | datetime, *, include_value: bool = False, max_days: int = 370, force: bool = False) -> Result:
         try:
             start = date.fromisoformat(validate_ymd(value.isoformat() if isinstance(value, (date, datetime)) else str(value)))
         except (TypeError, ValueError) as exc:
             return result_error(ResultStatus.UNSUPPORTED, source=CALENDAR_SOURCE, source_url=SZSE_CALENDAR_URL, code="invalid_date", message=str(exc))
         current = start
         for _ in range(max(1, int(max_days))):
-            check = self.is_open(current)
+            check = self.is_open(current, force=force)
             if check.status != ResultStatus.OK.value:
                 return check
             if check.data.get("is_open") and (include_value or current != start):
@@ -135,7 +135,7 @@ class TradingCalendarService:
             current += timedelta(days=1)
         return result_error(ResultStatus.UNAVAILABLE, source=CALENDAR_SOURCE, source_url=SZSE_CALENDAR_URL, code="next_day_limit", message="在搜索范围内没有找到下一交易日")
 
-    def next_session(self, value: datetime | str | None = None) -> Result:
+    def next_session(self, value: datetime | str | None = None, *, force: bool = False) -> Result:
         if value is None:
             moment = datetime.now(BEIJING)
         elif isinstance(value, datetime):
@@ -149,7 +149,7 @@ class TradingCalendarService:
                 return result_error(ResultStatus.UNSUPPORTED, source=CALENDAR_SOURCE, source_url=SZSE_CALENDAR_URL, code="invalid_datetime", message=str(exc))
         day = moment.date()
         for _ in range(370):
-            open_result = self.is_open(day)
+            open_result = self.is_open(day, force=force)
             if open_result.status != ResultStatus.OK.value:
                 return open_result
             if open_result.data.get("is_open"):
@@ -163,4 +163,3 @@ class TradingCalendarService:
             day += timedelta(days=1)
             moment = datetime.combine(day, time.min, tzinfo=BEIJING)
         return result_error(ResultStatus.UNAVAILABLE, source=CALENDAR_SOURCE, source_url=SZSE_CALENDAR_URL, code="next_session_limit", message="在搜索范围内没有找到下一交易时段")
-
