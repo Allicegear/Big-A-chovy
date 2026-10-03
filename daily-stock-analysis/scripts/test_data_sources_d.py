@@ -58,7 +58,7 @@ class TDXParserTests(unittest.TestCase):
     def test_http_client_keeps_urllib_status(self) -> None:
         class BrokenOpener:
             def open(self, request, timeout):
-                raise HTTPError(request.full_url, 404, "Not Found", {}, io.BytesIO())
+                raise HTTPError(request.full_url, 404, "Not Found", {}, None)
 
         from tools.data_sources.http import HTTPClient, HTTPClientError
 
