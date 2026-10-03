@@ -429,6 +429,74 @@ def _tool_financials(code: str) -> dict:
     return query_financial_profile(code)
 
 
+_TICK_SOURCE = None
+_CONTEXT_SOURCE = None
+_EVENT_SOURCE = None
+_SENTIMENT_SOURCE = None
+_CALENDAR_SOURCE = None
+
+
+def _tool_ticks(code: str, *, force: bool = False, max_pages: int = 300) -> dict:
+    global _TICK_SOURCE
+    if not code:
+        return {"error": "缺少 code 参数"}
+    from tools.data_sources.tencent import TencentTickSource
+    if _TICK_SOURCE is None:
+        _TICK_SOURCE = TencentTickSource()
+    return _TICK_SOURCE.fetch(code, force=force, max_pages=max(1, min(int(max_pages), 300))).to_dict()
+
+
+def _tool_context(code: str, topic: str, *, date: str | None = None, force: bool = False, limit: int = 20, contract: str | None = None) -> dict:
+    global _CONTEXT_SOURCE
+    from tools.data_sources.context import CONTEXT_TOPICS, ContextSource
+    if topic not in CONTEXT_TOPICS:
+        return {"error": f"topic 必须是: {', '.join(CONTEXT_TOPICS)}", "status": "unsupported"}
+    if not code:
+        return {"error": "缺少 code 参数"}
+    if _CONTEXT_SOURCE is None:
+        _CONTEXT_SOURCE = ContextSource()
+    return _CONTEXT_SOURCE.fetch(code, topic=topic, as_of=date or None, force=force, limit=max(1, min(int(limit), 100)), contract=contract).to_dict()
+
+
+def _tool_events(code: str, *, date: str | None = None, types: str | None = None, force: bool = False, forward_days: int = 90) -> dict:
+    global _EVENT_SOURCE
+    from tools.data_sources.events import EVENT_TYPES, EastmoneyEventSource
+    if not code:
+        return {"error": "缺少 code 参数"}
+    selected = [item.strip() for item in (types or ",".join(EVENT_TYPES)).split(",") if item.strip()]
+    if any(item not in EVENT_TYPES for item in selected):
+        return {"error": f"types 必须来自: {', '.join(EVENT_TYPES)}", "status": "unsupported"}
+    if _EVENT_SOURCE is None:
+        _EVENT_SOURCE = EastmoneyEventSource()
+    return _EVENT_SOURCE.fetch(code, event_types=selected, as_of=date or None, force=force, forward_days=max(0, min(int(forward_days), 365))).to_dict()
+
+
+def _tool_sentiment(*, date: str | None = None, force: bool = False) -> dict:
+    global _SENTIMENT_SOURCE
+    from tools.data_sources.sentiment import EastmoneySentimentSource
+    if _SENTIMENT_SOURCE is None:
+        _SENTIMENT_SOURCE = EastmoneySentimentSource()
+    return _SENTIMENT_SOURCE.fetch(date or None, force=force).to_dict()
+
+
+def _tool_calendar(date: str, *, action: str = "is_open") -> dict:
+    global _CALENDAR_SOURCE
+    from tools.data_sources.calendar import TradingCalendarService
+    if not date:
+        return {"error": "缺少 date 参数（YYYY-MM-DD）", "status": "unsupported"}
+    if action not in {"is_open", "next", "session"}:
+        return {"error": "action 必须是 is_open/next/session", "status": "unsupported"}
+    if _CALENDAR_SOURCE is None:
+        _CALENDAR_SOURCE = TradingCalendarService()
+    if action == "is_open":
+        result = _CALENDAR_SOURCE.is_open(date)
+    elif action == "next":
+        result = _CALENDAR_SOURCE.next_trading_day(date)
+    else:
+        result = _CALENDAR_SOURCE.next_session(date)
+    return result.to_dict()
+
+
 # ---------------------------------------------------------------------------
 # HTTP Handler：在原有 DashboardHandler 上追加工作台路由
 # ---------------------------------------------------------------------------
@@ -517,6 +585,14 @@ class WorkbenchHandler(dash.DashboardHandler):
         def g1(k: str) -> str:
             return (params.get(k) or [""])[0]
 
+        def i1(k: str, default: int, low: int, high: int) -> int:
+            raw = g1(k)
+            try:
+                value = int(raw) if raw else default
+            except ValueError:
+                raise ValueError(f"{k} 必须是整数")
+            return max(low, min(high, value))
+
         if path == "/api/wb/job":
             self._serve_json(JOB.status())
         elif path == "/api/wb/result":
@@ -538,7 +614,11 @@ class WorkbenchHandler(dash.DashboardHandler):
             self._serve_json(_tool_quote(
                 codes, minute=g1("minute") in ("1", "true"), kline=g1("kline") in ("1", "true")))
         elif path == "/api/wb/scan":
-            latest = int(g1("latest") or 0)
+            try:
+                latest = i1("latest", 0, 0, 500)
+            except ValueError as exc:
+                self._serve_json({"status": "unsupported", "error": str(exc)}, status=400)
+                return True
             self._serve_json(_tool_scan(g1("date") or None, latest, g1("file") or None))
         elif path == "/api/wb/position":
             self._serve_json(_tool_position(g1("date") or None))
@@ -548,6 +628,36 @@ class WorkbenchHandler(dash.DashboardHandler):
             self._serve_json(_tool_track(g1("code"), g1("date") or None))
         elif path == "/api/wb/financials":
             self._serve_json(_tool_financials(g1("code")))
+        elif path == "/api/wb/ticks":
+            try:
+                max_pages = i1("max_pages", 300, 1, 300)
+            except ValueError as exc:
+                self._serve_json({"status": "unsupported", "error": str(exc)}, status=400)
+                return True
+            self._serve_json(_tool_ticks(g1("code"), force=g1("force") in ("1", "true"), max_pages=max_pages))
+        elif path == "/api/wb/context":
+            topic = g1("topic")
+            from tools.data_sources.context import CONTEXT_TOPICS
+            if topic not in CONTEXT_TOPICS:
+                self._serve_json({"status": "unsupported", "error": f"topic 必须是: {', '.join(CONTEXT_TOPICS)}"}, status=400)
+            else:
+                try:
+                    limit = i1("limit", 20, 1, 100)
+                except ValueError as exc:
+                    self._serve_json({"status": "unsupported", "error": str(exc)}, status=400)
+                    return True
+                self._serve_json(_tool_context(g1("code"), topic, date=g1("date") or None, force=g1("force") in ("1", "true"), limit=limit, contract=g1("contract") or None))
+        elif path == "/api/wb/events":
+            try:
+                forward_days = i1("forward_days", 90, 0, 365)
+            except ValueError as exc:
+                self._serve_json({"status": "unsupported", "error": str(exc)}, status=400)
+                return True
+            self._serve_json(_tool_events(g1("code"), date=g1("date") or None, types=g1("types") or None, force=g1("force") in ("1", "true"), forward_days=forward_days))
+        elif path == "/api/wb/sentiment":
+            self._serve_json(_tool_sentiment(date=g1("date") or None, force=g1("force") in ("1", "true")))
+        elif path == "/api/wb/calendar":
+            self._serve_json(_tool_calendar(g1("date"), action=g1("action") or "is_open"))
         else:
             return False
         return True

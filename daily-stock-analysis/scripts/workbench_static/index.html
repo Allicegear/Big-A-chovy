@@ -114,6 +114,36 @@
         <div id="fin-out" class="tool-out"></div>
       </div>
 
+      <div class="card evidence-cockpit">
+        <div class="card-head">
+          <h2>证据核验舱</h2>
+          <span class="scope-chip">按需 · 只读</span>
+        </div>
+        <p class="hint">一次选择多个主题，独立返回来源、时点、缓存与空/失败状态。它们是候选核验证据，不会自动改变评分、门禁或买入权限。</p>
+        <div class="form-row">
+          <input type="text" id="evidence-code" placeholder="代码：600519" class="grow" aria-label="证据核验股票代码">
+          <label>观察日 <input type="text" id="evidence-date" placeholder="YYYY-MM-DD，可空" class="num"></label>
+          <label class="toggle"><input type="checkbox" id="evidence-force"> 强制刷新</label>
+          <button class="btn btn-primary" id="evidence-btn">核验证据</button>
+        </div>
+        <div class="evidence-topic-grid" role="group" aria-label="证据主题">
+          <label><input type="checkbox" name="evidence-topic" value="ticks" checked> 分笔</label>
+          <label><input type="checkbox" name="evidence-topic" value="financials" checked> 已披露财务</label>
+          <label><input type="checkbox" name="evidence-topic" value="events"> 隔夜事件</label>
+          <label><input type="checkbox" name="evidence-topic" value="themes"> 题材/主题</label>
+          <label><input type="checkbox" name="evidence-topic" value="news"> 新闻</label>
+          <label><input type="checkbox" name="evidence-topic" value="interaction"> 公司问答</label>
+          <label><input type="checkbox" name="evidence-topic" value="dragon_tiger"> 龙虎榜</label>
+          <label><input type="checkbox" name="evidence-topic" value="commodity"> 商品背景</label>
+        </div>
+        <div class="evidence-background-row">
+          <button class="btn" id="calendar-btn">查交易日历</button>
+          <button class="btn" id="sentiment-btn">查市场情绪</button>
+          <span class="meta-text">日历未确认时不推进 T+1 或自动筛选。</span>
+        </div>
+        <div id="evidence-out" class="evidence-out" aria-live="polite"></div>
+      </div>
+
       <div class="card">
         <h2>报告扫描（5/5 与 4/5 判定）</h2>
         <div class="form-row">

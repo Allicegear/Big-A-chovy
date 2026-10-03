@@ -23,6 +23,8 @@
   --teal-bg: #1a2826;
   --border: #45475a;
   --border-light: #585b70;
+  --ink-warm: #f2e9d8;
+  --evidence-accent: #f2cc8f;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -140,6 +142,10 @@ input.grow { flex: 1; min-width: 200px; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-primary { background: var(--blue-bg); color: var(--blue); border-color: var(--blue); }
 .btn-primary:hover { background: var(--blue); color: var(--bg-base); }
+button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--evidence-accent);
+  outline-offset: 2px;
+}
 
 /* ---- 进度 ---- */
 .progress { height: 6px; background: var(--bg-base); border-radius: 3px; overflow: hidden; margin-top: 10px; }
@@ -236,6 +242,37 @@ table.data a:hover { text-decoration: underline; }
 .tool-out .err { color: var(--red); }
 .tool-out .ok { color: var(--green); }
 
+/* ---- Evidence cockpit ----
+   A quieter editorial panel distinguishes source evidence from rule output.
+   The serif heading and mono metadata are intentionally limited to this
+   surface so the existing dashboard vocabulary remains stable. */
+.evidence-cockpit {
+  border-color: color-mix(in srgb, var(--evidence-accent) 45%, var(--border));
+  border-left: 3px solid var(--evidence-accent);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--bg-surface) 92%, #6f4d2a), var(--bg-surface));
+}
+.evidence-cockpit h2 { font-family: "Iowan Old Style", "Songti SC", Georgia, serif; color: var(--ink-warm); letter-spacing: .01em; }
+.evidence-topic-grid { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 7px 12px; margin: 10px 0; color: var(--text-secondary); }
+.evidence-topic-grid label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.evidence-topic-grid input { accent-color: var(--evidence-accent); }
+.evidence-background-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 10px; }
+.evidence-out { display: grid; gap: 8px; margin-top: 12px; }
+.evidence-card-row { border: 1px solid var(--border); border-left: 3px solid var(--text-dim); border-radius: 8px; padding: 10px 12px; background: color-mix(in srgb, var(--bg-base) 55%, var(--bg-surface)); }
+.evidence-card-row.evidence-ok { border-left-color: var(--green); }
+.evidence-card-row.evidence-empty { border-left-color: var(--yellow); }
+.evidence-card-row.evidence-bad { border-left-color: var(--red); }
+.evidence-row-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; color: var(--text-primary); }
+.evidence-status { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; padding: 1px 6px; border-radius: 9px; background: var(--bg-surface2); color: var(--evidence-accent); }
+.evidence-source, .evidence-meta { color: var(--text-dim); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.evidence-meta { margin-top: 4px; }
+.evidence-meta a { color: var(--teal); }
+.evidence-error, .evidence-warning { font-size: 12px; margin-top: 5px; color: var(--red); }
+.evidence-warning { color: var(--yellow); }
+.evidence-card-row details { margin-top: 7px; }
+.evidence-card-row summary { color: var(--text-secondary); cursor: pointer; font-size: 12px; }
+.evidence-card-row pre, .evidence-loading { margin-top: 7px; padding: 8px; border-radius: 6px; background: var(--bg-base); color: var(--text-secondary); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto; }
+.evidence-loading { color: var(--evidence-accent); }
+
 .foot { text-align: center; padding: 14px; }
 
 /* 涨跌配色 */
@@ -289,6 +326,7 @@ table.data a:hover { text-decoration: underline; }
 
 @media (max-width: 720px) {
   .tools-grid { grid-template-columns: 1fr; }
+  .evidence-topic-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
 }
 
 /* ---- 交易板范围的「仅观察」标注 ---- */

@@ -20,9 +20,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 class _FakeDashboardHandler(BaseHTTPRequestHandler):
     """Minimal dashboard surface so the workbench can be tested offline."""
 
-    def _serve_json(self, data: object) -> None:
+    def _serve_json(self, data: object, status: int = 200) -> None:
         content = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self._send_cors_headers()

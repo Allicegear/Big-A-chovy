@@ -239,6 +239,88 @@ $("#fin-btn").addEventListener("click", () => {
     fetchJSON(`/api/wb/financials?code=${encodeURIComponent($("#fin-code").value.trim())}`));
 });
 
+/* ================= 证据核验舱 ================= */
+const evidenceLabels = {
+  ticks: "腾讯分笔",
+  financials: "已披露财务",
+  events: "隔夜事件",
+  themes: "题材/主题",
+  news: "个股新闻",
+  interaction: "公司问答",
+  dragon_tiger: "龙虎榜",
+  commodity: "商品背景",
+};
+
+function evidenceLinks(value) {
+  const links = [];
+  const walk = (item) => {
+    if (!item || links.length >= 6) return;
+    if (Array.isArray(item)) { item.forEach(walk); return; }
+    if (typeof item !== "object") return;
+    Object.entries(item).forEach(([key, child]) => {
+      if ((key === "url" || key === "source_url" || key === "link") && typeof child === "string" && /^https?:\/\//i.test(child)) {
+        if (!links.some((x) => x === child)) links.push(child);
+      } else walk(child);
+    });
+  };
+  walk(value);
+  return links;
+}
+
+function evidenceCard(topic, payload) {
+  const status = payload?.status || (payload?.error ? "unavailable" : "ok");
+  const statusClass = status === "ok" ? "evidence-ok" : (status === "empty" ? "evidence-empty" : "evidence-bad");
+  const warnings = (payload?.warnings || []).map((w) => `<div class="evidence-warning">⚠ ${esc(w)}</div>`).join("");
+  const links = evidenceLinks(payload).map((url) => `<a href="${esc(url)}" target="_blank" rel="noreferrer noopener">打开来源</a>`).join(" · ");
+  const detail = payload?.data ?? payload;
+  return `<article class="evidence-card-row ${statusClass}">
+    <div class="evidence-row-head"><strong>${esc(evidenceLabels[topic] || topic)}</strong><span class="evidence-status">${esc(status)}</span><span class="evidence-source">${esc(payload?.source || "本地组合")}</span></div>
+    <div class="evidence-meta">时点 ${esc(payload?.as_of || payload?.data_date || "-")} ${links ? `· ${links}` : ""}</div>
+    ${payload?.error ? `<div class="evidence-error">${esc(payload.error.message || JSON.stringify(payload.error))}</div>` : ""}
+    ${warnings}
+    <details><summary>展开原始证据摘要</summary><pre>${esc(JSON.stringify(detail, null, 2))}</pre></details>
+  </article>`;
+}
+
+async function fetchEvidenceTopic(topic, code, date, force) {
+  const q = `code=${encodeURIComponent(code)}${date ? `&date=${encodeURIComponent(date)}` : ""}${force ? "&force=1" : ""}`;
+  if (topic === "ticks") return fetchJSON(`/api/wb/ticks?${q}`);
+  if (topic === "financials") return fetchJSON(`/api/wb/financials?code=${encodeURIComponent(code)}`);
+  if (topic === "events") return fetchJSON(`/api/wb/events?${q}`);
+  return fetchJSON(`/api/wb/context?${q}&topic=${encodeURIComponent(topic)}`);
+}
+
+$("#evidence-btn").addEventListener("click", async () => {
+  const button = $("#evidence-btn");
+  const code = $("#evidence-code").value.trim();
+  const date = $("#evidence-date").value.trim();
+  const force = $("#evidence-force").checked;
+  const topics = $$('input[name="evidence-topic"]:checked').map((el) => el.value);
+  const out = $("#evidence-out");
+  if (!code) { out.innerHTML = `<div class="evidence-error">请先输入股票代码。</div>`; return; }
+  if (!topics.length) { out.innerHTML = `<div class="evidence-error">至少选择一个证据主题。</div>`; return; }
+  button.disabled = true;
+  button.textContent = "核验中...";
+  out.innerHTML = `<div class="evidence-loading">正在按主题独立查询，失败不会伪装为空…</div>`;
+  const results = await Promise.all(topics.map(async (topic) => {
+    try { return [topic, await fetchEvidenceTopic(topic, code, date, force)]; }
+    catch (e) { return [topic, { status: "unavailable", error: { message: e.message || String(e) } }]; }
+  }));
+  out.innerHTML = results.map(([topic, payload]) => evidenceCard(topic, payload)).join("");
+  button.disabled = false;
+  button.textContent = "核验证据";
+});
+
+$("#calendar-btn").addEventListener("click", () => {
+  const date = $("#evidence-date").value.trim() || new Date().toISOString().slice(0, 10);
+  callTool($("#calendar-btn"), "#evidence-out", () => fetchJSON(`/api/wb/calendar?date=${encodeURIComponent(date)}&action=is_open`));
+});
+
+$("#sentiment-btn").addEventListener("click", () => {
+  const date = $("#evidence-date").value.trim();
+  callTool($("#sentiment-btn"), "#evidence-out", () => fetchJSON(`/api/wb/sentiment${date ? `?date=${encodeURIComponent(date)}` : ""}`));
+});
+
 $("#scan-btn").addEventListener("click", () => {
   callTool($("#scan-btn"), "#scan-out", () => {
     const date = $("#scan-date").value.trim();

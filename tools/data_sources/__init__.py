@@ -7,6 +7,7 @@ It does not contain trading rules, position handling, or buy/sell decisions.
 from .contracts import Result, ResultStatus, SourceError
 from .calendar import TradingCalendarService
 from .cninfo import CNInfoAnnouncementSource
+from .context import ContextSource
 from .events import EastmoneyEventSource
 from .sina import SinaFinancialSource
 from .sentiment import EastmoneySentimentSource
@@ -19,6 +20,7 @@ __all__ = [
     "SecuritySymbol",
     "SourceError",
     "CNInfoAnnouncementSource",
+    "ContextSource",
     "EastmoneyEventSource",
     "EastmoneySentimentSource",
     "SinaFinancialSource",
