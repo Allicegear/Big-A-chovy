@@ -9,6 +9,7 @@ import struct
 import tempfile
 import unittest
 import zipfile
+from urllib.error import HTTPError
 
 from tools.data_sources.cache import JsonCache
 from tools.data_sources.contracts import ResultStatus
@@ -54,6 +55,18 @@ def _fixture_zip(ymd: str = "20261003", *, dangerous_name: str | None = None, om
 
 
 class TDXParserTests(unittest.TestCase):
+    def test_http_client_keeps_urllib_status(self) -> None:
+        class BrokenOpener:
+            def open(self, request, timeout):
+                raise HTTPError(request.full_url, 404, "Not Found", {}, io.BytesIO())
+
+        from tools.data_sources.http import HTTPClient, HTTPClientError
+
+        with self.assertRaises(HTTPClientError) as captured:
+            HTTPClient(opener=BrokenOpener()).get("https://example.invalid/missing", retries=0)
+        self.assertEqual(captured.exception.code, "http_status")
+        self.assertEqual(captured.exception.status, 404)
+
     def test_parser_reads_identity_units_and_market_rows(self) -> None:
         rows = parse_tdx_daily_package(
             _fixture_zip(),

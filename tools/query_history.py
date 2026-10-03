@@ -263,7 +263,15 @@ class TDXHistorySource:
                 if exc.status == 404
                 else f"通达信盘后包请求失败: {exc}"
             )
-            return result_error(status, source="tdx_daily_package", source_url=url, code=code_name, message=message, data_date=normalized_date)
+            return result_error(
+                status,
+                source="tdx_daily_package",
+                source_url=url,
+                code=code_name,
+                message=message,
+                data_date=normalized_date,
+                request_count=self.client.request_count,
+            )
         except Exception as exc:
             return result_error(
                 ResultStatus.UNAVAILABLE,
@@ -272,6 +280,7 @@ class TDXHistorySource:
                 code="network_error",
                 message=f"通达信盘后包请求失败: {type(exc).__name__}: {exc}",
                 data_date=normalized_date,
+                request_count=self.client.request_count,
             )
         try:
             if not response.body.startswith(b"PK"):

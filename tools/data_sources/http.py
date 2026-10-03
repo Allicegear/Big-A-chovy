@@ -109,7 +109,22 @@ class HTTPClient:
                 last_error = exc
                 if not exc.retryable or attempt >= retries:
                     raise
-            except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            except HTTPError as exc:
+                # Keep an HTTP status from urllib's exception path.  Without
+                # this branch a real 404 becomes a generic network error and
+                # date-scoped sources cannot distinguish "not published" from
+                # a disconnected network.
+                status = int(exc.code) if getattr(exc, "code", None) is not None else None
+                retryable = status == 429 or (status is not None and status >= 500)
+                last_error = HTTPClientError(
+                    f"HTTP {status}: {exc}",
+                    code="http_status" if status is not None else "network_error",
+                    status=status,
+                    retryable=retryable,
+                )
+                if not retryable or attempt >= retries:
+                    raise last_error from exc
+            except (URLError, TimeoutError, OSError) as exc:
                 last_error = HTTPClientError(
                     f"请求失败: {type(exc).__name__}: {exc}", code="network_error", retryable=True
                 )
@@ -144,4 +159,3 @@ class HTTPClient:
             raw = response.read()
             response_headers = {str(k): str(v) for k, v in response.headers.items()}
             return HTTPResponse(int(response.status), response.geturl(), raw, response_headers, time.monotonic() - started)
-
