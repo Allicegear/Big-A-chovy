@@ -163,7 +163,7 @@ class HTTPClient:
             return HTTPResponse(int(response.status), response.geturl(), raw, response_headers, time.monotonic() - started)
 
 
-def project_http_client() -> HTTPClient:
+def project_http_client(*, deadline: float | None = None) -> HTTPClient:
     """Build the project's measured-path, TLS-verifying HTTP client.
 
     The network-path module lives beside the dashboard scripts, so this helper
@@ -177,7 +177,7 @@ def project_http_client() -> HTTPClient:
         import network_path
         import tls_context
 
-        proxy = network_path.best_proxy_url()
+        proxy = network_path.best_proxy_url(deadline=deadline)
         handlers = [HTTPSHandler(context=tls_context.build_context())]
         handlers.append(ProxyHandler({"http": proxy, "https": proxy} if proxy else {}))
         return HTTPClient(opener=build_opener(*handlers))

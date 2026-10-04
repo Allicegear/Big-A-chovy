@@ -114,12 +114,17 @@ _cooldown_until: Dict[str, float] = {}                 # label -> 冷却截止�
 _last_switch_reason: str = ""                          # 最近一次切换原因（诊断用）
 
 
-def _scutil_proxy_url() -> str:
+def _scutil_proxy_url(*, deadline: float | None = None) -> str:
     """读 macOS 系统代理（仅作为候选，读不到/非 darwin 一律返回空）。"""
     if sys.platform != "darwin":
         return ""
     try:
-        out = subprocess.run(["scutil", "--proxy"], capture_output=True, text=True, timeout=5)
+        timeout = 5.0
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                return ""
+        out = subprocess.run(["scutil", "--proxy"], capture_output=True, text=True, timeout=timeout)
         if out.returncode == 0:
             m = re.search(r"HTTPSProxy\s*:\s*([\d.]+)", out.stdout or "")
             pm = re.search(r"HTTPSPort\s*:\s*(\d+)", out.stdout or "")
@@ -130,7 +135,7 @@ def _scutil_proxy_url() -> str:
     return ""
 
 
-def candidate_paths() -> List[Tuple[str, Optional[str]]]:
+def candidate_paths(*, deadline: float | None = None) -> List[Tuple[str, Optional[str]]]:
     """枚举候选路径 [(label, proxy_url|None)]，proxy_url=None 表示直连。"""
     paths: List[Tuple[str, Optional[str]]] = [("直连", None)]
     seen: set[str] = set()
@@ -153,7 +158,7 @@ def candidate_paths() -> List[Tuple[str, Optional[str]]]:
     env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
     if env_proxy:
         _add(env_proxy)
-    _add(_scutil_proxy_url())
+    _add(_scutil_proxy_url(deadline=deadline))
     return paths
 
 
@@ -274,22 +279,51 @@ def record_success(label: str) -> None:
         _cooldown_until.pop(label, None)
 
 
-def probe_paths() -> List[Dict[str, Any]]:
-    """并发探测所有候选路径，返回按 score 升序的可用路径列表（不读缓存）。"""
-    from concurrent.futures import ThreadPoolExecutor
+def probe_paths(*, deadline: float | None = None) -> List[Dict[str, Any]]:
+    """并发探测候选路径，并在 deadline 前返回。
 
-    candidates = candidate_paths()
+    探测线程必须是 daemon 线程。  ``ThreadPoolExecutor`` 的 worker 会被
+    ``concurrent.futures`` 的解释器退出钩子再次等待，即使调用方已经超时
+    返回，冷启动子进程仍可能被慢探测拖住。这里让探测结果只写入本轮的
+    局部数组；超时后的迟到结果既不返回，也不进入全局缓存。
+    """
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
+    candidates = candidate_paths(deadline=deadline)
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
     # 冷却中的路径先跳过；若全部在冷却则本轮全部放行，避免无路可走
     active = [c for c in candidates if not _in_cooldown(c[0])] or candidates
     results: List[Optional[Dict[str, Any]]] = [None] * len(active)
 
-    with ThreadPoolExecutor(max_workers=max(2, len(active))) as pool:
-        futs = [pool.submit(_probe_one, label, proxy) for label, proxy in active]
-        for i, fut in enumerate(futs):
-            try:
-                results[i] = fut.result(timeout=(PROBE_TIMEOUT + 1.0) * len(PROBE_ENDPOINTS))
-            except Exception:
-                results[i] = None
+    def run_one(index: int, label: str, proxy: Optional[str]) -> None:
+        try:
+            results[index] = _probe_one(label, proxy)
+        except Exception:
+            results[index] = None
+
+    threads: list[threading.Thread] = []
+    for index, (label, proxy) in enumerate(active):
+        thread = threading.Thread(
+            target=run_one,
+            args=(index, label, proxy),
+            name=f"a-share-network-probe-{index}",
+            daemon=True,
+        )
+        threads.append(thread)
+        thread.start()
+
+    # Without an explicit caller budget, bound a probe round by the existing
+    # per-endpoint timeout plus a small scheduling allowance.  With a caller
+    # budget, no join may cross it.
+    wait_until = deadline if deadline is not None else time.monotonic() + (PROBE_TIMEOUT + 1.0) * max(1, len(PROBE_ENDPOINTS))
+    for thread in threads:
+        remaining = wait_until - time.monotonic()
+        if remaining <= 0:
+            break
+        thread.join(timeout=remaining)
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
     paths = [r for r in results if r is not None]
     if not paths:
         return []
@@ -320,16 +354,20 @@ def _apply_sticky(paths: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return paths
 
 
-def best_paths(max_age: float = CACHE_TTL) -> List[Dict[str, Any]]:
+def best_paths(max_age: float = CACHE_TTL, *, deadline: float | None = None) -> List[Dict[str, Any]]:
     """带缓存的可用路径列表（按实测延迟升序，最快在前）。"""
     global _cached_paths, _cached_at, _cached_ok
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
     with _lock:
         now = time.time()
         if _cached_paths is not None:
             ttl = CACHE_TTL if _cached_ok else NEGATIVE_TTL
             if now - _cached_at <= ttl:
                 return list(_cached_paths)
-    paths = probe_paths()
+    paths = probe_paths(deadline=deadline)
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
     with _lock:
         _cached_paths = paths
         _cached_ok = bool(paths)
@@ -369,13 +407,13 @@ def ordered_sessions(direct_session) -> List[Tuple[str, Any]]:
     return sessions
 
 
-def best_proxy_url() -> Optional[str]:
+def best_proxy_url(*, deadline: float | None = None) -> Optional[str]:
     """实测最优路径的代理 URL；最优是直连（或全不通）时返回 None。
 
     注意：必须取排序后的第一条判断。原实现遍历找「第一个代理」，
     会导致直连明明更快时仍返回某个代理，看板因此永远走代理。
     """
-    paths = best_paths()
+    paths = best_paths(deadline=deadline)
     if not paths:
         return None
     return paths[0]["proxy"]  # 直连时 proxy 为 None

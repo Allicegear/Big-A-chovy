@@ -6,6 +6,7 @@
 """
 
 import os
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -159,6 +160,24 @@ class NetworkPathTests(unittest.TestCase):
             np._cached_at = time.time() - np.NEGATIVE_TTL - 1
             np.best_paths()
         self.assertEqual(pp.call_count, 2, "全失败时负缓存应更短")
+
+    def test_deadline_discards_late_probe_and_does_not_cache(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_probe(label, proxy):
+            started.set()
+            release.wait(timeout=2.0)
+            return _path(label, proxy, 10.0)
+
+        with patch.object(np, "candidate_paths", return_value=[("直连", None)]), \
+             patch.object(np, "_probe_one", side_effect=slow_probe):
+            paths = np.best_paths(deadline=time.monotonic() + 0.05)
+        self.assertEqual(paths, [])
+        self.assertIsNone(np._cached_paths)
+        release.set()
+        self.assertTrue(started.wait(timeout=0.2))
+        self.assertIsNone(np._cached_paths, "迟到探测结果不得回写全局缓存")
 
     def test_invalidate_forces_reprobe(self):
         with patch.object(np, "probe_paths", return_value=[_path("直连", None, 50.0)]) as pp:

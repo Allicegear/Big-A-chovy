@@ -130,6 +130,20 @@ class FinancialEvidenceTests(unittest.TestCase):
         self.assertNotIn("不宜重仓", profile["safety_advice"])
         self.assertEqual(profile["real_warehouse_financial_gate"], "blocked_loss_or_negative_pe")
 
+    def test_positive_financial_evidence_has_no_unwritten_pe60_cutoff(self) -> None:
+        row = [{"report_period": "2026-06-30", "基本每股收益": "1.00", "归属于母公司所有者的净利润": "100"}]
+        for pe_raw in ("5999", "6000"):
+            with (
+                self.subTest(pe_raw=pe_raw),
+                patch.object(query_financials, "_eastmoney_snapshot", return_value=({"f43": "1000", "f162": pe_raw}, None)),
+                patch.object(query_financials, "_tencent_snapshot", return_value=({}, None)),
+                patch.object(query_financials, "_ytd", return_value=(0.0, None, "fixture")),
+                patch.object(query_financials.SinaFinancialSource, "fetch_reports", return_value=result_ok(row, source="sina", source_url="sina")),
+            ):
+                profile = query_financials.query_financial_profile("600519", client=Mock())
+            self.assertEqual(profile["real_warehouse_financial_gate"], "eligible_financial_evidence")
+            self.assertEqual(profile["profit_evidence_status"], "profit")
+
 
 class TickCoverageTests(unittest.TestCase):
     def test_two_ticks_one_minute_apart_do_not_cover_fifteen_minute_window(self) -> None:

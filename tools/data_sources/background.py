@@ -19,9 +19,9 @@ _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_THREADS: set[threading.Thread] = set()
 
 
-def project_http_client() -> HTTPClient:
+def project_http_client(*, deadline: float | None = None) -> HTTPClient:
     """Compatibility export for callers that historically imported it here."""
-    return _project_http_client()
+    return _project_http_client(deadline=deadline)
 
 
 def _budget_result(message: str = "市场背景查询超过总预算") -> dict[str, Any]:
@@ -88,7 +88,7 @@ def build_market_background(
         nonlocal shared_client
         with client_lock:
             if shared_client is None:
-                shared_client = project_http_client()
+                shared_client = project_http_client(deadline=deadline)
             return shared_client
 
     def worker(name: str) -> None:

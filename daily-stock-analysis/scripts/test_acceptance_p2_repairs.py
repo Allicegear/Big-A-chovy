@@ -87,6 +87,51 @@ class EventConfigAndScopeTests(unittest.TestCase):
         self.assertEqual(len(result.data["rows"]), 2)
         self.assertTrue(all(row["notice_date"] <= "2026-10-03" for row in result.data["rows"]))
 
+    def test_known_future_plan_and_forecast_are_retained_but_unknown_notice_is_partial(self) -> None:
+        def transport(method, url, **kwargs):
+            report = (kwargs.get("params") or {}).get("reportName")
+            if report == "RPTA_WEB_GETHGLIST_NEW":
+                rows = [{
+                    "DIM_SCODE": "600519",
+                    "DIM_DATE": "2026-10-01",
+                    "NOTICEDATE": "2026-10-01",
+                    "REPURSTARTDATE": "2026-10-10",
+                    "REPURENDDATE": "2027-01-01",
+                    "REPUROBJECTIVE": "注销",
+                }]
+            elif report == "RPT_PUBLIC_OP_NEWPREDICT":
+                rows = [{
+                    "SECURITY_CODE": "600519",
+                    "NOTICE_DATE": "2026-10-01",
+                    "REPORT_DATE": "2026-12-31",
+                    "PREDICT_FINANCE": "归属于上市公司股东的净利润",
+                    "PREDICT_AMT_LOWER": 100000000,
+                    "ADD_AMP_LOWER": 12.5,
+                }]
+            elif report == "RPT_SHARE_HOLDER_INCREASE":
+                rows = [{
+                    "SECURITY_CODE": "600519",
+                    "TRADE_DATE": "2026-10-01",
+                    "CHANGE_NUM_SYMBOL": 1,
+                }]
+            else:
+                rows = []
+            return json_response(url, {"success": True, "result": {"pages": 1, "data": rows, "count": len(rows)}})
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = EastmoneyEventSource(
+                client=HTTPClient(transport=transport),
+                cache=JsonCache("p3_future_events", path=Path(directory) / "cache.json"),
+            )
+            result = source.fetch("600519", event_types=["buyback", "earnings_forecast", "holder_trade"], as_of="2026-10-03", force=True)
+        self.assertEqual(result.status, "partial")
+        rows = result.data["rows"]
+        self.assertEqual({row["event_type"] for row in rows}, {"buyback", "earnings_forecast"})
+        self.assertTrue(all(row["notice_date"] <= "2026-10-03" for row in rows))
+        self.assertTrue(any(row.get("event_state") == "future_plan" for row in rows))
+        self.assertTrue(any(row.get("event_state") == "forecast" for row in rows))
+        self.assertTrue(any("披露日期" in warning for warning in result.warnings))
+
     def test_dragon_tiger_business_failure_is_not_empty_and_filter_has_valid_operator(self) -> None:
         filters = []
 
@@ -261,6 +306,41 @@ class BackgroundBudgetTests(unittest.TestCase):
             thread = scheduler._background_thread
             if thread is not None:
                 thread.join(timeout=2)
+
+    def test_project_http_client_cold_start_process_exit_is_budgeted(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        script = r'''
+import sys
+import time
+from unittest.mock import patch
+
+sys.path.insert(0, "daily-stock-analysis/scripts")
+from tools.data_sources import http
+import network_path
+
+def slow_probe(label, proxy):
+    time.sleep(1.5)
+    return None
+
+with patch.object(network_path, "candidate_paths", return_value=[("直连", None)]), \
+     patch.object(network_path, "_probe_one", side_effect=slow_probe):
+    started = time.monotonic()
+    client = http.project_http_client(deadline=started + 0.5)
+    print(type(client).__name__)
+    print(time.monotonic() - started)
+'''
+        started = time.monotonic()
+        completed = subprocess.run(
+            ["python3", "-c", script],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=True,
+        )
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0, completed.stderr or completed.stdout)
+        self.assertIn("HTTPClient", completed.stdout)
 
 
 if __name__ == "__main__":

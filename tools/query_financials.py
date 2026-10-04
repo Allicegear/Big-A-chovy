@@ -262,12 +262,9 @@ def query_financial_profile(code: str, *, client: HTTPClient | None = None) -> D
     if fin_color == "red" or (pe_dynamic is not None and pe_dynamic < 0):
         safety_advice = "❌ 真实仓暂不开：当前盈利证据为负或动态PE为负"
         real_warehouse_gate = "blocked_loss_or_negative_pe"
-    elif disclosed_complete_positive and pe_dynamic is not None and 0 < pe_dynamic < 60:
-        safety_advice = "✅ 稳健盈利(安全)"
+    elif disclosed_complete_positive and pe_dynamic is not None and pe_dynamic >= 0:
+        safety_advice = "✅ 盈利证据完整：EPS/归母净利润为正；PE仅作估值事实，不替代其他建仓门禁"
         real_warehouse_gate = "eligible_financial_evidence"
-    elif evidence_status == "profit" and pe_dynamic is not None and pe_dynamic >= 60:
-        safety_advice = "⚠️ 真实仓暂不开：盈利但动态PE偏高，需复核"
-        real_warehouse_gate = "review_high_valuation"
     elif evidence_status in {"unknown", "break_even"}:
         safety_advice = "⚠️ 真实仓暂不开：盈利证据缺失、冲突或未形成正盈利，需复核"
         real_warehouse_gate = "review_missing_or_conflicting_profit"

@@ -323,11 +323,13 @@ class EastmoneyEventSource:
         all_rows: list[dict[str, Any]] = []
         statuses: dict[str, str] = {}
         errors: list[str] = []
+        source_errors: list[str] = []
+        missing_disclosure: dict[str, int] = {}
         for event_type in selected:
-            # Unlock is a forward-looking effective-date query.  Other event
-            # types are historical evidence and must be cut off at as_of;
-            # passing start=as_of to them would accidentally request only one
-            # exact day and would allow future rows into a past view.
+            # Unlock is a forward-looking effective-date query.  For every
+            # other type, the query is bounded by the disclosure date, while
+            # the event's effective/implementation date is retained as
+            # evidence.  A future effective date is not a future disclosure.
             start = as_of if event_type == "unlock" else None
             event_end = end if event_type == "unlock" else as_of
             result = self._fetch_one(symbol.code, event_type, start=start, end=event_end, limit=limit)
@@ -337,23 +339,51 @@ class EastmoneyEventSource:
                     effective = row.get("effective_date")
                     notice = row.get("notice_date")
                     # A historical view may only contain information that was
-                    # already disclosed by its as-of date.  Effective/trade
-                    # dates describe when an event happens; they do not make a
-                    # later disclosure historically knowable.
-                    if not notice or notice > as_of:
+                    # already disclosed by its as-of date.  Missing disclosure
+                    # dates are not evidence of "no event" and must make the
+                    # result incomplete instead of silently disappearing.
+                    if not notice:
+                        missing_disclosure[event_type] = missing_disclosure.get(event_type, 0) + 1
+                        continue
+                    if notice > as_of:
                         continue
                     if event_type == "unlock":
                         if effective and as_of <= effective <= end:
-                            all_rows.append(row)
-                    elif not effective or effective <= as_of:
-                        all_rows.append(row)
+                            enriched = dict(row)
+                            enriched.update({"event_state": "future_unlock", "is_future_effective": True})
+                            all_rows.append(enriched)
+                    else:
+                        if event_type == "earnings_forecast":
+                            event_state = "forecast"
+                        elif event_type == "buyback" and (
+                            row.get("plan_actual_status") == "plan_only"
+                            or (effective and effective > as_of)
+                        ):
+                            event_state = "future_plan"
+                        elif effective and effective > as_of:
+                            event_state = "future_scheduled"
+                        else:
+                            event_state = "historical_or_completed"
+                        enriched = dict(row)
+                        enriched.update({
+                            "event_state": event_state,
+                            "is_future_effective": bool(effective and effective > as_of),
+                            "is_forecast": event_type == "earnings_forecast",
+                        })
+                        all_rows.append(enriched)
             else:
-                errors.append(f"{event_type}:{(result.error or {}).get('message', result.status)}")
+                message = f"{event_type}:{(result.error or {}).get('message', result.status)}"
+                errors.append(message)
+                source_errors.append(message)
+        for event_type, count in missing_disclosure.items():
+            warning = f"{event_type}: {count} 条记录缺少公告/已知披露日期，已排除；历史结果不完整，不能据此断言无事件"
+            errors.append(warning)
+            statuses[event_type] = ResultStatus.PARTIAL.value
         unique: dict[str, dict[str, Any]] = {}
         for row in all_rows:
             unique[row["evidence_key"]] = row
-        data = {"code": symbol.code, "as_of": as_of, "forward_days": forward_days, "rows": sorted(unique.values(), key=lambda row: (row.get("effective_date") or "9999-99-99", row.get("notice_date") or "9999-99-99")), "status_by_type": statuses, "coverage_note": "历史视图只保留 as_of 前已披露事件；有可靠源单位的股数统一为股、金额统一为元、比例统一为百分数，raw/source_unit 保留源值；源指标单位依赖标题时不填猜测性的 canonical amount；解禁未来日期仍需已披露"}
-        if not all_rows and errors and len(errors) == len(selected):
+        data = {"code": symbol.code, "as_of": as_of, "forward_days": forward_days, "rows": sorted(unique.values(), key=lambda row: (row.get("effective_date") or "9999-99-99", row.get("notice_date") or "9999-99-99")), "status_by_type": statuses, "coverage_note": "历史视图只保留 as_of 前已披露信息；非解禁事件的未来实施日/报告期可保留但会标注 event_state，不将计划/预告当作已实施或实绩；有可靠源单位的股数统一为股、金额统一为元、比例统一为百分数，raw/source_unit 保留源值；源指标单位依赖标题时不填猜测性的 canonical amount；解禁未来日期仍需已披露"}
+        if not all_rows and source_errors and len(source_errors) == len(selected):
             failure = result_error(ResultStatus.UNAVAILABLE, source=EVENT_SOURCE, source_url=DATACENTER_URL, code="all_event_types_failed", message="事件源均不可用", warnings=errors, retryable=True, data_date=as_of, as_of=as_of)
             self.cache.set(key, result_cache_value(failure), ttl=min(self.cache_ttl, 60), data_date=as_of)
             return failure
