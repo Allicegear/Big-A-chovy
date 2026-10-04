@@ -14,9 +14,9 @@
 
 ## 版本标识
 
-- 当前开发预览版：[v0.5.0-preview.5](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.5.0-preview.5)，增加东财前复权日 K 备用源与逐轮降级诊断，完善板块分页完整性，并统一看板和工作台的运行状态提示；仍为预览版。
-- Docker 发布版：[v0.5.0-docker.4](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.5.0-docker.4)，基于同一源码提供 `linux/amd64` 和 `linux/arm64` 容器镜像。
-- 旧版本（`v0.3.x`、`v0.4.x`、`v0.5.0-preview.1`–`preview.4`、`v0.5.0-docker.1`–`docker.3`）已被当前版本取代；其 tag 与容器镜像标签保留，便于复现与回退。
+- 当前开发预览版：[v0.6.0-preview.1](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-preview.1)，新增统一数据证据层、可读证据工作台、按需上下文与历史研究工具，并收口数据源失败语义、历史事件时点、财务资格和网络冷启动预算；仍为预览版。
+- Docker 发布版：[v0.6.0-docker.1](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-docker.1)，基于同一源码提供 `linux/amd64` 和 `linux/arm64` 容器镜像。
+- 旧版本（`v0.3.x`、`v0.4.x`、`v0.5.x`）已被当前版本取代；其 tag 与容器镜像标签保留，便于复现与回退。
 
 完整更新记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
@@ -106,7 +106,7 @@ HTTPS_PROXY=http://host.docker.internal:7890
 Docker 运行版同时启动 Web 工作台和实时看板，不启动 Finder、macOS `.command` 启动器或桌面 GUI；宿主机端口默认只绑定 `127.0.0.1`，需要局域网访问时应明确修改 compose 端口映射并确认网络可信。它同样不会自动下单。发布标签会由 GitHub Actions 构建并发布多架构镜像到 GitHub Container Registry；如果首次发布后镜像仍是私有的，需要在 GitHub Packages 中将其改为 Public。
 
 ```bash
-docker pull ghcr.io/luqtest/big-a-chovy:v0.5.0-docker.3
+docker pull ghcr.io/luqtest/big-a-chovy:v0.6.0-docker.1
 ```
 
 ### 1. 启动普通筛选 GUI
