@@ -51,3 +51,9 @@ Issue、Pull Request 和 Discussion 仅接受以下主题：
 5. 等待维护者审查。超出社区范围、违反三条底线或无法脱敏的提交可能被关闭或拒绝合并。
 
 维护者可以关闭超出项目范围、包含敏感数据或违反上述边界的 Issue 和 Pull Request。对 fork、二次开发或自行部署版本的运营行为，由相应运营者自行负责。
+
+## 贡献许可
+
+除非另有明确约定，你有权提交并有意纳入本项目的贡献按 [Apache License 2.0](LICENSE) 授权。请保留相关第三方版权、许可证和来源说明；引入第三方内容时同步更新 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+本贡献指南规定社区讨论与 PR 接收范围，不对 Apache-2.0 授予的使用、修改或分发权利增加限制。

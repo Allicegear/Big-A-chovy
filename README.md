@@ -4,6 +4,7 @@
 
 [![Latest preview release](https://img.shields.io/github/v/release/LuQTest/Big-A-chovy?include_prereleases&label=latest%20preview&style=flat-square)](https://github.com/LuQTest/Big-A-chovy/releases)
 [![GitHub stars](https://img.shields.io/github/stars/LuQTest/Big-A-chovy?style=flat-square&label=stars)](https://github.com/LuQTest/Big-A-chovy/stargazers)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](LICENSE)
 
 这是一个面向 A 股盘中筛选、低吸候选、明日观察池和复盘分析的本地工具集。
 
@@ -516,3 +517,13 @@ python3 daily-stock-analysis/scripts/a_share_daily_screen.py --boards main chine
 - 不提交账户、持仓、交易金额、个人决策记录、API 密钥或其他敏感数据。
 
 详细贡献规则见 [`CONTRIBUTING.md`](CONTRIBUTING.md)；Issue 提交前请使用仓库提供的模板。
+
+## 十五、许可证
+
+Copyright 2026 LuQTest and contributors.
+
+除另有说明的第三方内容外，本项目发布的源码、文档和示例配置采用 [Apache License 2.0](LICENSE)。完整许可证使用 [Apache 官方英文文本](https://www.apache.org/licenses/LICENSE-2.0.txt)；项目版权与来源说明见 [NOTICE](NOTICE)，第三方来源和许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。第三方组件仍遵循各自许可证。
+
+本许可不授予第三方行情、公告或其他外部数据的使用和再分发权；这些数据应遵循各数据提供方的条款。本地私有报告、决策记录、持仓、账户、运行状态及密钥不作为本项目开源发布内容。
+
+贡献采用相同的 Apache-2.0 许可证，详见 [贡献指南](CONTRIBUTING.md)。社区讨论与 PR 接收范围属于项目维护规则，不增加对 Apache-2.0 许可权利的限制。
