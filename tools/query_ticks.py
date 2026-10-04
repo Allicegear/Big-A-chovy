@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.data_sources.tencent import TencentTickSource  # noqa: E402
+from tools.data_sources.http import project_http_client  # noqa: E402
 
 
 def _print_result(result: Any, *, json_mode: bool) -> None:
@@ -49,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-verify", action="store_true", help="不比较分笔成交额与腾讯快照成交额")
     parser.add_argument("--json", action="store_true", dest="json_mode", help="输出 JSON")
     args = parser.parse_args(argv)
-    source = TencentTickSource()
+    source = TencentTickSource(client=project_http_client())
     exit_code = 0
     for raw in args.codes:
         for code in (part.strip() for part in raw.split(",")):
@@ -66,4 +67,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

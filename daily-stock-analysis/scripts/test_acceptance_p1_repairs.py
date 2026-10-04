@@ -11,6 +11,7 @@ import a_share_daily_screen as screen
 from tools import query_financials
 import realtime_dashboard as dashboard
 from tools.data_sources.cache import JsonCache
+from tools.data_sources.announcements import fetch_announcement_evidence
 from tools.data_sources.contracts import Result, ResultStatus, result_ok
 from tools.data_sources.tencent import TencentTickSource, aggregate_ticks
 
@@ -34,6 +35,29 @@ class AnnouncementBusinessFailureTests(unittest.TestCase):
             with patch.object(screen, "CNInfoAnnouncementSource", return_value=fallback):
                 self.assertEqual(screen.fetch_announcements("600519"), [])
         fallback.fetch.assert_not_called()
+
+    def test_total_count_conflict_and_missing_title_use_fallback(self) -> None:
+        for payload in (
+            {"success": True, "data": {"list": [], "total": 3}},
+            {"success": True, "data": {"list": [{"code": "600519"}], "total": 1}},
+        ):
+            with self.subTest(payload=payload):
+                with patch.object(screen, "fetch_json", return_value=payload):
+                    fallback = self._fallback([{"title": "备用公告"}])
+                    with patch.object(screen, "CNInfoAnnouncementSource", return_value=fallback):
+                        self.assertEqual(screen.fetch_announcements("600519"), ["备用公告"])
+                    fallback.fetch.assert_called_once()
+
+    def test_nested_business_failure_does_not_become_empty_primary(self) -> None:
+        fallback = self._fallback([{"title": "备用公告"}])
+        result = fetch_announcement_evidence(
+            "600519",
+            primary=lambda: {"success": True, "result": {"success": False, "code": 429, "data": []}},
+            fallback=fallback,
+        )
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.data["rows"][0]["title"], "备用公告")
+        fallback.fetch.assert_called_once()
 
     def test_both_sources_fail_and_stale_avoid_is_preserved(self) -> None:
         result = {"trend_observation": [{"code": "600519"}]}
@@ -91,6 +115,20 @@ class FinancialEvidenceTests(unittest.TestCase):
         ):
             profile = query_financials.query_financial_profile("600519", client=Mock())
         self.assertNotIn("安全", profile["safety_advice"])
+        self.assertIn("真实仓暂不开", profile["safety_advice"])
+
+    def test_loss_advice_is_an_explicit_real_warehouse_gate(self) -> None:
+        row = [{"report_period": "2026-06-30", "基本每股收益": "-0.20", "归属于母公司所有者的净利润": "-100"}]
+        with (
+            patch.object(query_financials, "_eastmoney_snapshot", return_value=({"f43": "1000", "f162": "1000"}, None)),
+            patch.object(query_financials, "_tencent_snapshot", return_value=({}, None)),
+            patch.object(query_financials, "_ytd", return_value=(0.0, None, "fixture")),
+            patch.object(query_financials.SinaFinancialSource, "fetch_reports", return_value=result_ok(row, source="sina", source_url="sina")),
+        ):
+            profile = query_financials.query_financial_profile("600519", client=Mock())
+        self.assertIn("真实仓暂不开", profile["safety_advice"])
+        self.assertNotIn("不宜重仓", profile["safety_advice"])
+        self.assertEqual(profile["real_warehouse_financial_gate"], "blocked_loss_or_negative_pe")
 
 
 class TickCoverageTests(unittest.TestCase):
@@ -106,6 +144,17 @@ class TickCoverageTests(unittest.TestCase):
         self.assertFalse(result["data_sufficient"])
         self.assertIn("覆盖不足", result["reason"])
 
+    def test_sparse_rows_do_not_prove_a_five_minute_window_later_in_session(self) -> None:
+        result = aggregate_ticks(
+            [
+                {"time": "10:00:00", "amount": 100, "side": "B"},
+                {"time": "10:01:00", "amount": 100, "side": "S"},
+            ],
+            window_minutes=5,
+            as_of="100100",
+        )
+        self.assertFalse(result["data_sufficient"])
+
     def test_snapshot_close_time_is_normalized_before_amount_check(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = TencentTickSource(cache=JsonCache("p1_ticks", path=Path(directory) / "cache.json"), sleep_seconds=0)
@@ -119,6 +168,27 @@ class TickCoverageTests(unittest.TestCase):
             ])
             result = source.fetch("600519", max_pages=4)
         self.assertTrue(any("成交额" in warning for warning in result.warnings))
+
+    def test_amount_check_uses_auction_plus_continuous_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = TencentTickSource(cache=JsonCache("p1_ticks_auction", path=Path(directory) / "cache.json"), sleep_seconds=0)
+            source._snapshot = Mock(return_value={
+                "data_date": "2026-10-04", "as_of": "153000", "amount": 30_000,
+                "name": "测试股", "price": 10.0,
+            })
+            source._page = Mock(side_effect=[
+                [
+                    {"seq": 1, "time": "09:25:00", "price": 10.0, "change": 0.0, "volume": 1, "amount": 10_000, "side": "M"},
+                    {"seq": 2, "time": "09:30:00", "price": 10.0, "change": 0.0, "volume": 1, "amount": 10_000, "side": "B"},
+                    {"seq": 3, "time": "09:31:00", "price": 10.0, "change": 0.0, "volume": 1, "amount": 10_000, "side": "S"},
+                ],
+                None,
+            ])
+            result = source.fetch("600519", max_pages=4)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.data["auction_amount"], 10_000)
+        self.assertEqual(result.data["session_amount"], 30_000)
+        self.assertFalse(any("成交额" in warning for warning in result.warnings))
 
 
 class TradingDayRetryTests(unittest.TestCase):

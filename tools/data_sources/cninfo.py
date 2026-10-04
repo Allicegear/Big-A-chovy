@@ -41,14 +41,27 @@ def parse_org_map(payload: Mapping[str, Any]) -> dict[str, str]:
     return output
 
 
-def parse_announcement_payload(payload: Mapping[str, Any], *, code: str, source_url: str = CNINFO_ANNOUNCEMENT_URL) -> list[dict[str, Any]]:
+def parse_announcement_payload(payload: Mapping[str, Any], *, code: str, source_url: str = CNINFO_ANNOUNCEMENT_URL, page_size: int = 30) -> list[dict[str, Any]]:
     if not isinstance(payload, Mapping) or "announcements" not in payload:
         raise ValueError("巨潮公告响应缺少 announcements")
+    success = payload.get("success")
+    if success is not None and success not in (True, 1, "1", "true", "True", "ok", "OK"):
+        raise ValueError(f"巨潮公告业务失败: success={success!r}, code={payload.get('code')!r}")
+    if "code" in payload and payload.get("code") not in (None, "", 0, "0", 200, "200"):
+        raise ValueError(f"巨潮公告业务失败: code={payload.get('code')!r}")
     announcements = payload.get("announcements")
     if announcements is None:
         raise ValueError("巨潮公告响应 announcements 为 null")
     if not isinstance(announcements, list):
         raise ValueError("巨潮 announcements 不是列表")
+    total = next((payload.get(key) for key in ("totalAnnouncement", "total", "totalCount", "count") if payload.get(key) is not None), None)
+    if total is not None:
+        try:
+            expected = min(int(total), max(1, int(page_size)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"巨潮公告 total 不是非负整数: {total!r}") from exc
+        if int(total) < 0 or len(announcements) != expected:
+            raise ValueError(f"巨潮公告页不完整: total={total}, page_size={page_size}, rows={len(announcements)}")
     rows: list[dict[str, Any]] = []
     for item in announcements:
         if not isinstance(item, Mapping):
@@ -67,8 +80,9 @@ def parse_announcement_payload(payload: Mapping[str, Any], *, code: str, source_
             "source": CNINFO_SOURCE,
             "source_url": source_url,
         }
-        if row["title"] or row["announcement_id"]:
-            rows.append(row)
+        if not row["title"]:
+            raise ValueError("巨潮公告非空页缺少可解析标题")
+        rows.append(row)
     return rows
 
 
@@ -135,7 +149,7 @@ class CNInfoAnnouncementSource:
                 },
                 retries=1,
             )
-            rows = parse_announcement_payload(response.json(), code=symbol.code)
+            rows = parse_announcement_payload(response.json(), code=symbol.code, page_size=page_size)
             if not rows:
                 return result_empty(source=CNINFO_SOURCE, source_url=CNINFO_ANNOUNCEMENT_URL, data=[])
             return result_ok(rows, source=CNINFO_SOURCE, source_url=CNINFO_ANNOUNCEMENT_URL, request_count=self.client.request_count)

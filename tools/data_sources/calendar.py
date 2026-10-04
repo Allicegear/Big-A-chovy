@@ -5,6 +5,7 @@ from __future__ import annotations
 import calendar as calendar_module
 from datetime import date, datetime, time, timedelta, timezone
 from collections.abc import Mapping
+import time as time_module
 from typing import Any
 
 from .cache import JsonCache
@@ -81,7 +82,7 @@ class TradingCalendarService:
         self.cache_ttl = max(60, int(cache_ttl))
         self.request_timeout = max(0.5, float(request_timeout))
 
-    def fetch_month(self, year: int, month: int, *, force: bool = False) -> Result:
+    def fetch_month(self, year: int, month: int, *, force: bool = False, deadline: float | None = None) -> Result:
         if type(year) is not int or type(month) is not int or not 1 <= month <= 12:
             return result_error(ResultStatus.UNSUPPORTED, source=CALENDAR_SOURCE, source_url=SZSE_CALENDAR_URL, code="invalid_month", message="year/month 不合法")
         key = self.cache.key({"year": year, "month": month})
@@ -98,7 +99,14 @@ class TradingCalendarService:
                     cache={"hit": True},
                 )
         try:
-            response = self.client.get(SZSE_CALENDAR_URL, params={"month": f"{year}-{month:02d}"}, headers={"Referer": "https://www.szse.cn/"}, timeout=self.request_timeout, retries=1)
+            if deadline is not None and time_module.monotonic() >= deadline:
+                return result_error(ResultStatus.UNAVAILABLE, source=CALENDAR_SOURCE, source_url=SZSE_CALENDAR_URL, code="background_budget_exceeded", message="交易日历查询超过背景预算", retryable=True)
+            timeout = self.request_timeout
+            if deadline is not None:
+                timeout = min(timeout, max(0.1, deadline - time_module.monotonic()))
+            response = self.client.get(SZSE_CALENDAR_URL, params={"month": f"{year}-{month:02d}"}, headers={"Referer": "https://www.szse.cn/"}, timeout=timeout, retries=1)
+            if deadline is not None and time_module.monotonic() >= deadline:
+                return result_error(ResultStatus.UNAVAILABLE, source=CALENDAR_SOURCE, source_url=response.url, code="background_budget_exceeded", message="交易日历查询超过背景预算", retryable=True)
             rows = parse_calendar_payload(response.json(), year=year, month=month, source_url=response.url)
             self.cache.set(key, {"rows": rows}, ttl=self.cache_ttl, data_date=f"{year:04d}-{month:02d}")
             return result_ok(rows, source=CALENDAR_SOURCE, source_url=response.url, data_date=f"{year:04d}-{month:02d}", cache={"hit": False}, request_count=self.client.request_count)
@@ -107,13 +115,13 @@ class TradingCalendarService:
         except (TypeError, ValueError, KeyError) as exc:
             return result_error(ResultStatus.UNAVAILABLE, source=CALENDAR_SOURCE, source_url=SZSE_CALENDAR_URL, code="calendar_incomplete", message=str(exc), retryable=True)
 
-    def is_open(self, value: str | date | datetime, *, force: bool = False) -> Result:
+    def is_open(self, value: str | date | datetime, *, force: bool = False, deadline: float | None = None) -> Result:
         try:
             normalized = validate_ymd(value.isoformat() if isinstance(value, (date, datetime)) else str(value))
             year, month = _month(normalized)
         except (TypeError, ValueError) as exc:
             return result_error(ResultStatus.UNSUPPORTED, source=CALENDAR_SOURCE, source_url=SZSE_CALENDAR_URL, code="invalid_date", message=str(exc))
-        month_result = self.fetch_month(year, month, force=force)
+        month_result = self.fetch_month(year, month, force=force, deadline=deadline)
         if month_result.status != ResultStatus.OK.value:
             return month_result
         found = next((row for row in month_result.data if row.get("date") == normalized), None)

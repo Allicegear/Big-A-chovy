@@ -17,6 +17,8 @@ TICK_URL = "https://stock.gtimg.cn/data/index.php"
 QUOTE_URL = "https://qt.gtimg.cn/q="
 MAX_PAGES = 300
 SESSION_END = "15:00:59"
+SESSION_START = "09:30:00"
+AUCTION_START = "09:25:00"
 TICK_SOURCE = "tencent_ticks"
 
 
@@ -126,7 +128,20 @@ def parse_tick_page(text: str, symbol: str, page: int) -> list[dict[str, Any]] |
     return rows
 
 
-def aggregate_ticks(rows: Iterable[dict[str, Any]], *, window_minutes: int = 5, as_of: str | None = None) -> dict[str, Any]:
+def _format_seconds(value: int) -> str:
+    return f"{value // 3600:02d}:{(value % 3600) // 60:02d}:{value % 60:02d}"
+
+
+def aggregate_ticks(
+    rows: Iterable[dict[str, Any]],
+    *,
+    window_minutes: int = 5,
+    as_of: str | None = None,
+    source_complete: bool | None = None,
+    source_start: str | None = None,
+    source_end: str | None = None,
+    source_warnings: Iterable[str] = (),
+) -> dict[str, Any]:
     """Aggregate B/S/M ticks in continuous auction time only.
 
     The returned ratio is ``B amount / S amount``.  A zero sell amount is
@@ -140,48 +155,110 @@ def aggregate_ticks(rows: Iterable[dict[str, Any]], *, window_minutes: int = 5, 
         if 9 * 3600 + 30 * 60 <= seconds <= 15 * 3600 + 59:
             prepared.append((seconds, row))
     prepared.sort(key=lambda item: item[0])
+    requested_minutes = max(1, int(window_minutes))
     if not prepared:
         return {
-            "window_minutes": window_minutes,
+            "window_minutes": requested_minutes,
             "as_of": as_of,
             "row_count": 0,
             "coverage_minutes": 0.0,
+            "required_coverage_minutes": 0.0,
             "buy_amount": 0.0,
             "sell_amount": 0.0,
             "neutral_amount": 0.0,
             "net_amount": 0.0,
             "buy_sell_ratio": None,
             "data_sufficient": False,
+            "source_coverage_proven": False,
+            "coverage_basis": "none",
             "reason": "连续竞价窗口没有有效分笔",
         }
-    as_of_seconds = _time_seconds(as_of) if as_of else prepared[-1][0]
-    latest = max(as_of_seconds, prepared[-1][0])
-    cutoff = latest - max(1, int(window_minutes)) * 60
+    session_open = _time_seconds(SESSION_START)
+    session_close = _time_seconds(SESSION_END)
+    as_of_seconds = min(_time_seconds(as_of), session_close) if as_of else min(prepared[-1][0], session_close)
+    latest = as_of_seconds
+    effective_window_minutes = min(float(requested_minutes), max(0.0, (latest - session_open) / 60.0))
+    requested_start = max(session_open, latest - requested_minutes * 60)
+    cutoff = requested_start
     selected = [row for seconds, row in prepared if cutoff <= seconds <= latest]
+    if not selected:
+        return {
+            "window_minutes": requested_minutes,
+            "as_of": as_of,
+            "row_count": 0,
+            "coverage_minutes": 0.0,
+            "required_coverage_minutes": round(effective_window_minutes, 2),
+            "buy_amount": 0.0,
+            "sell_amount": 0.0,
+            "neutral_amount": 0.0,
+            "net_amount": 0.0,
+            "buy_sell_ratio": None,
+            "data_sufficient": False,
+            "source_coverage_proven": False,
+            "coverage_basis": "no_selected_rows",
+            "source_range_start": source_start,
+            "source_range_end": source_end,
+            "source_complete": source_complete,
+            "reason": f"所选窗口 { _format_seconds(requested_start) }–{_format_seconds(latest)} 没有分笔记录",
+        }
     buy = sum(float(row.get("amount") or 0) for row in selected if row.get("side") == "B")
     sell = sum(float(row.get("amount") or 0) for row in selected if row.get("side") == "S")
     neutral = sum(float(row.get("amount") or 0) for row in selected if row.get("side") == "M")
     selected_times = [_time_seconds(str(row["time"])) for row in selected]
     coverage = ((max(selected_times) - min(selected_times)) / 60.0) if len(selected_times) > 1 else 0.0
-    # A 5-minute live window can be accepted with the provider's one-minute
-    # minimum observation, while a 15-minute window must cover materially
-    # more than one minute.  The old ``min(window_minutes, 1)`` rule made both
-    # windows equivalent and allowed a single-minute sample to pass 15m.
-    required_coverage = 1.0 if int(window_minutes) <= 5 else max(5.0, float(window_minutes) * 0.5)
-    sufficient = coverage >= required_coverage
+    observed_start = min(selected_times)
+    observed_end = max(selected_times)
+    source_start_seconds = _time_seconds(source_start) if source_start else None
+    source_end_seconds = min(_time_seconds(source_end), session_close) if source_end else None
+    warning_list = [str(item) for item in source_warnings if str(item)]
+    source_range_covers = (
+        source_complete is True
+        and not warning_list
+        and source_start_seconds is not None
+        and source_end_seconds is not None
+        and source_start_seconds <= requested_start
+        and source_end_seconds >= latest
+    )
+    observed_range_covers = (
+        source_complete is None
+        and observed_start <= requested_start
+        and observed_end >= latest
+    )
+    sufficient = source_range_covers or observed_range_covers
+    if source_range_covers:
+        coverage_basis = "source_range_complete"
+    elif observed_range_covers:
+        coverage_basis = "observed_timestamps"
+    else:
+        coverage_basis = "insufficient_source_range"
+    if sufficient:
+        reason = ""
+    elif source_complete is False:
+        reason = "源分笔范围未完整收取，不能证明所选窗口覆盖"
+    elif warning_list:
+        reason = "源分笔存在完整性警告，不能作为真实仓盘口核验充分证据"
+    elif source_complete is True and source_start_seconds is not None:
+        reason = f"源覆盖范围不足（观察 {coverage:.2f} 分钟；需要从 {_format_seconds(requested_start)} 起有源证据）"
+    else:
+        reason = f"窗口覆盖不足且缺少边界成交/源范围证明（观察 {coverage:.2f} 分钟；需要 {effective_window_minutes:.2f} 分钟）"
     return {
-        "window_minutes": int(window_minutes),
+        "window_minutes": requested_minutes,
         "as_of": as_of or selected[-1].get("time"),
         "row_count": len(selected),
         "coverage_minutes": round(coverage, 2),
-        "required_coverage_minutes": required_coverage,
+        "required_coverage_minutes": round(effective_window_minutes, 2),
         "buy_amount": round(buy, 2),
         "sell_amount": round(sell, 2),
         "neutral_amount": round(neutral, 2),
         "net_amount": round(buy - sell, 2),
         "buy_sell_ratio": round(buy / sell, 4) if sell > 0 else None,
         "data_sufficient": sufficient,
-        "reason": "" if sufficient else f"窗口覆盖不足（{coverage:.2f} / {required_coverage:.2f} 分钟）",
+        "source_coverage_proven": source_range_covers,
+        "coverage_basis": coverage_basis,
+        "source_range_start": source_start,
+        "source_range_end": source_end,
+        "source_complete": source_complete,
+        "reason": reason,
     }
 
 
@@ -294,20 +371,42 @@ class TencentTickSource:
                 expected = seq + 1
                 last_time_seconds = current_time_seconds
 
-            continuous = [
+            auction_and_continuous = [
                 row for row in ordered
-                if _time_seconds(str(row["time"])) >= _time_seconds("09:30:00")
+                if _time_seconds(str(row["time"])) >= _time_seconds(AUCTION_START)
                 and _time_seconds(str(row["time"])) <= _time_seconds(SESSION_END)
             ]
+            continuous = [
+                row for row in ordered
+                if _time_seconds(str(row["time"])) >= _time_seconds(SESSION_START)
+                and _time_seconds(str(row["time"])) <= _time_seconds(SESSION_END)
+            ]
+            auction_amount = sum(float(row.get("amount") or 0) for row in auction_and_continuous if _time_seconds(str(row["time"])) < _time_seconds(SESSION_START))
+            session_amount = sum(float(row.get("amount") or 0) for row in auction_and_continuous)
             continuous_amount = sum(float(row.get("amount") or 0) for row in continuous)
             if verify_amount and snapshot["amount"] > 0 and _time_seconds(snapshot["as_of"]) >= _time_seconds("15:01:00"):
                 tolerance = snapshot["amount"] * 0.001 + 1000
-                if abs(continuous_amount - snapshot["amount"]) > tolerance:
+                if abs(session_amount - snapshot["amount"]) > tolerance:
                     warnings.append(
-                        f"连续竞价成交额 {continuous_amount:.0f} 与快照 {snapshot['amount']:.0f} 不符，分笔可能不完整"
+                        f"交易时段成交额 {session_amount:.0f}（集合竞价 {auction_amount:.0f} + 连续竞价 {continuous_amount:.0f}）与全日快照 {snapshot['amount']:.0f} 不符，分笔可能不完整"
                     )
 
-            windows = {str(minutes): aggregate_ticks(ordered, window_minutes=minutes, as_of=snapshot["as_of"]) for minutes in (5, 15)}
+            continuous_times = [_time_seconds(str(row["time"])) for row in continuous]
+            source_start = _format_seconds(min(continuous_times)) if continuous_times else None
+            source_end = snapshot["as_of"] if complete else (_format_seconds(max(continuous_times)) if continuous_times else None)
+            source_complete_for_windows = complete and not warnings
+            windows = {
+                str(minutes): aggregate_ticks(
+                    ordered,
+                    window_minutes=minutes,
+                    as_of=snapshot["as_of"],
+                    source_complete=source_complete_for_windows,
+                    source_start=source_start,
+                    source_end=source_end,
+                    source_warnings=warnings,
+                )
+                for minutes in (5, 15)
+            }
             data = {
                 "code": symbol.code,
                 "symbol": symbol.tencent,
@@ -316,7 +415,14 @@ class TencentTickSource:
                 "as_of": snapshot["as_of"],
                 "rows": ordered,
                 "row_count": len(ordered),
+                "source_complete": complete,
+                "source_sequence_start": int(ordered[0]["seq"]),
+                "source_sequence_end": int(ordered[-1]["seq"]),
+                "source_range_start": source_start,
+                "source_range_end": source_end,
+                "auction_amount": round(auction_amount, 2),
                 "continuous_amount": round(continuous_amount, 2),
+                "session_amount": round(session_amount, 2),
                 "snapshot_amount": snapshot["amount"],
                 "missing_seq": sorted(set(missing_seq)),
                 "windows": windows,

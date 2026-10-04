@@ -167,6 +167,18 @@ class SinaAndCNInfoTests(unittest.TestCase):
         result = fetch_announcement_evidence("600519", primary=lambda: {"rows": [], "source_url": "primary"}, fallback=ShouldNotRun())
         self.assertEqual(result.status, "empty")
 
+    def test_nested_valid_primary_empty_is_not_rewritten_by_fallback(self) -> None:
+        class ShouldNotRun:
+            def fetch(self, code, page_size=30):
+                raise AssertionError("valid nested primary empty must be retained")
+
+        result = fetch_announcement_evidence(
+            "600519",
+            primary=lambda: {"success": True, "data": {"list": [], "total": 0}, "source_url": "primary"},
+            fallback=ShouldNotRun(),
+        )
+        self.assertEqual(result.status, "empty")
+
 
 if __name__ == "__main__":
     unittest.main()

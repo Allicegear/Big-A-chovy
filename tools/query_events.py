@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.data_sources.events import EVENT_TYPES, EastmoneyEventSource  # noqa: E402
+from tools.data_sources.http import project_http_client  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -26,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", dest="json_mode", help="输出 JSON")
     args = parser.parse_args(argv)
     types = [value.strip() for value in args.types.split(",") if value.strip()]
-    source = EastmoneyEventSource()
+    source = EastmoneyEventSource(client=project_http_client())
     results = []
     for raw in args.codes:
         for code in (value.strip() for value in raw.split(",")):
@@ -47,4 +48,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

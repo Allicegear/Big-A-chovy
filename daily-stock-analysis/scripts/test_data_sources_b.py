@@ -85,7 +85,7 @@ class SentimentTests(unittest.TestCase):
 
 
 class EventTests(unittest.TestCase):
-    def test_event_normalization_keeps_unknown_units_and_rejects_wrong_code(self) -> None:
+    def test_event_normalization_uses_canonical_units_and_rejects_wrong_code(self) -> None:
         rows = normalize_event_rows([{
             "SECURITY_CODE": "600519",
             "SECURITY_NAME_ABBR": "样本",
@@ -98,7 +98,20 @@ class EventTests(unittest.TestCase):
         self.assertEqual(rows[0]["notice_date"], "2026-10-01")
         self.assertEqual(rows[0]["effective_date"], "2026-10-20")
         self.assertIsNone(rows[0]["ratio"])
-        self.assertEqual(rows[0]["shares_unit"], "source_native")
+        self.assertEqual(rows[0]["shares_unit"], "股")
+        self.assertEqual(rows[0]["shares"], 1_000_000)
+        self.assertEqual(rows[0]["shares_source_unit"], "万股")
+        forecast = normalize_event_rows([{
+            "SECURITY_CODE": "600519",
+            "NOTICE_DATE": "2026-10-01",
+            "REPORT_DATE": "2026-09-30",
+            "PREDICT_FINANCE": "归属于上市公司股东的净利润",
+            "PREDICT_AMT_LOWER": 100000000,
+            "ADD_AMP_LOWER": "12.5",
+        }], event_type="earnings_forecast", code="600519")
+        self.assertEqual(forecast[0]["ratio"], 12.5)
+        self.assertEqual(forecast[0]["ratio_unit"], "%")
+        self.assertIsNone(forecast[0]["amount_unit"])
         with self.assertRaises(ValueError):
             normalize_event_rows([{"SECURITY_CODE": "000001"}], event_type="unlock", code="600519")
 
@@ -114,4 +127,3 @@ class EventTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -81,11 +81,31 @@ def _date(value: Any) -> str | None:
     return raw[:19]
 
 
+def _validate_business_envelope(payload: Mapping[str, Any]) -> None:
+    """Reject provider business failures before looking at empty containers."""
+    envelopes: list[Mapping[str, Any]] = [payload]
+    for key in ("result", "data"):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            envelopes.append(nested)
+    for envelope in envelopes:
+        success = envelope.get("success")
+        code = envelope.get("code")
+        message = str(envelope.get("message") or payload.get("message") or "")
+        if success is False:
+            if str(code) == "9201" and ("空" in message or any(isinstance(envelope.get(key), list) for key in ("data", "rows", "list", "items"))):
+                continue
+            raise ValueError(f"上下文接口业务失败: {message or code}")
+        if "code" in envelope and code not in (None, "", 0, "0", 200, "200"):
+            raise ValueError(f"上下文接口业务失败: {code}")
+
+
 def _rows_from_json(payload: Any, keys: tuple[str, ...] = ("data", "rows", "list", "items")) -> list[Mapping[str, Any]]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, Mapping)]
     if not isinstance(payload, Mapping):
         raise ValueError("上下文响应不是对象/列表")
+    _validate_business_envelope(payload)
     for key in keys:
         value = payload.get(key)
         if isinstance(value, list):
@@ -114,7 +134,10 @@ def parse_monitor_payload(payload: Any, *, code: str | None = None, as_of: str |
 
 
 def parse_anomaly_payload(payload: Mapping[str, Any], *, code: str | None = None) -> dict[str, Any]:
-    if not isinstance(payload, Mapping) or payload.get("result") not in (0, "0", None):
+    if not isinstance(payload, Mapping):
+        raise ValueError("异动接口响应不是对象")
+    _validate_business_envelope(payload)
+    if payload.get("result") not in (0, "0", None):
         raise ValueError(f"异动接口拒绝: {payload.get('msg') if isinstance(payload, Mapping) else 'unknown'}")
     rows = payload.get("data")
     if not isinstance(rows, list):
@@ -361,7 +384,7 @@ class ContextSource:
         urls = []
         configs = [("RPT_DAILYBILLBOARD_DETAILSNEW", "records"), ("RPT_BILLBOARD_DAILYDETAILSBUY", "buy"), ("RPT_BILLBOARD_DAILYDETAILSSELL", "sell")]
         for report, kind in configs:
-            response = self.client.get(DATACENTER_URL, params={"reportName": report, "columns": "ALL", "source": "WEB", "client": "WEB", "filter": f'(SECURITY_CODE="{symbol.code}")(TRADE_DATE<\'={as_of}\')', "pageNumber": "1", "pageSize": str(min(limit, 100)), "sortColumns": "TRADE_DATE", "sortTypes": "-1"}, headers={"Referer": "https://data.eastmoney.com/"}, retries=1)
+            response = self.client.get(DATACENTER_URL, params={"reportName": report, "columns": "ALL", "source": "WEB", "client": "WEB", "filter": f'(SECURITY_CODE="{symbol.code}")(TRADE_DATE<=\'{as_of}\')', "pageNumber": "1", "pageSize": str(min(limit, 100)), "sortColumns": "TRADE_DATE", "sortTypes": "-1"}, headers={"Referer": "https://data.eastmoney.com/"}, retries=1)
             urls.append(response.url)
             rows = _rows_from_json(response.json(), keys=("data",))
             if kind == "records":

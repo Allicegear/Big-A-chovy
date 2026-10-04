@@ -426,7 +426,7 @@ def _tool_financials(code: str, date: str | None = None) -> dict:
     from tools.query_financials import query_financial_profile
     if not code:
         return {"error": "缺少 code 参数"}
-    result = query_financial_profile(code)
+    result = query_financial_profile(code, client=_data_http_client())
     if date:
         result["requested_as_of"] = date
         result.setdefault("warnings", []).append("财务接口返回最新披露与当前估值快照，不支持按观察日回溯；报告期请以 report_period/published_at 核对")
@@ -438,6 +438,16 @@ _CONTEXT_SOURCE = None
 _EVENT_SOURCE = None
 _SENTIMENT_SOURCE = None
 _CALENDAR_SOURCE = None
+_DATA_HTTP_CLIENT = None
+
+
+def _data_http_client():
+    """Lazily share the measured-path/TLS client across toolbox adapters."""
+    global _DATA_HTTP_CLIENT
+    if _DATA_HTTP_CLIENT is None:
+        from tools.data_sources.http import project_http_client
+        _DATA_HTTP_CLIENT = project_http_client()
+    return _DATA_HTTP_CLIENT
 
 
 def _tool_ticks(code: str, *, date: str | None = None, force: bool = False, max_pages: int = 300) -> dict:
@@ -453,7 +463,7 @@ def _tool_ticks(code: str, *, date: str | None = None, force: bool = False, max_
         }
     from tools.data_sources.tencent import TencentTickSource
     if _TICK_SOURCE is None:
-        _TICK_SOURCE = TencentTickSource()
+        _TICK_SOURCE = TencentTickSource(client=_data_http_client())
     result = _TICK_SOURCE.fetch(code, force=force, max_pages=max(1, min(int(max_pages), 300))).to_dict()
     if date:
         result["requested_as_of"] = date
@@ -468,7 +478,7 @@ def _tool_context(code: str, topic: str, *, date: str | None = None, force: bool
     if not code:
         return {"error": "缺少 code 参数"}
     if _CONTEXT_SOURCE is None:
-        _CONTEXT_SOURCE = ContextSource()
+        _CONTEXT_SOURCE = ContextSource(client=_data_http_client())
     return _CONTEXT_SOURCE.fetch(code, topic=topic, as_of=date or None, force=force, limit=max(1, min(int(limit), 100)), contract=contract).to_dict()
 
 
@@ -481,7 +491,7 @@ def _tool_events(code: str, *, date: str | None = None, types: str | None = None
     if any(item not in EVENT_TYPES for item in selected):
         return {"error": f"types 必须来自: {', '.join(EVENT_TYPES)}", "status": "unsupported"}
     if _EVENT_SOURCE is None:
-        _EVENT_SOURCE = EastmoneyEventSource()
+        _EVENT_SOURCE = EastmoneyEventSource(client=_data_http_client())
     return _EVENT_SOURCE.fetch(code, event_types=selected, as_of=date or None, force=force, forward_days=max(0, min(int(forward_days), 365))).to_dict()
 
 
@@ -489,7 +499,7 @@ def _tool_sentiment(*, date: str | None = None, force: bool = False) -> dict:
     global _SENTIMENT_SOURCE
     from tools.data_sources.sentiment import EastmoneySentimentSource
     if _SENTIMENT_SOURCE is None:
-        _SENTIMENT_SOURCE = EastmoneySentimentSource()
+        _SENTIMENT_SOURCE = EastmoneySentimentSource(client=_data_http_client())
     return _SENTIMENT_SOURCE.fetch(date or None, force=force).to_dict()
 
 
@@ -501,7 +511,7 @@ def _tool_calendar(date: str, *, action: str = "is_open") -> dict:
     if action not in {"is_open", "next", "session"}:
         return {"error": "action 必须是 is_open/next/session", "status": "unsupported"}
     if _CALENDAR_SOURCE is None:
-        _CALENDAR_SOURCE = TradingCalendarService()
+        _CALENDAR_SOURCE = TradingCalendarService(client=_data_http_client())
     if action == "is_open":
         result = _CALENDAR_SOURCE.is_open(date)
     elif action == "next":

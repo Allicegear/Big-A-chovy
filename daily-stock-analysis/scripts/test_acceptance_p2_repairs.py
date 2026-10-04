@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 from tools.data_sources.background import build_market_background
 from tools.data_sources.cache import JsonCache
-from tools.data_sources.context import normalize_dragon_tiger, parse_theme_payload
+from tools.data_sources.context import ContextSource, normalize_dragon_tiger, parse_theme_payload
 from tools.data_sources.contracts import ResultStatus, result_ok
 from tools.data_sources.events import EVENT_TYPES, EastmoneyEventSource
 from tools.data_sources.http import HTTPClient, HTTPResponse
@@ -59,6 +59,49 @@ class EventConfigAndScopeTests(unittest.TestCase):
         self.assertIn("NOTICE_DATE<='2026-10-03'", holder_call["filter"])
         self.assertIn("DIM_SCODE=\"600519\"", buyback_call["filter"])
         self.assertIn("DIM_DATE<='2026-10-03'", buyback_call["filter"])
+
+    def test_historical_events_require_disclosure_before_as_of(self) -> None:
+        def transport(method, url, **kwargs):
+            report = (kwargs.get("params") or {}).get("reportName")
+            if report == "RPT_LIFT_STAGE":
+                rows = [
+                    {"SECURITY_CODE": "600519", "EUTIME": "2026-10-05", "FREE_DATE": "2026-10-10", "FREE_SHARES": 100},
+                    {"SECURITY_CODE": "600519", "EUTIME": "2026-10-02", "FREE_DATE": "2026-10-10", "FREE_SHARES": 200},
+                ]
+            elif report == "RPT_SHARE_HOLDER_INCREASE":
+                rows = [
+                    {"SECURITY_CODE": "600519", "NOTICE_DATE": "2026-10-05", "TRADE_DATE": "2026-10-01", "CHANGE_NUM_SYMBOL": 1},
+                    {"SECURITY_CODE": "600519", "NOTICE_DATE": "2026-10-02", "TRADE_DATE": "2026-10-01", "CHANGE_NUM_SYMBOL": 2},
+                ]
+            else:
+                rows = []
+            return json_response(url, {"success": True, "result": {"pages": 1, "data": rows, "count": len(rows)}})
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = EastmoneyEventSource(
+                client=HTTPClient(transport=transport),
+                cache=JsonCache("p2_events_as_of", path=Path(directory) / "cache.json"),
+            )
+            result = source.fetch("600519", event_types=["unlock", "holder_trade"], as_of="2026-10-03", force=True)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(result.data["rows"]), 2)
+        self.assertTrue(all(row["notice_date"] <= "2026-10-03" for row in result.data["rows"]))
+
+    def test_dragon_tiger_business_failure_is_not_empty_and_filter_has_valid_operator(self) -> None:
+        filters = []
+
+        def transport(method, url, **kwargs):
+            filters.append((kwargs.get("params") or {}).get("filter"))
+            return json_response(url, {"success": False, "code": 429, "result": {"data": []}})
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = ContextSource(
+                client=HTTPClient(transport=transport),
+                cache=JsonCache("p2_context_failure", path=Path(directory) / "cache.json"),
+            )
+            result = source.fetch("600519", topic="dragon_tiger", as_of="2026-10-03", force=True)
+        self.assertEqual(result.status, "unavailable")
+        self.assertIn("TRADE_DATE<='2026-10-03'", filters[0])
 
 
 class CacheContractTests(unittest.TestCase):

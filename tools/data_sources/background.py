@@ -2,35 +2,45 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timezone, timedelta
+import inspect
+import threading
 import time
-from typing import Any
-import urllib.request
+from typing import Any, Callable
 
 from .calendar import TradingCalendarService
-from .http import HTTPClient
+from .http import HTTPClient, project_http_client as _project_http_client
 from .sentiment import EastmoneySentimentSource
 
 
 BEIJING = timezone(timedelta(hours=8))
 BACKGROUND_DEFAULT_BUDGET_SECONDS = 8.0
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_THREADS: set[threading.Thread] = set()
 
 
 def project_http_client() -> HTTPClient:
-    """Build the shared data-source client with measured path + TLS policy."""
-    try:
-        import network_path
-        import tls_context
+    """Compatibility export for callers that historically imported it here."""
+    return _project_http_client()
 
-        proxy = network_path.best_proxy_url()
-        handlers = [urllib.request.HTTPSHandler(context=tls_context.build_context())]
-        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {}))
-        return HTTPClient(opener=urllib.request.build_opener(*handlers))
-    except Exception:
-        # CLI use outside the dashboard still gets verified default TLS; the
-        # dashboard path above reuses its measured direct/proxy choice.
-        return HTTPClient()
+
+def _budget_result(message: str = "市场背景查询超过总预算") -> dict[str, Any]:
+    return {
+        "status": "unavailable",
+        "error": {"code": "background_budget_exceeded", "message": message},
+        "warnings": ["背景查询已限时，不影响核心筛选结果"],
+    }
+
+
+def _call_with_optional_deadline(function: Callable[..., Any], value: str, deadline: float) -> Any:
+    """Call old injected test doubles and new deadline-aware sources safely."""
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "deadline" in parameters:
+        return function(value, deadline=deadline)
+    return function(value)
 
 
 def build_market_background(
@@ -41,38 +51,90 @@ def build_market_background(
     include_sentiment: bool = True,
     budget_seconds: float = BACKGROUND_DEFAULT_BUDGET_SECONDS,
 ) -> dict[str, Any]:
-    """Return independently degradable background evidence within a hard budget."""
+    """Return independently degradable evidence within a process-level budget.
+
+    The workers are daemon threads, so a stalled provider cannot keep a CLI
+    process alive after the budget.  A later invocation refuses to overlap an
+    earlier still-running provider; late worker results are discarded rather
+    than being published as if they completed inside the budget.
+    """
     if data_date is None:
         data_date = datetime.now(BEIJING).date().isoformat()
+    budget = max(0.05, float(budget_seconds))
+    deadline = time.monotonic() + budget
+    names = ["calendar"] + (["sentiment"] if include_sentiment else [])
     background: dict[str, Any] = {
         "data_date": data_date,
         "note": "市场情绪与事件仅作背景证据，不改变现有评分、门禁或真实仓权限",
     }
-    shared_client = None
-    if calendar_service is None or (include_sentiment and sentiment_source is None):
-        shared_client = project_http_client()
-    calendar_service = calendar_service or TradingCalendarService(client=shared_client, request_timeout=max(0.5, float(budget_seconds) / 3))
-    sentiment_source = sentiment_source or EastmoneySentimentSource(client=shared_client, request_timeout=max(0.5, float(budget_seconds) / 3))
 
-    tasks: dict[str, Any] = {}
-    pool = ThreadPoolExecutor(max_workers=2)
-    try:
-        tasks["calendar"] = pool.submit(calendar_service.is_open, data_date)
-        if include_sentiment:
-            tasks["sentiment"] = pool.submit(sentiment_source.fetch, data_date)
-        deadline = time.monotonic() + max(0.5, float(budget_seconds))
-        for name, future in tasks.items():
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                result = future.result(timeout=remaining)
-                background[name] = result.to_dict()
-            except FutureTimeout:
-                background[name] = {"status": "unavailable", "error": {"code": "background_budget_exceeded", "message": "市场背景查询超过总预算"}, "warnings": ["背景查询已限时，不影响核心筛选结果"]}
-            except Exception as exc:
-                background[name] = {"status": "unavailable", "error": {"code": "background_source_error", "message": f"{type(exc).__name__}: {exc}"}, "warnings": ["背景源失败，不影响核心筛选结果"]}
-    finally:
-        # Do not wait for a stalled provider after the budget has expired.  The
-        # worker is bounded by the HTTP client's timeout and is independent of
-        # the screening lock.
-        pool.shutdown(wait=False, cancel_futures=True)
+    with _ACTIVE_LOCK:
+        _ACTIVE_THREADS.difference_update({thread for thread in _ACTIVE_THREADS if not thread.is_alive()})
+        if any(thread.is_alive() for thread in _ACTIVE_THREADS):
+            for name in names:
+                background[name] = {
+                    "status": "unavailable",
+                    "error": {"code": "background_inflight", "message": "上一轮背景查询仍在后台，拒绝重叠请求"},
+                    "warnings": ["背景查询未重叠；不影响核心筛选结果"],
+                }
+            return background
+
+    results: dict[str, Any] = {}
+    completed = {name: threading.Event() for name in names}
+    client_lock = threading.Lock()
+    shared_client: HTTPClient | None = None
+
+    def get_shared_client() -> HTTPClient:
+        nonlocal shared_client
+        with client_lock:
+            if shared_client is None:
+                shared_client = project_http_client()
+            return shared_client
+
+    def worker(name: str) -> None:
+        try:
+            if time.monotonic() >= deadline:
+                return
+            if name == "calendar":
+                service = calendar_service or TradingCalendarService(
+                    client=get_shared_client(),
+                    request_timeout=max(0.1, min(10.0, budget / 3)),
+                )
+                result = _call_with_optional_deadline(service.is_open, data_date, deadline)
+            else:
+                service = sentiment_source or EastmoneySentimentSource(
+                    client=get_shared_client(),
+                    request_timeout=max(0.1, min(10.0, budget / 3)),
+                )
+                result = _call_with_optional_deadline(service.fetch, data_date, deadline)
+            if time.monotonic() < deadline:
+                results[name] = result.to_dict() if hasattr(result, "to_dict") else result
+        except Exception as exc:  # noqa: BLE001
+            if time.monotonic() < deadline:
+                results[name] = {
+                    "status": "unavailable",
+                    "error": {"code": "background_source_error", "message": f"{type(exc).__name__}: {exc}"},
+                    "warnings": ["背景源失败，不影响核心筛选结果"],
+                }
+        finally:
+            completed[name].set()
+
+    threads: list[threading.Thread] = []
+    for name in names:
+        thread = threading.Thread(target=worker, args=(name,), name=f"a-share-background-{name}", daemon=True)
+        threads.append(thread)
+        with _ACTIVE_LOCK:
+            _ACTIVE_THREADS.add(thread)
+        thread.start()
+
+    while time.monotonic() < deadline and any(not event.is_set() for event in completed.values()):
+        remaining = max(0.0, deadline - time.monotonic())
+        next((event for event in completed.values() if not event.is_set()), threading.Event()).wait(timeout=remaining)
+
+    for name in names:
+        background[name] = results.get(name, _budget_result())
+    # Removing only finished threads keeps the overlap guard active for a
+    # late daemon worker; the worker itself is never allowed to publish late.
+    with _ACTIVE_LOCK:
+        _ACTIVE_THREADS.difference_update({thread for thread in _ACTIVE_THREADS if not thread.is_alive()})
     return background

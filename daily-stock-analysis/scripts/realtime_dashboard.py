@@ -237,13 +237,21 @@ TRADING_SESSIONS = [
 TRADING_DAY_RETRY_SECONDS = 15.0
 _TRADING_DAY_CACHE = {"date": None, "value": True, "source": None, "checked_at": 0.0}
 _TRADING_DAY_LOCK = threading.Lock()
-_OFFICIAL_CALENDAR = TradingCalendarService()
+_OFFICIAL_CALENDAR: TradingCalendarService | None = None
+
+
+def _official_calendar() -> TradingCalendarService:
+    global _OFFICIAL_CALENDAR
+    if _OFFICIAL_CALENDAR is None:
+        from tools.data_sources.http import project_http_client
+        _OFFICIAL_CALENDAR = TradingCalendarService(client=project_http_client())
+    return _OFFICIAL_CALENDAR
 
 
 def _fetch_official_calendar_day(now: datetime) -> tuple[bool, str] | None:
     """Return (is_open, source) when the official calendar is conclusive."""
     try:
-        result = _OFFICIAL_CALENDAR.is_open(now.date())
+        result = _official_calendar().is_open(now.date())
         if result.status == "ok" and isinstance(result.data, dict):
             return bool(result.data.get("is_open")), "szse_official"
     except Exception:
@@ -1078,7 +1086,7 @@ def _next_trading_open() -> datetime | None:
     """返回官方日历确认的下一个交易时段开始时间。"""
     now = datetime.now()
     try:
-        result = _OFFICIAL_CALENDAR.next_session(now)
+        result = _official_calendar().next_session(now)
         if result.status == "ok" and isinstance(result.data, dict) and result.data.get("start"):
             value = datetime.fromisoformat(str(result.data["start"]))
             return value.replace(tzinfo=None)

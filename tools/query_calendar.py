@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.data_sources.calendar import TradingCalendarService  # noqa: E402
+from tools.data_sources.http import project_http_client  # noqa: E402
 
 
 def main() -> int:
@@ -23,7 +24,7 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="忽略当月缓存")
     parser.add_argument("--json", action="store_true", help="输出完整 JSON")
     args = parser.parse_args()
-    source = TradingCalendarService()
+    source = TradingCalendarService(client=project_http_client())
     if args.action == "next":
         result = source.next_trading_day(args.date, force=args.force)
     elif args.action == "session":

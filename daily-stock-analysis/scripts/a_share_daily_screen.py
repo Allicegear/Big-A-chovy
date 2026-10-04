@@ -48,9 +48,13 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from tools.rule_config import RULE_CONFIG, get_rule_config, hhmm_to_minutes  # noqa: E402
-from tools.data_sources.announcements import fetch_announcement_evidence  # noqa: E402
+from tools.data_sources.announcements import (  # noqa: E402
+    classify_announcement_risk as _canonical_announcement_risk,
+    fetch_announcement_evidence,
+)
 from tools.data_sources.cninfo import CNInfoAnnouncementSource  # noqa: E402
 from tools.data_sources.background import build_market_background  # noqa: E402
+from tools.data_sources.http import project_http_client  # noqa: E402
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -1173,6 +1177,47 @@ def collect_announcement_titles(obj: Any) -> List[str]:
     return deduped
 
 
+def _announcement_container(value: Any) -> tuple[list[Any], Dict[str, Any]] | None:
+    """Find the provider list and its pagination metadata."""
+    if isinstance(value, list):
+        return value, {}
+    if not isinstance(value, dict):
+        return None
+    for key in ("rows", "list", "announcements"):
+        if key in value and isinstance(value[key], list):
+            return value[key], value
+    for key in ("data", "result"):
+        if key in value:
+            found = _announcement_container(value[key])
+            if found is not None:
+                rows, container = found
+                # A nested result inherits the outer business envelope and
+                # total fields when the provider puts them beside `data`.
+                merged = dict(value)
+                merged.update(container)
+                return rows, merged
+    return None
+
+
+def _announcement_business_failure(value: Any) -> str | None:
+    """Reject an error envelope at any data/result nesting level."""
+    if not isinstance(value, dict):
+        return None
+    if "success" in value and value.get("success") not in (True, 1, "1", "true", "True", "ok", "OK"):
+        return f"success={value.get('success')!r}"
+    if "code" in value and value.get("code") not in (None, "", 0, "0", 200, "200"):
+        return f"code={value.get('code')!r}"
+    if "data" in value and value.get("data") is None:
+        return "data=null"
+    for key in ("data", "result"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            failure = _announcement_business_failure(nested)
+            if failure:
+                return failure
+    return None
+
+
 def _has_announcement_container(value: Any) -> bool:
     """Return whether an announcement response contains a list-shaped payload.
 
@@ -1180,34 +1225,59 @@ def _has_announcement_container(value: Any) -> bool:
     valid empty list.  The endpoint has returned business-error envelopes with
     ``data: null`` and empty objects; those must reach the CNINFO fallback.
     """
-    if isinstance(value, list):
-        return True
-    if not isinstance(value, dict):
-        return False
-    for key in ("rows", "list", "announcements"):
-        if key in value and isinstance(value[key], list):
-            return True
-    for key in ("data", "result"):
-        if key in value and _has_announcement_container(value[key]):
-            return True
-    return False
+    return _announcement_container(value) is not None
 
 
-def _validate_primary_announcement_response(data: Any) -> None:
+def _announcement_row_title(row: Any) -> str:
+    if isinstance(row, str):
+        return row.strip()
+    if not isinstance(row, dict):
+        return ""
+    for key in ("title", "announcementTitle", "noticeTitle", "notice_title", "art_title", "artTitle", "TITLE"):
+        title = str(row.get(key) or "").strip()
+        if title:
+            return title
+    return ""
+
+
+def _validate_primary_announcement_response(data: Any, *, code: str, page_size: int) -> list[dict[str, Any]]:
     """Validate Eastmoney's business envelope before title extraction."""
     if isinstance(data, list):
-        return
-    if not isinstance(data, dict):
-        raise RuntimeError("东财公告响应不是对象")
-    if data.get("success") is False or data.get("data") is None:
-        raise RuntimeError(f"东财公告业务失败: code={data.get('code')!r}")
-    known_keys = {"data", "result", "total", "totalCount", "announcements", "list", "rows"}
-    if not (known_keys & set(data)):
-        raise RuntimeError("东财公告响应缺少已知结构字段")
-    # A total=0 response is only a valid empty result when the list container
-    # is present.  ``{data: {}}`` and ``{data: null}`` are schema failures.
-    if not _has_announcement_container(data):
-        raise RuntimeError("东财公告响应缺少公告列表容器")
+        rows = data
+        total = None
+        container: Dict[str, Any] = {}
+    else:
+        if not isinstance(data, dict):
+            raise RuntimeError("东财公告响应不是对象")
+        failure = _announcement_business_failure(data)
+        if failure:
+            raise RuntimeError(f"东财公告业务失败: {failure}")
+        found = _announcement_container(data)
+        if found is None:
+            raise RuntimeError("东财公告响应缺少公告列表容器")
+        rows, container = found
+        total = next((container.get(key) for key in ("total", "totalCount", "totalAnnouncement", "count") if container.get(key) is not None), None)
+    if total is not None:
+        try:
+            total_int = int(total)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"东财公告 total 不是非负整数: {total!r}") from exc
+        expected = min(total_int, max(1, int(page_size)))
+        if total_int < 0 or len(rows) != expected:
+            raise RuntimeError(f"东财公告页不完整: total={total_int}, page_size={page_size}, rows={len(rows)}")
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        title = _announcement_row_title(row)
+        if not title:
+            raise RuntimeError("东财公告非空页缺少可解析标题")
+        if isinstance(row, dict):
+            returned_code = str(next((row.get(key) for key in ("SECURITY_CODE", "securityCode", "stockCode", "secCode", "security_code") if row.get(key)), "")).strip()
+            if returned_code and returned_code.split(".", 1)[0].zfill(6) != str(code).zfill(6):
+                raise RuntimeError(f"东财公告返回其他证券: {returned_code}")
+            normalized.append({**row, "title": title})
+        else:
+            normalized.append({"title": title})
+    return normalized
 
 
 def fetch_announcements(code: str, page_size: int = 8) -> List[str]:
@@ -1228,13 +1298,20 @@ def fetch_announcements(code: str, page_size: int = 8) -> List[str]:
             "client_source": "web",
             "stock_list": code,
         }, timeout=ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS, retries=0)
-        if isinstance(data, list):
-            return {"rows": [{"title": title} for title in collect_announcement_titles(data)], "source_url": ANNOUNCEMENT_URL}
-        _validate_primary_announcement_response(data)
-        titles = collect_announcement_titles(data)[:page_size]
-        return {"rows": [{"title": title} for title in titles], "source_url": ANNOUNCEMENT_URL}
+        rows = _validate_primary_announcement_response(data, code=code, page_size=page_size)
+        return {
+            "rows": rows[:page_size],
+            "source_url": ANNOUNCEMENT_URL,
+            "_provider_total": next((data.get(key) for key in ("total", "totalCount", "totalAnnouncement", "count") if isinstance(data, dict) and data.get(key) is not None), None),
+            "_requested_page_size": page_size,
+        }
 
-    evidence = fetch_announcement_evidence(code, primary=_primary, fallback=CNInfoAnnouncementSource(), page_size=page_size)
+    evidence = fetch_announcement_evidence(
+        code,
+        primary=_primary,
+        fallback_factory=lambda: CNInfoAnnouncementSource(client=project_http_client()),
+        page_size=page_size,
+    )
     if evidence.status not in {"ok", "empty"}:
         error = evidence.error if isinstance(evidence.error, dict) else {}
         raise RuntimeError(error.get("message") or "公告源不可用")
@@ -1243,20 +1320,8 @@ def fetch_announcements(code: str, page_size: int = 8) -> List[str]:
 
 
 def classify_announcement_risk(titles: List[str]) -> Dict[str, Any]:
-    filtered = [t for t in titles if not any(k in t for k in ANNOUNCEMENT_IGNORE_KEYWORDS)]
-    hard = sorted({k for t in filtered for k in HARD_ANNOUNCEMENT_KEYWORDS if k in t})
-    watch = sorted({k for t in filtered for k in WATCH_ANNOUNCEMENT_KEYWORDS if k in t})
-    if hard:
-        level = RISK_AVOID
-    elif watch:
-        level = RISK_WATCH
-    else:
-        level = RISK_CLEAN
-    return {
-        "announcement_risk": level,
-        "announcement_keywords": hard or watch,
-        "announcement_titles": filtered[:3],
-    }
+    canonical = _canonical_announcement_risk(titles)
+    return {key: canonical[key] for key in ("announcement_risk", "announcement_keywords", "announcement_titles")}
 
 
 def _load_announcement_risk_cache() -> Dict[str, Dict[str, Any]]:

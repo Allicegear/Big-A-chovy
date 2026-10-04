@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.data_sources.sentiment import EastmoneySentimentSource  # noqa: E402
+from tools.data_sources.http import project_http_client  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,7 +23,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="忽略情绪短缓存")
     parser.add_argument("--json", action="store_true", dest="json_mode", help="输出 JSON")
     args = parser.parse_args(argv)
-    result = EastmoneySentimentSource().fetch(args.date, force=args.force)
+    result = EastmoneySentimentSource(client=project_http_client()).fetch(args.date, force=args.force)
     payload = result.to_dict()
     if args.json_mode:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -43,4 +44,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

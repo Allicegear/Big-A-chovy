@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
 import math
+import time
 from typing import Any
 
 from .cache import JsonCache, coalesced_fetch, result_cache_value, result_from_cache
@@ -180,7 +181,7 @@ class EastmoneySentimentSource:
         self.request_timeout = max(0.5, float(request_timeout))
 
     @coalesced_fetch("sentiment")
-    def fetch(self, data_date: str | None = None, *, force: bool = False, page_size: int = 1000) -> Result:
+    def fetch(self, data_date: str | None = None, *, force: bool = False, page_size: int = 1000, deadline: float | None = None) -> Result:
         if data_date is None:
             data_date = datetime.now(BEIJING).date().isoformat()
         try:
@@ -198,13 +199,22 @@ class EastmoneySentimentSource:
         urls: dict[str, str] = {}
         for pool_kind, url in POOL_URLS.items():
             try:
-                response = self.client.get(url, params={"ut": "7eea3edcaed734bea9c7b7f85d5b38", "dpt": "wz.ztzt", "pageindex": "1", "pagesize": str(page_size), "sort": "fbt:asc", "date": data_date.replace("-", "")}, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=self.request_timeout, retries=1)
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                timeout = self.request_timeout
+                if deadline is not None:
+                    timeout = min(timeout, max(0.1, deadline - time.monotonic()))
+                response = self.client.get(url, params={"ut": "7eea3edcaed734bea9c7b7f85d5b38", "dpt": "wz.ztzt", "pageindex": "1", "pagesize": str(page_size), "sort": "fbt:asc", "date": data_date.replace("-", "")}, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, retries=1)
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 pools[pool_kind] = parse_sentiment_pool_payload(response.json(), pool_kind=pool_kind, data_date=data_date)
                 urls[pool_kind] = response.url
             except HTTPClientError as exc:
                 errors.append(f"{pool_kind}:{exc.code}")
             except (TypeError, ValueError, KeyError) as exc:
                 errors.append(f"{pool_kind}:malformed:{exc}")
+        if deadline is not None and time.monotonic() >= deadline:
+            return result_error(ResultStatus.UNAVAILABLE, source=SENTIMENT_SOURCE, source_url=SENTIMENT_BASE, code="background_budget_exceeded", message="情绪查询超过背景预算", warnings=errors or ["情绪查询已限时"], retryable=True, data_date=data_date)
         if not pools:
             failure = result_error(ResultStatus.UNAVAILABLE, source=SENTIMENT_SOURCE, source_url=SENTIMENT_BASE, code="all_pools_failed", message="涨停/炸板/跌停池均不可用", warnings=errors, retryable=True, data_date=data_date)
             self.cache.set(key, result_cache_value(failure), ttl=min(self.cache_ttl, 30), data_date=data_date)

@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.data_sources.contracts import Result  # noqa: E402
-from tools.data_sources.http import HTTPClient, HTTPClientError  # noqa: E402
+from tools.data_sources.http import HTTPClient, HTTPClientError, project_http_client  # noqa: E402
 from tools.data_sources.sina import SinaFinancialSource  # noqa: E402
 from tools.data_sources.symbols import normalize_security  # noqa: E402
 from tools.data_sources.tencent import parse_snapshot  # noqa: E402
@@ -224,7 +224,7 @@ def _ytd(symbol: Any, price: float) -> tuple[Optional[float], Optional[str], str
 
 def query_financial_profile(code: str, *, client: HTTPClient | None = None) -> Dict[str, Any]:
     symbol = normalize_security(code)
-    http = client or HTTPClient()
+    http = client or project_http_client()
     em, em_error = _eastmoney_snapshot(http, symbol)
     tq, tq_error = _tencent_snapshot(http, symbol)
     name = str(em.get("f58") or tq.get("name") or "")
@@ -260,15 +260,20 @@ def query_financial_profile(code: str, *, client: HTTPClient | None = None) -> D
         and disclosed.get("net_profit_disclosed") > 0
     )
     if fin_color == "red" or (pe_dynamic is not None and pe_dynamic < 0):
-        safety_advice = "❌ 亏损股(不宜重仓)"
+        safety_advice = "❌ 真实仓暂不开：当前盈利证据为负或动态PE为负"
+        real_warehouse_gate = "blocked_loss_or_negative_pe"
     elif disclosed_complete_positive and pe_dynamic is not None and 0 < pe_dynamic < 60:
         safety_advice = "✅ 稳健盈利(安全)"
+        real_warehouse_gate = "eligible_financial_evidence"
     elif evidence_status == "profit" and pe_dynamic is not None and pe_dynamic >= 60:
-        safety_advice = "⚠️ 盈利但高估值"
-    elif evidence_status in {"unknown", "break_even"} and pe_dynamic is not None and pe_dynamic > 0:
-        safety_advice = "⚪ 动态PE为正，但实际披露盈利待核验"
+        safety_advice = "⚠️ 真实仓暂不开：盈利但动态PE偏高，需复核"
+        real_warehouse_gate = "review_high_valuation"
+    elif evidence_status in {"unknown", "break_even"}:
+        safety_advice = "⚠️ 真实仓暂不开：盈利证据缺失、冲突或未形成正盈利，需复核"
+        real_warehouse_gate = "review_missing_or_conflicting_profit"
     else:
-        safety_advice = "⚪ 正常观察"
+        safety_advice = "⚠️ 真实仓暂不开：财务字段或估值证据不足，需复核"
+        real_warehouse_gate = "review_incomplete_financial_evidence"
 
     ytd_pct, ytd_error, ytd_basis = _ytd(symbol, price)
     return {
@@ -295,6 +300,7 @@ def query_financial_profile(code: str, *, client: HTTPClient | None = None) -> D
         "fin_status": fin_status,
         "fin_color": fin_color,
         "safety_advice": safety_advice,
+        "real_warehouse_financial_gate": real_warehouse_gate,
         "ytd_pct": ytd_pct,
         "ytd_error": ytd_error,
         "ytd_basis": ytd_basis,
@@ -341,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     rows.append(query_financial_profile(code))
                 except Exception as exc:
-                    rows.append({"code": normalize_code_clean(code), "name": "", "fin_status": "待披露/未知 ⚪", "safety_advice": "⚪ 正常观察", "error": str(exc)})
+                    rows.append({"code": normalize_code_clean(code), "name": "", "fin_status": "待披露/未知 ⚪", "safety_advice": "⚠️ 真实仓暂不开：财务查询失败，需复核", "real_warehouse_financial_gate": "review_query_failure", "error": str(exc)})
     if args.json_mode:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
     else:

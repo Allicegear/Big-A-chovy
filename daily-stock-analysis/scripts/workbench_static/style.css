@@ -278,7 +278,8 @@ table.data a:hover { text-decoration: underline; }
 .evidence-list { display: grid; gap: 5px; margin-top: 9px; }
 .evidence-list > div { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; padding: 6px 8px; border-radius: 6px; background: color-mix(in srgb, var(--bg-surface) 72%, var(--bg-base)); color: var(--text-primary); }
 .evidence-list span { color: var(--text-dim); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.evidence-empty-line, .evidence-loading-line { margin-top: 9px; padding: 8px 10px; border-radius: 6px; background: var(--bg-surface); color: var(--text-secondary); }
+.evidence-empty-line, .evidence-loading-line, .evidence-unavailable { margin-top: 9px; padding: 8px 10px; border-radius: 6px; background: var(--bg-surface); color: var(--text-secondary); }
+.evidence-unavailable { border: 1px solid color-mix(in srgb, var(--red) 55%, var(--border)); color: var(--red); }
 .evidence-loading-line { color: var(--evidence-accent); }
 .evidence-scope-note { margin: 10px 0 0; padding-top: 8px; border-top: 1px solid var(--border); }
 @keyframes evidence-pulse { 0%, 100% { box-shadow: 0 0 0 rgba(242, 204, 143, 0); } 50% { box-shadow: 0 0 0 3px rgba(242, 204, 143, .08); } }

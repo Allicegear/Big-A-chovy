@@ -54,10 +54,12 @@ class WorkbenchEvidenceRouteTests(unittest.TestCase):
         self.assertIn("证据核验舱", html)
         self.assertIn("aria-live=\"polite\"", html)
         self.assertIn("evidenceLinks", js)
+        self.assertIn("function evidenceDetail", js)
+        self.assertIn("不能据此断言", js)
+        self.assertIn("five_book", js)
         self.assertIn("esc(JSON.stringify(detail", js)
         self.assertNotIn("innerHTML = payload", js)
 
 
 if __name__ == "__main__":
     unittest.main()
-

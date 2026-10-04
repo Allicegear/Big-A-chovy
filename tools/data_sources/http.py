@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
+import sys
 import time
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, build_opener, ProxyHandler, urlopen
+from urllib.request import HTTPSHandler, Request, build_opener, ProxyHandler
 
 
 class HTTPClientError(RuntimeError):
@@ -159,3 +161,27 @@ class HTTPClient:
             raw = response.read()
             response_headers = {str(k): str(v) for k, v in response.headers.items()}
             return HTTPResponse(int(response.status), response.geturl(), raw, response_headers, time.monotonic() - started)
+
+
+def project_http_client() -> HTTPClient:
+    """Build the project's measured-path, TLS-verifying HTTP client.
+
+    The network-path module lives beside the dashboard scripts, so this helper
+    resolves that directory lazily.  Tests and callers that inject a transport
+    never pass through the path probe; real CLI/API entry points do.
+    """
+    try:
+        scripts_dir = Path(__file__).resolve().parents[2] / "daily-stock-analysis" / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import network_path
+        import tls_context
+
+        proxy = network_path.best_proxy_url()
+        handlers = [HTTPSHandler(context=tls_context.build_context())]
+        handlers.append(ProxyHandler({"http": proxy, "https": proxy} if proxy else {}))
+        return HTTPClient(opener=build_opener(*handlers))
+    except Exception:
+        # Outside the dashboard, verified system TLS remains the safe fallback
+        # if path discovery itself is unavailable.
+        return HTTPClient()

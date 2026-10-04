@@ -272,7 +272,22 @@ function evidenceLinks(value) {
 function evidenceRows(value) {
   if (Array.isArray(value)) return value;
   if (value && Array.isArray(value.data)) return value.data;
+  if (value && Array.isArray(value.items)) return value.items;
+  if (value && Array.isArray(value.rows)) return value.rows;
   return [];
+}
+
+function evidenceDetail(payload) {
+  if (!payload || typeof payload !== "object") return {};
+  if (!Object.prototype.hasOwnProperty.call(payload, "status")) return payload;
+  const data = payload.data;
+  if (!data || typeof data !== "object") return {};
+  // ContextSource wraps the actual topic payload one level deeper as
+  // {topic, code, data}; other adapters expose their data directly.
+  if (Object.prototype.hasOwnProperty.call(data, "topic") && Object.prototype.hasOwnProperty.call(data, "data")) {
+    return data.data ?? {};
+  }
+  return data;
 }
 
 function evidenceValue(value, fallback = "-") {
@@ -282,8 +297,15 @@ function evidenceValue(value, fallback = "-") {
 }
 
 function evidenceSummary(topic, payload) {
-  const detail = payload?.data ?? {};
+  const detail = evidenceDetail(payload);
   if (payload?.status === "loading") return `<div class="evidence-loading-line" role="status">正在加载 ${esc(evidenceLabels[topic] || topic)}，其他卡片不受影响…</div>`;
+  const status = payload?.status;
+  if (status === "unavailable" || status === "unsupported") {
+    return `<div class="evidence-unavailable" role="status">未确认：${esc(payload?.error?.message || "数据源不可用")}。不能据此断言“没有记录”。</div>`;
+  }
+  const statusNotice = (status === "partial" || status === "stale")
+    ? `<div class="evidence-warning">${status === "partial" ? "部分数据：" : "过期数据："}以下内容只作线索，完整性/时点仍需复核。</div>`
+    : "";
   if (topic === "financials") {
     const fields = [
       ["名称", detail.name], ["现价", detail.price], ["披露业绩", detail.fin_status],
@@ -291,24 +313,31 @@ function evidenceSummary(topic, payload) {
       ["动态 PE", detail.pe_dynamic], ["TTM PE", detail.pe_ttm],
       ["报告期", detail.report_period], ["建议", detail.safety_advice],
     ];
-    return `<div class="evidence-facts">${fields.map(([label, value]) => `<span><b>${esc(label)}</b>${esc(evidenceValue(value))}</span>`).join("")}</div>`;
+    return statusNotice + `<div class="evidence-facts">${fields.map(([label, value]) => `<span><b>${esc(label)}</b>${esc(evidenceValue(value))}</span>`).join("")}</div>`;
   }
   if (topic === "ticks") {
     const windows = detail.windows || {};
     const windowRows = Object.entries(windows).map(([minutes, item]) =>
       `<tr><th>${esc(minutes)} 分钟</th><td>${item.data_sufficient ? "覆盖充分" : "覆盖不足"}</td><td>B ${esc(evidenceValue(item.buy_amount))} / S ${esc(evidenceValue(item.sell_amount))}</td><td>比值 ${esc(evidenceValue(item.buy_sell_ratio))}</td></tr>`).join("");
-    return `<div class="evidence-facts"><span><b>快照</b>${esc(evidenceValue(detail.as_of || payload.as_of))}</span><span><b>分笔数</b>${esc(evidenceValue(detail.row_count, "0"))}</span></div><table class="evidence-mini-table"><tbody>${windowRows || "<tr><td>暂无有效窗口</td></tr>"}</tbody></table>`;
+    const quotePayload = detail.five_book || {};
+    const quoteMap = quotePayload.quotes || {};
+    const quote = Object.values(quoteMap)[0] || {};
+    const bookReady = Array.isArray(quote.buy_orders) && Array.isArray(quote.sell_orders);
+    const bookSummary = bookReady
+      ? `买一 ${evidenceValue(quote.buy_orders[0]?.[0])}/${evidenceValue(quote.buy_orders[0]?.[1])}手 · 卖一 ${evidenceValue(quote.sell_orders[0]?.[0])}/${evidenceValue(quote.sell_orders[0]?.[1])}手`
+      : "五档未返回，不能完成盘口承接核验";
+    return statusNotice + `<div class="evidence-facts"><span><b>快照</b>${esc(evidenceValue(detail.as_of || payload.as_of))}</span><span><b>分笔数</b>${esc(evidenceValue(detail.row_count, "0"))}</span><span><b>分笔+五档</b>${esc(bookSummary)}</span></div><table class="evidence-mini-table"><tbody>${windowRows || "<tr><td>暂无有效窗口</td></tr>"}</tbody></table>`;
   }
   if (topic === "events") {
     const rows = Array.isArray(detail.rows) ? detail.rows : [];
-    return rows.length
+    return statusNotice + (rows.length
       ? `<div class="evidence-list">${rows.slice(0, 5).map((row) => `<div><b>${esc(evidenceValue(row.event_type_name || row.event_type))}</b> ${esc(evidenceValue(row.title, "事件"))}<span>${esc(evidenceValue(row.notice_date))} → ${esc(evidenceValue(row.effective_date))} · 股数 ${esc(evidenceValue(row.shares))} ${esc(evidenceValue(row.shares_unit, ""))}</span></div>`).join("")}</div>`
-      : `<div class="evidence-empty-line">观察日范围内没有结构化事件。</div>`;
+      : `<div class="evidence-empty-line">观察日范围内没有已确认的结构化事件。</div>`);
   }
   if (topic === "themes" || topic === "news" || topic === "research" || topic === "interaction" || topic === "monitor" || topic === "anomaly") {
-    const rows = evidenceRows(detail.data ?? detail);
-    if (!rows.length) return `<div class="evidence-empty-line">没有可展示的 ${esc(evidenceLabels[topic] || topic)} 记录。</div>`;
-    return `<div class="evidence-list">${rows.slice(0, 5).map((row) => {
+    const rows = evidenceRows(detail);
+    if (!rows.length) return statusNotice + `<div class="evidence-empty-line">没有可展示的 ${esc(evidenceLabels[topic] || topic)} 记录。</div>`;
+    return statusNotice + `<div class="evidence-list">${rows.slice(0, 5).map((row) => {
       const title = row.concept || row.title || row.rule || row.question || row.name || row.company || "记录";
       const secondary = row.board_code || row.published_at || row.start || row.date || row.answer || row.content || row.institution || "";
       return `<div><b>${esc(evidenceValue(title))}</b><span>${esc(evidenceValue(secondary))}</span></div>`;
@@ -317,11 +346,11 @@ function evidenceSummary(topic, payload) {
   if (topic === "dragon_tiger") {
     const records = Array.isArray(detail.records) ? detail.records : [];
     const seats = detail.seats || {};
-    return `<div class="evidence-facts"><span><b>已确认上榜日</b>${esc(evidenceValue((detail.record_dates || []).join("、")))}</span><span><b>记录数</b>${esc(evidenceValue(records.length, "0"))}</span><span><b>席位</b>买 ${esc(evidenceValue((seats.buy || []).length, "0"))} / 卖 ${esc(evidenceValue((seats.sell || []).length, "0"))}</span></div>`;
+    return statusNotice + `<div class="evidence-facts"><span><b>已确认上榜日</b>${esc(evidenceValue((detail.record_dates || []).join("、")))}</span><span><b>记录数</b>${esc(evidenceValue(records.length, "0"))}</span><span><b>席位</b>买 ${esc(evidenceValue((seats.buy || []).length, "0"))} / 卖 ${esc(evidenceValue((seats.sell || []).length, "0"))}</span></div>`;
   }
   if (topic === "commodity") {
-    const commodity = detail.data ?? detail;
-    return `<div class="evidence-facts"><span><b>合约</b>${esc(evidenceValue(commodity.contract))}</span><span><b>名称</b>${esc(evidenceValue(commodity.display_name || commodity.name))}</span><span><b>价格</b>${esc(evidenceValue(commodity.price))}</span><span><b>涨跌</b>${esc(evidenceValue(commodity.change_pct))}</span></div>`;
+    const commodity = detail;
+    return statusNotice + `<div class="evidence-facts"><span><b>合约</b>${esc(evidenceValue(commodity.contract))}</span><span><b>名称</b>${esc(evidenceValue(commodity.display_name || commodity.name))}</span><span><b>价格</b>${esc(evidenceValue(commodity.price))}</span><span><b>涨跌</b>${esc(evidenceValue(commodity.change_pct))}</span></div>`;
   }
   return "";
 }
@@ -331,7 +360,7 @@ function evidenceCard(topic, payload) {
   const statusClass = status === "ok" ? "evidence-ok" : (status === "empty" ? "evidence-empty" : (status === "loading" ? "evidence-pending" : "evidence-bad"));
   const warnings = (payload?.warnings || []).map((w) => `<div class="evidence-warning">⚠ ${esc(w)}</div>`).join("");
   const links = evidenceLinks(payload).map((url) => `<a href="${esc(url)}" target="_blank" rel="noreferrer noopener">打开来源</a>`).join(" · ");
-  const detail = payload?.data ?? payload;
+  const detail = evidenceDetail(payload);
   return `<article id="evidence-card-${esc(topic)}" data-evidence-topic="${esc(topic)}" class="evidence-card-row ${statusClass}">
     <div class="evidence-row-head"><strong>${esc(evidenceLabels[topic] || topic)}</strong><span class="evidence-status">${esc(status)}</span><span class="evidence-source">${esc(payload?.source || "本地组合")}</span></div>
     <div class="evidence-meta">时点 ${esc(payload?.as_of || payload?.data_date || "-")} ${links ? `· ${links}` : ""}</div>
@@ -345,7 +374,18 @@ function evidenceCard(topic, payload) {
 async function fetchEvidenceTopic(topic, code, date, force) {
   const commodity = $("#evidence-commodity")?.value || "copper";
   const q = `code=${encodeURIComponent(code)}${date ? `&date=${encodeURIComponent(date)}` : ""}${force ? "&force=1" : ""}${topic === "commodity" ? `&contract=${encodeURIComponent(commodity)}` : ""}`;
-  if (topic === "ticks") return fetchJSON(`/api/wb/ticks?${q}`);
+  if (topic === "ticks") {
+    const [ticks, quote] = await Promise.all([
+      fetchJSON(`/api/wb/ticks?${q}`),
+      fetchJSON(`/api/wb/quote?codes=${encodeURIComponent(code)}`),
+    ]);
+    const tickDetail = ticks && typeof ticks.data === "object" && ticks.data ? ticks.data : {};
+    return {
+      ...ticks,
+      data: { ...tickDetail, five_book: quote },
+      warnings: [...(ticks?.warnings || []), ...(Object.keys(quote?.quotes || {}).length ? [] : ["五档接口未返回可核验盘口"])],
+    };
+  }
   if (topic === "financials") return fetchJSON(`/api/wb/financials?${q}`);
   if (topic === "events") return fetchJSON(`/api/wb/events?${q}`);
   return fetchJSON(`/api/wb/context?${q}&topic=${encodeURIComponent(topic)}`);
