@@ -15,7 +15,7 @@ on:
         default: false
         type: boolean
       image_tag:
-        description: Image tag to publish, for example v0.5.0-docker.1
+        description: Image tag to publish, for example v0.6.0-docker.2
         required: false
         type: string
 
