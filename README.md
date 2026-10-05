@@ -14,8 +14,8 @@
 
 ## 版本标识
 
-- 当前开发预览版：[v0.6.0-preview.1](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-preview.1)，新增统一数据证据层、可读证据工作台、按需上下文与历史研究工具，并收口数据源失败语义、历史事件时点、财务资格和网络冷启动预算；仍为预览版。
-- Docker 发布版：[v0.6.0-docker.1](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-docker.1)，基于同一源码提供 `linux/amd64` 和 `linux/arm64` 容器镜像。
+- 当前开发预览版：[v0.6.0-preview.2](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-preview.2)，修正公告总量冲突、行情涨跌停价与财务字段映射，并加固影子样本事务、结算校验和工作台生命周期；仍为预览版。
+- Docker 发布版：[v0.6.0-docker.2](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-docker.2)，基于同一源码提供 `linux/amd64` 和 `linux/arm64` 容器镜像。
 - 旧版本（`v0.3.x`、`v0.4.x`、`v0.5.x`）已被当前版本取代；其 tag 与容器镜像标签保留，便于复现与回退。
 
 完整更新记录见 [`CHANGELOG.md`](CHANGELOG.md)。
@@ -106,7 +106,7 @@ HTTPS_PROXY=http://host.docker.internal:7890
 Docker 运行版同时启动 Web 工作台和实时看板，不启动 Finder、macOS `.command` 启动器或桌面 GUI；宿主机端口默认只绑定 `127.0.0.1`，需要局域网访问时应明确修改 compose 端口映射并确认网络可信。它同样不会自动下单。发布标签会由 GitHub Actions 构建并发布多架构镜像到 GitHub Container Registry；如果首次发布后镜像仍是私有的，需要在 GitHub Packages 中将其改为 Public。
 
 ```bash
-docker pull ghcr.io/luqtest/big-a-chovy:v0.6.0-docker.1
+docker pull ghcr.io/luqtest/big-a-chovy:v0.6.0-docker.2
 ```
 
 ### 1. 启动普通筛选 GUI
@@ -276,7 +276,7 @@ python3 tools/verify_t1.py 20260824
 
 影子验证只用于模拟数据统计，不能直接转化为真实仓买入依据：
 
-> ⚠️ **真实样本库保护**：工程修复和离线回归不会自动解锁真实库写入。禁止对默认本机影子库运行无参数或带 `--date` 的 `shadow_tracker.py` 扫描，也禁止对真实库使用 `detect_divergence_leader.py --record`；`--report` 仅作只读查看。测试必须设置临时 `A_SHARE_SHADOW_DATA_DIR`，并只使用人工报告和模拟行情。真实历史库迁移、重算或恢复须另行制定方案并单独验收；测试通过、样本数量或代码版本均不构成授权。线下反馈提到的 `shadow_sample.py` 和 `每日收盘.bat` 不在当前工作副本中，先同步并核实后再使用。
+> ⚠️ **真实样本库保护**：工程修复和离线回归不会自动解锁真实库写入。禁止对默认本机影子库运行无参数或带 `--date` 的 `shadow_tracker.py` 扫描，也禁止对真实库使用 `detect_divergence_leader.py --record`；`--report` 仅作只读查看。测试必须设置临时 `A_SHARE_SHADOW_DATA_DIR`，并只使用人工报告和模拟行情。缺少 `fcntl` 跨进程锁的平台会明确拒绝影子库写入；Windows 原生行为尚未单独验收。真实历史库迁移、重算或恢复须另行制定方案并单独验收；测试通过、样本数量或代码版本均不构成授权。线下反馈提到的 `shadow_sample.py` 和 `每日收盘.bat` 不在当前工作副本中，先同步并核实后再使用。
 
 ```bash
 # 只查看当前进度
