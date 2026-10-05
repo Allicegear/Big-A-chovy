@@ -141,6 +141,77 @@ class AnnouncementBusinessFailureTests(unittest.TestCase):
 
 
 class FinancialEvidenceTests(unittest.TestCase):
+    def test_eastmoney_requests_eps_snapshot_field(self) -> None:
+        client = Mock()
+        client.get.return_value.json.return_value = {"data": {"f55": "1.25"}}
+        _, error = query_financials._eastmoney_snapshot(client, query_financials.normalize_security("600519"))
+        self.assertIsNone(error)
+        fields = client.get.call_args.kwargs["params"]["fields"].split(",")
+        self.assertIn("f55", fields)
+
+    def test_snapshot_uses_eps_and_net_profit_growth_not_profit_margins(self) -> None:
+        snapshot = {"f43": "1000", "f162": "1000", "f55": "1.25", "f185": "-8.5", "f186": "42", "f187": "18"}
+        with (
+            patch.object(query_financials, "_eastmoney_snapshot", return_value=(snapshot, None)),
+            patch.object(query_financials, "_tencent_snapshot", return_value=({}, None)),
+            patch.object(query_financials, "_ytd", return_value=(0.0, None, "fixture")),
+            patch.object(
+                query_financials.SinaFinancialSource,
+                "fetch_reports",
+                return_value=result_ok([], source="sina", source_url="fixture"),
+            ),
+        ):
+            profile = query_financials.query_financial_profile("600519", client=Mock())
+
+        self.assertEqual(profile["eps_snapshot"], 1.25)
+        self.assertEqual(profile["net_profit_growth"], -8.5)
+        self.assertIsNone(profile["eps"], "快照 EPS 不得冒充最新披露 EPS")
+        self.assertEqual(profile["profit_evidence_status"], "unknown")
+        self.assertEqual(profile["real_warehouse_financial_gate"], "review_missing_or_conflicting_profit")
+
+    def test_disclosed_profit_growth_takes_precedence_over_snapshot(self) -> None:
+        snapshot = {"f43": "1000", "f162": "1000", "f55": "1.25", "f185": "22", "f186": "42", "f187": "18"}
+        row = [{
+            "report_period": "2026-06-30",
+            "基本每股收益": "0.50",
+            "归属于母公司所有者的净利润": "100",
+            "归属于母公司所有者的净利润_同比": "-3.5",
+        }]
+        with (
+            patch.object(query_financials, "_eastmoney_snapshot", return_value=(snapshot, None)),
+            patch.object(query_financials, "_tencent_snapshot", return_value=({}, None)),
+            patch.object(query_financials, "_ytd", return_value=(0.0, None, "fixture")),
+            patch.object(
+                query_financials.SinaFinancialSource,
+                "fetch_reports",
+                return_value=result_ok(row, source="sina", source_url="fixture"),
+            ),
+        ):
+            profile = query_financials.query_financial_profile("600519", client=Mock())
+
+        self.assertEqual(profile["net_profit_growth"], -3.5)
+        self.assertEqual(profile["eps"], 0.5)
+        self.assertEqual(profile["real_warehouse_financial_gate"], "eligible_financial_evidence")
+
+    def test_missing_snapshot_fields_remain_unknown_and_do_not_use_margins(self) -> None:
+        for missing in (None, "", "-"):
+            with self.subTest(missing=missing):
+                snapshot = {"f43": "1000", "f162": "1000", "f55": missing, "f185": missing, "f186": "42", "f187": "18"}
+                with (
+                    patch.object(query_financials, "_eastmoney_snapshot", return_value=(snapshot, None)),
+                    patch.object(query_financials, "_tencent_snapshot", return_value=({}, None)),
+                    patch.object(query_financials, "_ytd", return_value=(0.0, None, "fixture")),
+                    patch.object(
+                        query_financials.SinaFinancialSource,
+                        "fetch_reports",
+                        return_value=result_ok([], source="sina", source_url="fixture"),
+                    ),
+                ):
+                    profile = query_financials.query_financial_profile("600519", client=Mock())
+                self.assertIsNone(profile["eps_snapshot"])
+                self.assertIsNone(profile["net_profit_growth"])
+                self.assertEqual(profile["profit_evidence_status"], "unknown")
+
     def test_yoy_fields_are_not_used_as_actual_values(self) -> None:
         result = Result(
             status=ResultStatus.OK,
