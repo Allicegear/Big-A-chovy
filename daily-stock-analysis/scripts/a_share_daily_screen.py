@@ -50,7 +50,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.rule_config import RULE_CONFIG, get_rule_config, hhmm_to_minutes  # noqa: E402
 from tools.data_sources.announcements import (  # noqa: E402
     classify_announcement_risk as _canonical_announcement_risk,
+    extract_primary_announcement_container,
+    extract_primary_announcement_total,
     fetch_announcement_evidence,
+    validate_primary_announcement_page,
 )
 from tools.data_sources.cninfo import CNInfoAnnouncementSource  # noqa: E402
 from tools.data_sources.background import build_market_background  # noqa: E402
@@ -1225,26 +1228,9 @@ def collect_announcement_titles(obj: Any) -> List[str]:
     return deduped
 
 
-def _announcement_container(value: Any) -> tuple[list[Any], Dict[str, Any]] | None:
-    """Find the provider list and its pagination metadata."""
-    if isinstance(value, list):
-        return value, {}
-    if not isinstance(value, dict):
-        return None
-    for key in ("rows", "list", "announcements"):
-        if key in value and isinstance(value[key], list):
-            return value[key], value
-    for key in ("data", "result"):
-        if key in value:
-            found = _announcement_container(value[key])
-            if found is not None:
-                rows, container = found
-                # A nested result inherits the outer business envelope and
-                # total fields when the provider puts them beside `data`.
-                merged = dict(value)
-                merged.update(container)
-                return rows, merged
-    return None
+def _announcement_container(value: Any) -> tuple[list[Any], list[Any]] | None:
+    """Find rows while retaining the original metadata at every envelope level."""
+    return extract_primary_announcement_container(value)
 
 
 def _announcement_business_failure(value: Any) -> str | None:
@@ -1290,48 +1276,30 @@ def _announcement_row_title(row: Any) -> str:
     return ""
 
 
-_ANNOUNCEMENT_TOTAL_KEYS = (
-    "_provider_total", "total", "total_hits", "totalHits", "totalCount",
-    "totalAnnouncement", "count",
-)
-
-
-def _announcement_total(container: Dict[str, Any]) -> Any:
-    return next((container.get(key) for key in _ANNOUNCEMENT_TOTAL_KEYS if container.get(key) is not None), None)
+def _announcement_total(metadata_layers: Any) -> Any:
+    """Read only fields that mean total matches; ``count`` is page-local."""
+    if isinstance(metadata_layers, dict):
+        metadata_layers = [metadata_layers]
+    return extract_primary_announcement_total(metadata_layers or [])
 
 
 def _announcement_total_from_response(data: Any) -> Any:
     if isinstance(data, dict):
         found = _announcement_container(data)
-        return _announcement_total(found[1] if found is not None else data)
+        return _announcement_total(found[1] if found is not None else [data])
     return None
 
 
 def _validate_announcement_page_count(rows: List[Any], total: Any, page_size: int) -> None:
-    if total in (None, ""):
-        if not rows:
-            raise RuntimeError("东财公告空页缺少明确的 total=0")
-        return
-    if isinstance(total, bool):
-        raise RuntimeError(f"东财公告 total 不是非负整数: {total!r}")
-    if isinstance(total, int):
-        total_int = total
-    elif isinstance(total, str) and total.strip().isdecimal():
-        total_int = int(total.strip())
-    else:
-        raise RuntimeError(f"东财公告 total 不是非负整数: {total!r}")
-    page_limit = max(1, int(page_size))
-    expected = min(total_int, page_limit)
-    if total_int < 0 or len(rows) != expected:
-        raise RuntimeError(f"东财公告页不完整: total={total_int}, page_size={page_limit}, rows={len(rows)}")
+    metadata = [] if total in (None, "") else [{"_provider_total": total}]
+    validate_primary_announcement_page(rows, metadata, page_size)
 
 
 def _validate_primary_announcement_response(data: Any, *, code: str, page_size: int) -> list[dict[str, Any]]:
     """Validate Eastmoney's business envelope before title extraction."""
     if isinstance(data, list):
         rows = data
-        total = None
-        container: Dict[str, Any] = {}
+        metadata_layers: list[Any] = []
     else:
         if not isinstance(data, dict):
             raise RuntimeError("东财公告响应不是对象")
@@ -1341,9 +1309,8 @@ def _validate_primary_announcement_response(data: Any, *, code: str, page_size: 
         found = _announcement_container(data)
         if found is None:
             raise RuntimeError("东财公告响应缺少公告列表容器")
-        rows, container = found
-        total = _announcement_total(container)
-    _validate_announcement_page_count(rows, total, page_size)
+        rows, metadata_layers = found
+    validate_primary_announcement_page(rows, metadata_layers, page_size)
     normalized: list[dict[str, Any]] = []
     for row in rows:
         title = _announcement_row_title(row)
