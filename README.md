@@ -14,8 +14,8 @@
 
 ## 版本标识
 
-- 当前开发预览版：[v0.6.0-preview.1](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-preview.1)，新增统一数据证据层、可读证据工作台、按需上下文与历史研究工具，并收口数据源失败语义、历史事件时点、财务资格和网络冷启动预算；仍为预览版。
-- Docker 发布版：[v0.6.0-docker.1](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-docker.1)，基于同一源码提供 `linux/amd64` 和 `linux/arm64` 容器镜像。
+- 当前开发预览版：[v0.6.0-preview.2](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-preview.2)，修正公告总量冲突、行情涨跌停价与财务字段映射，并加固影子样本事务、结算校验和工作台生命周期；仍为预览版。
+- Docker 发布版：[v0.6.0-docker.2](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-docker.2)，基于同一源码提供 `linux/amd64` 和 `linux/arm64` 容器镜像。
 - 旧版本（`v0.3.x`、`v0.4.x`、`v0.5.x`）已被当前版本取代；其 tag 与容器镜像标签保留，便于复现与回退。
 
 完整更新记录见 [`CHANGELOG.md`](CHANGELOG.md)。
@@ -106,7 +106,7 @@ HTTPS_PROXY=http://host.docker.internal:7890
 Docker 运行版同时启动 Web 工作台和实时看板，不启动 Finder、macOS `.command` 启动器或桌面 GUI；宿主机端口默认只绑定 `127.0.0.1`，需要局域网访问时应明确修改 compose 端口映射并确认网络可信。它同样不会自动下单。发布标签会由 GitHub Actions 构建并发布多架构镜像到 GitHub Container Registry；如果首次发布后镜像仍是私有的，需要在 GitHub Packages 中将其改为 Public。
 
 ```bash
-docker pull ghcr.io/luqtest/big-a-chovy:v0.6.0-docker.1
+docker pull ghcr.io/luqtest/big-a-chovy:v0.6.0-docker.2
 ```
 
 ### 1. 启动普通筛选 GUI
@@ -276,7 +276,7 @@ python3 tools/verify_t1.py 20260824
 
 影子验证只用于模拟数据统计，不能直接转化为真实仓买入依据：
 
-> ⚠️ **样本保全警告**：当前 `shadow_tracker.py` 每次扫描都会重建三类核心样本，而不带日期的报告查找只取最新一天；无参数或带 `--date` 运行都可能丢掉历史样本。修复并验证全历史增量累积前，禁止用它更新样本；`--report` 仅用于只读查看。线下反馈提到的 `shadow_sample.py` 和 `每日收盘.bat` 不在当前工作副本中，先同步并核实后再使用。
+> ⚠️ **真实样本库保护**：工程修复和离线回归不会自动解锁真实库写入。禁止对默认本机影子库运行无参数或带 `--date` 的 `shadow_tracker.py` 扫描，也禁止对真实库使用 `detect_divergence_leader.py --record`；`--report` 仅作只读查看。测试必须设置临时 `A_SHARE_SHADOW_DATA_DIR`，并只使用人工报告和模拟行情。缺少 `fcntl` 跨进程锁的平台会明确拒绝影子库写入；Windows 原生行为尚未单独验收。真实历史库迁移、重算或恢复须另行制定方案并单独验收；测试通过、样本数量或代码版本均不构成授权。线下反馈提到的 `shadow_sample.py` 和 `每日收盘.bat` 不在当前工作副本中，先同步并核实后再使用。
 
 ```bash
 # 只查看当前进度
@@ -285,8 +285,7 @@ python3 tools/shadow_tracker.py --report
 # 只读检查框架、代码、影子库和权限门槛是否一致
 python3 tools/validate_consistency.py
 
-# 识别并记录龙头分歧候选；仅写入影子样本
-python3 tools/detect_divergence_leader.py --date 20260824 --record
+# `--record` 仅可用于人工报告目录和临时影子库；本轮不提供指向默认真实报告目录的写入命令。
 ```
 
 ## 四、输出目录和运行状态
@@ -459,7 +458,7 @@ python3 daily-stock-analysis/scripts/a_share_daily_screen.py --boards main chine
 ### 待处理
 
 1. **工作台的网络前置检查可能跳过新浪全市场备用（2026-09-28 记录）**：`a_share_daily_screen.fetch_market()` 已有新浪备用；但 `realtime_dashboard.ScreeningScheduler.run_screening()` 在 `network_path.has_working_path()` 为假时会提前返回并保留旧快照，不调用筛选引擎。若东财探测全失败、但新浪仍可用，已有备用逻辑可能到不了。修复目标：全网断开时继续快速失败；东财路径不可用但新浪可达时，仍允许进入备用行情流程，并在结果中明确标注降级。待下一个交易时段做真实联调；盘后可先用模拟/受控故障场景验证。
-2. **影子样本扫描会丢失历史累计（线下反馈，2026-09-28）**：`tools/shadow_tracker.py:scan_and_update()` 每次都把 `coalition`、`breakout`、`sector_boost` 三类样本先重建为空；`get_report_files(reports_dir, None)` 又只返回最新一天的报告。每天执行扫描会让样本只剩当天内容，20 样本验证门槛无法累计，已有结算也可能丢失。修复目标是遍历历史报告并按样本键增量合并，同时保持原有业务规则函数不变。修复验证前禁止直接运行 `python3 tools/shadow_tracker.py` 或带 `--date` 扫描；`--report` 只读。当前工作副本没有线下反馈提到的 `shadow_sample.py` / `每日收盘.bat`，临时绕行方案需先同步确认。
+2. **影子样本累计与结算保全（2026-10-05 修复候选）**：`shadow_tracker.py` 现遍历平铺/日期目录全历史报告并按“类别+证券+日期”增量去重；`--date` 仅限制新增报告，不清空旧样本。扫描与分歧记录共用完整的读→修改→校验→原子提交事务；兼容性 `save_db` 拒绝会删除/改写较新记录的旧快照；缺少可验证跨进程锁的平台明确拒绝写入。畸形库拒绝覆盖；自定义目标及 divergence 等类别保留。T+1 仅认官方日历确认日期、精确共享目标时刻和同日完整日 K；缺时点旧结算保留原始证据但不计入完整样本。离线人工夹具覆盖历史累计、线程和多进程并发、无锁平台拒写、坏库/写入失败、日期缺口、缺时点与旧记录迁移；这些测试不读取或改写真实影子库，且不会解除真实库保护。真实历史库迁移不在本轮范围。
 3. **运行状态被验证跑覆盖（2026-10-01 记录，内容不可恢复）**：交易板范围验收期间的实跑改写了三个运行时状态文件（`flow_snapshot.json`、`intersection_state.json`、`watchlist_breakout_state.json`），**盘中原始内容已丢失且没有备份可回退**；现存的 9/30 收盘版本只作为验收数据保留，不能当作原始盘中状态。当时的口径记录：交集状态与观察池状态均为 9/30 16:12 收盘快照按当次范围重新评估的结果，日期字段为 `2026-09-30`。
    - **不能宣称当前状态"已恢复"或"完全干净"**：状态机的日期隔离依据的是**行情日期**而非自然日，假期重跑 9/30 旧行情仍会判定为同一交易日并读取同日状态，所以此次覆盖的影响面无法用日期判断排除。若后续发现盘中状态机行为异常（锁存／确认次数与预期不符），应优先怀疑这一条。
    - **已加隔离**：`daily-stock-analysis/scripts/runtime_paths.py` 统一提供运行状态路径，端到端验证可通过 `A_SHARE_STATE_DIR`／`A_SHARE_REPORT_DIR` 把状态与报告定向到临时目录（用法见「七、开发和测试」）。此后所有实跑验证必须先设置这两个变量，被测代码与测试不得再写真实运行状态。

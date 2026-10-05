@@ -350,8 +350,11 @@ def check_framework_progress(
         _add(result, "warn", "本地影子库不可用，只核对了框架声明，无法读取实际进度")
         return result
 
-    samples = db.get("samples") or {}
-    targets = db.get("targets") or {}
+    samples = db.get("samples")
+    targets = db.get("targets")
+    if not isinstance(samples, dict) or not isinstance(targets, dict):
+        _add(result, "fail", "本地影子库 targets/samples 结构异常，不能核对进度")
+        return result
     for category in PROGRESS_MARKERS:
         rows = samples.get(category)
         if not isinstance(rows, list):
@@ -398,24 +401,40 @@ def check_shadow_database(
         _add(result, "fail", "影子样本库顶层结构不是对象")
         return result
 
-    expected = set(shadow_targets())
-    actual_targets = set((db.get("targets") or {}).keys())
-    actual_samples = set((db.get("samples") or {}).keys())
-    if actual_targets != expected or actual_samples != expected:
+    configured_targets = shadow_targets()
+    expected = set(configured_targets)
+    targets = db.get("targets")
+    samples = db.get("samples")
+    if not isinstance(targets, dict) or not isinstance(samples, dict):
+        _add(result, "fail", "影子样本库 targets/samples 必须是对象")
+        return result
+    actual_targets = set(targets)
+    actual_samples = set(samples)
+    missing_targets = expected - actual_targets
+    missing_samples = expected - actual_samples
+    if missing_targets or missing_samples or actual_targets != actual_samples:
         _add(
             result,
             "fail",
-            f"影子机制类别不一致：配置={sorted(expected)}，"
+            f"影子机制类别缺失/错位：配置至少包含={sorted(expected)}，"
             f"targets={sorted(actual_targets)}，samples={sorted(actual_samples)}",
         )
         return result
 
-    for category, meta in shadow_targets().items():
-        target_meta = db["targets"].get(category) or {}
-        if target_meta.get("target_samples") != meta["target_samples"]:
+    for category in sorted(actual_targets):
+        target_meta = targets.get(category)
+        if not isinstance(target_meta, dict):
+            _add(result, "fail", f"{category} 数据库目标配置不是对象")
+            continue
+        configured = configured_targets.get(category)
+        target = target_meta.get("target_samples")
+        if isinstance(target, bool) or not isinstance(target, int) or target <= 0:
+            _add(result, "fail", f"{category} 数据库目标值不是正整数")
+            continue
+        if configured is not None and target != configured["target_samples"]:
             _add(result, "fail", f"{category} 数据库目标值与共享配置不一致")
             continue
-        rows = db["samples"].get(category)
+        rows = samples.get(category)
         if not isinstance(rows, list):
             _add(result, "fail", f"{category} 样本不是数组")
             continue

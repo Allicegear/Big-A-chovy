@@ -42,7 +42,7 @@ for p in (str(PROJECT_ROOT), str(PROJECT_ROOT / "tools")):
         sys.path.insert(0, p)
 
 from tools.report_parser import parse_screening_report  # noqa: E402
-from tools.shadow_tracker import init_db, save_db, SHADOW_DB_FILE  # noqa: E402
+from tools.shadow_tracker import mutate_db, SHADOW_DB_FILE  # noqa: E402
 from tools.rule_config import RULE_CONFIG  # noqa: E402
 
 # ---- 参数区（初值·影子期校准；改动需留痕）----
@@ -265,36 +265,40 @@ def evaluate_day_badges(date_str):
 
 
 def record(triggers):
-    """写入影子库 divergence 类；字段与 shadow_tracker 结算/报表管线完全对齐。"""
-    db = init_db()
-    db["targets"].setdefault(
-        "divergence", {"name": "龙头分歧识别(divergence_leader)", "target_samples": 20})
-    db["samples"].setdefault("divergence", [])
-    exist_ids = {s.get("id") for s in db["samples"]["divergence"]}
-    legacy_keys = {f"{s.get('code')}_{s.get('date')}" for s in db["samples"]["divergence"]}
-    added = 0
-    for tg in triggers:
-        new_id = f"DIV_{tg['date']}_{tg['code']}"
-        legacy_key = f"{tg['code']}_{tg['date']}"
-        if new_id in exist_ids or legacy_key in legacy_keys:
-            continue
-        db["samples"]["divergence"].append({
-            "id": new_id,
-            "mechanism": "divergence",
-            "code": tg["code"], "name": tg["name"], "date": tg["date"],
-            "trigger_time": tg["trigger_time"],
-            "report_file": tg.get("report_file", ""),
-            "trigger_price": round(float(tg["trigger_price"]), 2),
-            "plate": tg["plate"],
-            "mainp_pct": round(float(tg["mainp"]), 2),
-            "xl_wan": round(float(tg["xl"]), 1),
-            "pullback_pct": round(float(tg["pull"]), 2),
-            "dominance_label": tg.get("dom_label", ""),
-            "scenario": tg["scenario"],
-            "t1_result": None,
-        })
-        added += 1
-    save_db(db)
+    """Add divergence samples inside shadow_tracker's complete DB transaction."""
+    def add_triggers(db):
+        db["targets"].setdefault(
+            "divergence", {"name": "龙头分歧识别(divergence_leader)", "target_samples": 20})
+        db["samples"].setdefault("divergence", [])
+        exist_ids = {s.get("id") for s in db["samples"]["divergence"]}
+        legacy_keys = {f"{s.get('code')}_{s.get('date')}" for s in db["samples"]["divergence"]}
+        added = 0
+        for tg in triggers:
+            new_id = f"DIV_{tg['date']}_{tg['code']}"
+            legacy_key = f"{tg['code']}_{tg['date']}"
+            if new_id in exist_ids or legacy_key in legacy_keys:
+                continue
+            db["samples"]["divergence"].append({
+                "id": new_id,
+                "mechanism": "divergence",
+                "code": tg["code"], "name": tg["name"], "date": tg["date"],
+                "trigger_time": tg["trigger_time"],
+                "report_file": tg.get("report_file", ""),
+                "trigger_price": round(float(tg["trigger_price"]), 2),
+                "plate": tg["plate"],
+                "mainp_pct": round(float(tg["mainp"]), 2),
+                "xl_wan": round(float(tg["xl"]), 1),
+                "pullback_pct": round(float(tg["pull"]), 2),
+                "dominance_label": tg.get("dom_label", ""),
+                "scenario": tg["scenario"],
+                "t1_result": None,
+            })
+            exist_ids.add(new_id)
+            legacy_keys.add(legacy_key)
+            added += 1
+        return added
+
+    added, db = mutate_db(add_triggers)
     total = len(db["samples"]["divergence"])
     print(f"\n[record] 写入 divergence 样本 {added} 条 → {SHADOW_DB_FILE.name}"
           f"（当前 {total}/20）")

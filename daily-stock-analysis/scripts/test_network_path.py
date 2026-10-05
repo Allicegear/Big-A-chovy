@@ -31,6 +31,8 @@ class NetworkPathTests(unittest.TestCase):
         np.invalidate()
         np._current_label = None
         np._last_switch_reason = ""
+        np._independent_candidates = None
+        np._independent_candidates_at = 0.0
         np._fail_streak.clear()
         np._cooldown_until.clear()
 
@@ -241,6 +243,34 @@ class NetworkPathTests(unittest.TestCase):
              patch.object(np, "_session_for", return_value=sentinel):
             np.ordered_sessions(sentinel)
         self.assertEqual(np._current_label, "代理A")
+
+    def test_independent_endpoint_can_try_candidates_after_eastmoney_negative_cache(self):
+        direct = object()
+        proxy_session = object()
+        candidates = [
+            ("直连", None),
+            ("代理127.0.0.1:7890", "http://127.0.0.1:7890"),
+        ]
+        with patch.object(np, "requests", object()), \
+             patch.object(np, "best_paths", return_value=[]), \
+             patch.object(np, "candidate_paths", return_value=candidates), \
+             patch.object(np, "_session_for", return_value=proxy_session):
+            got = np.ordered_independent_sessions(direct)
+
+        self.assertEqual(got, [("直连", direct), ("代理127.0.0.1:7890", proxy_session)])
+
+    def test_independent_endpoint_respects_route_cooldown(self):
+        direct = object()
+        proxy_session = object()
+        candidates = [("直连", None), ("代理A", "http://127.0.0.1:7890")]
+        with patch.object(np, "requests", object()), \
+             patch.object(np, "best_paths", return_value=[]), \
+             patch.object(np, "candidate_paths", return_value=candidates), \
+             patch.object(np, "_in_cooldown", side_effect=lambda label: label == "直连"), \
+             patch.object(np, "_session_for", return_value=proxy_session):
+            got = np.ordered_independent_sessions(direct)
+
+        self.assertEqual(got, [("代理A", proxy_session)])
 
     # ---------- 配置 ----------
     def test_load_candidate_ports_falls_back_on_missing_file(self):

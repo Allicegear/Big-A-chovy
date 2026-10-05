@@ -1,7 +1,9 @@
 import contextlib
 import io
+import threading
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import a_share_daily_screen as screen
 import realtime_engine as realtime
@@ -251,6 +253,97 @@ class NetworkDiagnosticsTests(unittest.TestCase):
         self.assertTrue(status["complete"])
         self.assertEqual(status["failed_pages"], [])
         self.assertEqual(len(rows), 200)
+
+
+class SinaReachableTests(unittest.TestCase):
+    VALID_ROW = {
+        "symbol": "sh600000", "name": "浦发银行", "trade": "10.00",
+        "settlement": "9.80", "changepercent": "2.04",
+    }
+
+    @patch("a_share_daily_screen.fetch_json")
+    def test_sina_reachable_requires_a_normalizable_quote(self, fetch_json):
+        import realtime_dashboard as dash
+
+        fetch_json.return_value = [self.VALID_ROW]
+        self.assertTrue(dash._sina_reachable())
+        self.assertIn("deadline", fetch_json.call_args.kwargs)
+        self.assertEqual(fetch_json.call_args.kwargs["retries"], 0)
+
+    @patch("a_share_daily_screen.fetch_json")
+    def test_sina_reachable_rejects_empty_malformed_and_false_positive_rows(self, fetch_json):
+        import realtime_dashboard as dash
+
+        for payload in ([], {}, [{"symbol": "sh600000"}], [{**self.VALID_ROW, "trade": "-"}], [None]):
+            with self.subTest(payload=payload):
+                fetch_json.return_value = payload
+                self.assertFalse(dash._sina_reachable())
+
+    @patch("a_share_daily_screen.fetch_json", side_effect=RuntimeError("offline"))
+    def test_sina_reachable_rejects_provider_errors(self, _fetch_json):
+        import realtime_dashboard as dash
+
+        self.assertFalse(dash._sina_reachable())
+
+    def test_sina_reachability_probe_returns_at_its_deadline(self):
+        import realtime_dashboard as dash
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def stalled(*_args, **_kwargs):
+            entered.set()
+            release.wait(timeout=2)
+            return [self.VALID_ROW]
+
+        started = time.monotonic()
+        with patch("a_share_daily_screen.fetch_json", side_effect=stalled):
+            self.assertFalse(dash._sina_reachable(timeout=0.05))
+        elapsed = time.monotonic() - started
+        release.set()
+        self.assertTrue(entered.wait(timeout=0.2))
+        self.assertLess(elapsed, 0.3)
+
+    def test_sina_fetch_uses_independent_candidate_paths_with_deadline(self):
+        session = Mock()
+        session.get.return_value.json.return_value = [self.VALID_ROW]
+        deadline = time.monotonic() + 2
+        with patch.object(screen, "NETWORK_MODE", "auto"), \
+             patch.object(screen, "requests", object()), \
+             patch.object(screen.network_path, "ordered_independent_sessions", return_value=[("代理A", session)]) as routes, \
+             patch.object(screen.network_path, "ordered_sessions", side_effect=AssertionError("Eastmoney-only path list used")):
+            data = screen.fetch_json(screen.SINA_MARKET_URL, {"num": 1}, deadline=deadline)
+
+        self.assertEqual(data, [self.VALID_ROW])
+        routes.assert_called_once_with(screen.REQUESTS_DIRECT_SESSION, deadline=deadline)
+        self.assertLessEqual(session.get.call_args.kwargs["timeout"], 2)
+
+    def test_sina_fetch_stdlib_fallback_uses_synthetic_opener(self):
+        import json
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps([self_row]).encode("utf-8")
+
+        self_row = self.VALID_ROW
+        opener = Mock()
+        opener.open.return_value = FakeResponse()
+        deadline = time.monotonic() + 2
+        with patch.object(screen, "NETWORK_MODE", "auto"), \
+             patch.object(screen, "requests", None), \
+             patch.object(screen.network_path, "independent_path_candidates", return_value=[("直连", None)]) as routes, \
+             patch.object(screen.urllib.request, "build_opener", return_value=opener):
+            data = screen.fetch_json(screen.SINA_MARKET_URL, {"num": 1}, deadline=deadline)
+
+        self.assertEqual(data, [self.VALID_ROW])
+        routes.assert_called_once_with(deadline=deadline)
+        self.assertLessEqual(opener.open.call_args.kwargs["timeout"], 2)
 
 
 if __name__ == "__main__":

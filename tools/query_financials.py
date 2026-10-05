@@ -66,7 +66,7 @@ def _eastmoney_snapshot(client: HTTPClient, symbol: Any) -> tuple[dict[str, Any]
             EASTMONEY_QUOTE_URL,
             params={
                 "secid": symbol.secid,
-                "fields": "f57,f58,f43,f59,f162,f163,f164,f167,f173,f183,f184,f185,f186,f187",
+                "fields": "f57,f58,f43,f55,f59,f162,f163,f164,f167,f173,f183,f184,f185,f186,f187",
             },
             retries=1,
         )
@@ -234,10 +234,13 @@ def query_financial_profile(code: str, *, client: HTTPClient | None = None) -> D
     pb = _number(em.get("f167"), scale=100.0)
     if pe_dynamic is None:
         pe_dynamic = _number(tq.get("pe"))
-    snapshot_eps = _number(em.get("f187"), scale=100.0)
+    # 东财快照中 f55 是每股收益（元/股），f185 是净利润同比（%）。
+    # f186/f187 是利润率，不能代替净利润同比或 EPS。披露利润表仍是
+    # 盈利门禁的权威来源；快照仅补充 profile 字段。
+    snapshot_eps = _number(em.get("f55"))
     snapshot_revenue = _number(em.get("f183"), scale=100_000_000.0)
     snapshot_revenue_growth = _number(em.get("f184"))
-    snapshot_net_profit_growth = _number(em.get("f186"))
+    snapshot_net_profit_growth = _number(em.get("f185"))
 
     sina = SinaFinancialSource(client=http).fetch_reports(symbol.code, report_type="lrb", limit=8)
     disclosed = _disclosed_financials(sina)

@@ -215,6 +215,8 @@ PORT = 8765
 # 引擎会在超时附近空耗，这里兜底中止该轮，标记代理不可用并保留快照，
 # 避免前端一直停在「筛选中」。
 SCREENING_TIMEOUT = 120
+SINA_REACHABILITY_BUDGET_SECONDS = 3.0
+SINA_REACHABILITY_REQUEST_TIMEOUT_SECONDS = 1.5
 # 代理断开时，用更短的轮询间隔探测恢复（正常刷新间隔是 settings["interval"]=90s）。
 # 你一旦把代理弄通，看板约 20s 内自动恢复，不用干等一整轮。
 PROXY_RECOVERY_INTERVAL = 15
@@ -336,6 +338,52 @@ def is_trading_hours() -> bool:
         if h1 * 60 + m1 <= current <= h2 * 60 + m2:
             return True
     return False
+
+
+def _sina_reachable(*, timeout: float | None = None) -> bool:
+    """Boundedly probe one structurally usable Sina quote without accepting it as a result.
+
+    Eastmoney path health is endpoint-specific. This check only decides whether
+    to let the normal shared engine try its independent fallback; the engine
+    still fetches and validates the full market, marks Sina data degraded, and
+    uses the usual round-commit gate. The daemon worker cannot mutate screening
+    state after this probe's deadline expires.
+    """
+    import a_share_daily_screen as screen
+
+    budget = SINA_REACHABILITY_BUDGET_SECONDS if timeout is None else max(0.0, timeout)
+    if budget <= 0:
+        return False
+    deadline = time.monotonic() + budget
+    outcome: dict[str, bool] = {"usable": False}
+
+    def _probe() -> None:
+        try:
+            data = screen.fetch_json(
+                screen.SINA_MARKET_URL,
+                {"page": 1, "num": 1, "sort": "symbol", "asc": 1,
+                 "node": "hs_a", "_s_r_a": "page"},
+                timeout=min(SINA_REACHABILITY_REQUEST_TIMEOUT_SECONDS, budget),
+                retries=0,
+                deadline=deadline,
+            )
+            if not isinstance(data, list):
+                return
+            outcome["usable"] = any(
+                isinstance(row, dict)
+                and (normalized := screen._normalize_sina_row(row)) is not None
+                and re.fullmatch(r"\d{6}", str(normalized.get("f12") or "")) is not None
+                and (normalized.get("f2") or 0) > 0
+                and (normalized.get("f18") or 0) > 0
+                for row in data
+            )
+        except Exception:
+            outcome["usable"] = False
+
+    probe_thread = threading.Thread(target=_probe, name="sina-reachability-probe", daemon=True)
+    probe_thread.start()
+    probe_thread.join(timeout=budget)
+    return not probe_thread.is_alive() and outcome["usable"]
 
 
 def _inject_proxy_to_session() -> None:
@@ -473,6 +521,7 @@ class ScreeningScheduler:
     def run_screening(self, force: bool = False) -> bool:
         if not self._screening_lock.acquire(blocking=False):
             return False
+        sina_probe_succeeded = False
         try:
             self.is_running = True
             # 每轮开始时固定一份配置快照：运行途中改配置只作用于下一轮。
@@ -481,9 +530,12 @@ class ScreeningScheduler:
             round_negative_super_view = dashboard_settings.view_of(self.config)
             # 交易板范围同样在轮初冻结：运行途中改配置只作用于下一轮。
             round_enabled_boards = dashboard_settings.boards_of(self.config)
-            # 快速失败条件：直连和所有候选代理都拿不到东财数据（network_path 实测）。
-            # 直连可用时不再依赖代理；避免全网断开时空耗一轮超时。
-            if not network_path.has_working_path():
+            # network_path 实测的是东财，不代表独立行情源也不可达。东财全灭时，
+            # 只有新浪返回可归一化报价才进入共用引擎；探测不替代完整性检查。
+            eastmoney_reachable = network_path.has_working_path()
+            if not eastmoney_reachable:
+                sina_probe_succeeded = _sina_reachable()
+            if not eastmoney_reachable and not sina_probe_succeeded:
                 self.proxy_unavailable = True
                 prev = self.latest_result
                 prev_meta = (prev or {}).get("meta", {})
@@ -539,7 +591,7 @@ class ScreeningScheduler:
                 # 超时/崩溃：中止本轮状态提交。旧工作线程可能仍在跑，但已无法写正式状态。
                 round_commit.abort()
                 # 代理掉线 / 引擎崩溃：不要覆盖已有有效数据，保留快照并提示。
-                self.proxy_unavailable = True
+                self.proxy_unavailable = not sina_probe_succeeded
                 prev = self.latest_result
                 prev_meta = (prev or {}).get("meta", {})
                 if prev and "error" not in prev and not prev_meta.get("market_data_degraded"):
@@ -629,7 +681,7 @@ class ScreeningScheduler:
             else:
                 # 失败也尽量保留已有有效结果
                 round_commit.abort()
-                self.proxy_unavailable = True
+                self.proxy_unavailable = not sina_probe_succeeded
                 prev = self.latest_result
                 prev_meta = (prev or {}).get("meta", {})
                 prev_valid = bool(
@@ -688,6 +740,10 @@ class ScreeningScheduler:
         thread = threading.Thread(target=self._loop, daemon=True)
         thread.start()
         threading.Thread(target=self._initial_run, daemon=True).start()
+
+    def stop(self) -> None:
+        """Stop the scheduler loop when its owning HTTP service exits."""
+        self._stop_event.set()
 
     def _initial_run(self) -> None:
         """At startup: prewarm if cache is cold, then run screening."""
@@ -1098,12 +1154,49 @@ def _next_trading_open() -> datetime | None:
 
 scheduler = ScreeningScheduler()
 _server: ThreadingHTTPServer | None = None
+_server_lock = threading.Lock()
+_server_shutdown_requested = False
+
+
+def _attach_server(server: ThreadingHTTPServer) -> None:
+    """Publish the active HTTP server before its scheduler can request shutdown."""
+    global _server, _server_shutdown_requested
+    with _server_lock:
+        _server = server
+        _server_shutdown_requested = False
+
+
+def _detach_server(server: ThreadingHTTPServer) -> None:
+    """Clear only the server instance owned by the exiting entry point."""
+    global _server, _server_shutdown_requested
+    with _server_lock:
+        if _server is server:
+            _server = None
+            _server_shutdown_requested = False
 
 
 def _shutdown_server() -> None:
-    """Shutdown the HTTP server from a background thread."""
-    if _server is not None:
-        threading.Thread(target=_server.shutdown, daemon=True).start()
+    """Request shutdown from a safe thread; the serving thread closes its socket."""
+    global _server_shutdown_requested
+    with _server_lock:
+        server = _server
+        if server is None or _server_shutdown_requested:
+            return
+        _server_shutdown_requested = True
+
+    def _shutdown() -> None:
+        try:
+            server.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[dashboard] server shutdown failed: {exc}", file=sys.stderr)
+
+    try:
+        threading.Thread(target=_shutdown, name="dashboard-http-shutdown", daemon=True).start()
+    except Exception:
+        with _server_lock:
+            if _server is server:
+                _server_shutdown_requested = False
+        raise
 
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -1318,8 +1411,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    global _server
-
     parser = argparse.ArgumentParser(description="A股实时筛选看板")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     args = parser.parse_args()
@@ -1338,34 +1429,43 @@ def main() -> int:
     except Exception:
         pass
 
-    _server = ThreadingHTTPServer(("0.0.0.0", PORT), DashboardHandler)
-    scheduler.start()
-
-    import atexit
-    atexit.register(scheduler._archive_markdown)
-
-    url = f"http://localhost:{PORT}"
-    print(f"[dashboard] server running at {url}")
-    print(f"[dashboard] trading hours: {is_trading_hours()}")
-    print(f"[dashboard] auto-refresh: every {scheduler.settings['interval']}s during trading")
-    print("[dashboard] auto-shutdown at 15:15 on weekdays")
-    print("[dashboard] press Ctrl+C to stop")
-
-    # A previous dashboard process may have left a usable browser tab behind.
-    # Do not create another tab on every restart; callers can also suppress
-    # browser handling explicitly with --no-browser.
-    if not args.no_browser and not had_stale_process:
-        try:
-            webbrowser.open_new_tab(url)
-        except Exception:
-            pass
-
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), DashboardHandler)
+    _attach_server(server)
     try:
-        _server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n[dashboard] shutting down...")
-        scheduler._archive_markdown()
-        _server.shutdown()
+        scheduler.start()
+
+        import atexit
+        atexit.register(scheduler._archive_markdown)
+
+        url = f"http://localhost:{PORT}"
+        print(f"[dashboard] server running at {url}")
+        print(f"[dashboard] trading hours: {is_trading_hours()}")
+        print(f"[dashboard] auto-refresh: every {scheduler.settings['interval']}s during trading")
+        print("[dashboard] auto-shutdown at 15:15 on weekdays")
+        print("[dashboard] press Ctrl+C to stop")
+
+        # A previous dashboard process may have left a usable browser tab behind.
+        # Do not create another tab on every restart; callers can also suppress
+        # browser handling explicitly with --no-browser.
+        if not args.no_browser and not had_stale_process:
+            try:
+                webbrowser.open_new_tab(url)
+            except Exception:
+                pass
+
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\n[dashboard] shutting down...")
+            scheduler._archive_markdown()
+            # serve_forever has already unwound; shutdown() belongs to a separate
+            # thread and is unnecessary for this KeyboardInterrupt path.
+    finally:
+        scheduler.stop()
+        try:
+            server.server_close()
+        finally:
+            _detach_server(server)
     return 0
 
 

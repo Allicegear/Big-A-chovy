@@ -76,11 +76,18 @@ class RuleConsistencyTests(unittest.TestCase):
             "t1_max_gain_pct": 2.0,
             "t1_max_drawdown_pct": -1.0,
             "is_false_breakout": False,
+            "t1_date": "20260824",
+            "target_time": "09:45",
+            "target_snapshot_found": True,
+            "t1_date_verified": True,
         }
         self.assertFalse(is_complete_shadow_result(incomplete))
 
         complete = {**incomplete, "source": "daily_kline"}
         self.assertTrue(is_complete_shadow_result(complete))
+        self.assertFalse(is_complete_shadow_result({key: value for key, value in complete.items() if key != "target_time"}))
+        self.assertFalse(is_complete_shadow_result({**complete, "target_time": "09:44"}))
+        self.assertFalse(is_complete_shadow_result({**complete, "t1_date_verified": False}))
 
     def test_checked_but_incomplete_sample_is_reported_as_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -103,6 +110,18 @@ class RuleConsistencyTests(unittest.TestCase):
             result = check_shadow_database(PROJECT_ROOT, db_path=path)
             self.assertTrue(result["fail"])
             self.assertIn("checked=true", result["fail"][0]["message"])
+
+    def test_custom_shadow_category_is_retained_and_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shadow_samples.json"
+            db = {
+                "targets": {**shadow_targets(), "custom_external": {"name": "外部记录", "target_samples": 7}},
+                "samples": {**{category: [] for category in shadow_targets()}, "custom_external": [{"id": "EXT-1", "t1_result": None}]},
+            }
+            path.write_text(json.dumps(db, ensure_ascii=False), encoding="utf-8")
+            result = check_shadow_database(PROJECT_ROOT, db_path=path)
+            self.assertFalse(result["fail"])
+            self.assertTrue(any("custom_external 结构有效" in issue["message"] for issue in result["pass"]))
 
     def _framework_text(self) -> str:
         return (PROJECT_ROOT / "选股框架.md").read_text(encoding="utf-8")

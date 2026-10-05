@@ -50,7 +50,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.rule_config import RULE_CONFIG, get_rule_config, hhmm_to_minutes  # noqa: E402
 from tools.data_sources.announcements import (  # noqa: E402
     classify_announcement_risk as _canonical_announcement_risk,
+    extract_primary_announcement_container,
+    extract_primary_announcement_total,
     fetch_announcement_evidence,
+    validate_primary_announcement_page,
 )
 from tools.data_sources.cninfo import CNInfoAnnouncementSource  # noqa: E402
 from tools.data_sources.background import build_market_background  # noqa: E402
@@ -356,12 +359,27 @@ WATCH_ANNOUNCEMENT_KEYWORDS = list(ANNOUNCEMENT_CONFIG["watch_keywords"])
 ANNOUNCEMENT_IGNORE_KEYWORDS = list(ANNOUNCEMENT_CONFIG["ignore_keywords"])
 
 
-def fetch_json(url: str, params: Dict[str, Any], timeout: int = 6, retries: int = 0) -> Any:
+def fetch_json(
+    url: str,
+    params: Dict[str, Any],
+    timeout: int = 6,
+    retries: int = 0,
+    *,
+    deadline: float | None = None,
+) -> Any:
     errors: Dict[str, str] = {}
+    independent_host = "sina.com.cn" in url
     if NETWORK_MODE == "direct":
         sessions = [("直连", REQUESTS_DIRECT_SESSION)]
     elif NETWORK_MODE == "proxy":
         sessions = [("系统代理", REQUESTS_SESSION)]
+    elif independent_host:
+        # 东财探测失败只说明东财不可用，不能因此把所有候选路径都从新浪
+        # 备用源的探测/实际抓取中排除。
+        sessions = network_path.ordered_independent_sessions(
+            REQUESTS_DIRECT_SESSION,
+            deadline=deadline,
+        )
     else:
         # auto：实测所有路径（直连+各候选代理端口）延迟，最快优先，不依赖系统代理设置
         sessions = network_path.ordered_sessions(REQUESTS_DIRECT_SESSION)
@@ -376,8 +394,12 @@ def fetch_json(url: str, params: Dict[str, Any], timeout: int = 6, retries: int 
                     "Accept-Language": "zh-CN,zh;q=0.9",
                 }
                 for label, session in sessions:
+                    remaining = deadline - time.monotonic() if deadline is not None else timeout
+                    if remaining <= 0:
+                        errors[label] = "deadline exceeded"
+                        break
                     try:
-                        resp = session.get(url, params=params, headers=headers, timeout=timeout,
+                        resp = session.get(url, params=params, headers=headers, timeout=min(timeout, remaining),
                                            verify=tls_context.requests_verify())
                         resp.raise_for_status()
                         _mark_host_ok(url)
@@ -394,11 +416,40 @@ def fetch_json(url: str, params: Dict[str, Any], timeout: int = 6, retries: int 
                 _mark_host_failed(url)
                 raise NetworkUnavailable(url, errors)
             query = urllib.parse.urlencode(params)
-            req = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": UA})
-            opener = build_url_opener(NETWORK_MODE)
-            with opener.open(req, timeout=timeout) as resp:
-                data = resp.read().decode("utf-8", errors="replace")
-            return json.loads(data)
+            request_url = f"{url}?{query}"
+            req = urllib.request.Request(request_url, headers={"User-Agent": UA})
+            if independent_host and NETWORK_MODE == "auto":
+                paths = network_path.independent_path_candidates(deadline=deadline)
+                for label, proxy in paths:
+                    remaining = deadline - time.monotonic() if deadline is not None else timeout
+                    if remaining <= 0:
+                        errors[label] = "deadline exceeded"
+                        break
+                    handlers = [urllib.request.HTTPSHandler(context=SSL_CONTEXT)]
+                    handlers.append(urllib.request.ProxyHandler(
+                        {"http": proxy, "https": proxy} if proxy else {}
+                    ))
+                    opener = urllib.request.build_opener(*handlers)
+                    try:
+                        with opener.open(req, timeout=min(timeout, remaining)) as resp:
+                            data = resp.read().decode("utf-8", errors="replace")
+                        result = json.loads(data)
+                        _mark_host_ok(url)
+                        return result
+                    except Exception as exc:
+                        errors[label] = f"{type(exc).__name__}: {' '.join(str(exc).split())[:220]}"
+            else:
+                opener = build_url_opener(NETWORK_MODE)
+                remaining = deadline - time.monotonic() if deadline is not None else timeout
+                if remaining <= 0:
+                    raise TimeoutError("deadline exceeded")
+                with opener.open(req, timeout=min(timeout, remaining)) as resp:
+                    data = resp.read().decode("utf-8", errors="replace")
+                result = json.loads(data)
+                _mark_host_ok(url)
+                return result
+            _mark_host_failed(url)
+            raise NetworkUnavailable(url, errors)
         except NetworkUnavailable:
             pass
         except Exception as exc:  # network providers are not fully stable
@@ -1177,32 +1228,17 @@ def collect_announcement_titles(obj: Any) -> List[str]:
     return deduped
 
 
-def _announcement_container(value: Any) -> tuple[list[Any], Dict[str, Any]] | None:
-    """Find the provider list and its pagination metadata."""
-    if isinstance(value, list):
-        return value, {}
-    if not isinstance(value, dict):
-        return None
-    for key in ("rows", "list", "announcements"):
-        if key in value and isinstance(value[key], list):
-            return value[key], value
-    for key in ("data", "result"):
-        if key in value:
-            found = _announcement_container(value[key])
-            if found is not None:
-                rows, container = found
-                # A nested result inherits the outer business envelope and
-                # total fields when the provider puts them beside `data`.
-                merged = dict(value)
-                merged.update(container)
-                return rows, merged
-    return None
+def _announcement_container(value: Any) -> tuple[list[Any], list[Any]] | None:
+    """Find rows while retaining the original metadata at every envelope level."""
+    return extract_primary_announcement_container(value)
 
 
 def _announcement_business_failure(value: Any) -> str | None:
     """Reject an error envelope at any data/result nesting level."""
     if not isinstance(value, dict):
         return None
+    if "error" in value and value.get("error") not in (None, "", False, 0):
+        return f"error={value.get('error')!r}"
     if "success" in value and value.get("success") not in (True, 1, "1", "true", "True", "ok", "OK"):
         return f"success={value.get('success')!r}"
     if "code" in value and value.get("code") not in (None, "", 0, "0", 200, "200"):
@@ -1240,12 +1276,30 @@ def _announcement_row_title(row: Any) -> str:
     return ""
 
 
+def _announcement_total(metadata_layers: Any) -> Any:
+    """Read only fields that mean total matches; ``count`` is page-local."""
+    if isinstance(metadata_layers, dict):
+        metadata_layers = [metadata_layers]
+    return extract_primary_announcement_total(metadata_layers or [])
+
+
+def _announcement_total_from_response(data: Any) -> Any:
+    if isinstance(data, dict):
+        found = _announcement_container(data)
+        return _announcement_total(found[1] if found is not None else [data])
+    return None
+
+
+def _validate_announcement_page_count(rows: List[Any], total: Any, page_size: int) -> None:
+    metadata = [] if total in (None, "") else [{"_provider_total": total}]
+    validate_primary_announcement_page(rows, metadata, page_size)
+
+
 def _validate_primary_announcement_response(data: Any, *, code: str, page_size: int) -> list[dict[str, Any]]:
     """Validate Eastmoney's business envelope before title extraction."""
     if isinstance(data, list):
         rows = data
-        total = None
-        container: Dict[str, Any] = {}
+        metadata_layers: list[Any] = []
     else:
         if not isinstance(data, dict):
             raise RuntimeError("东财公告响应不是对象")
@@ -1255,16 +1309,8 @@ def _validate_primary_announcement_response(data: Any, *, code: str, page_size: 
         found = _announcement_container(data)
         if found is None:
             raise RuntimeError("东财公告响应缺少公告列表容器")
-        rows, container = found
-        total = next((container.get(key) for key in ("total", "totalCount", "totalAnnouncement", "count") if container.get(key) is not None), None)
-    if total is not None:
-        try:
-            total_int = int(total)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"东财公告 total 不是非负整数: {total!r}") from exc
-        expected = min(total_int, max(1, int(page_size)))
-        if total_int < 0 or len(rows) != expected:
-            raise RuntimeError(f"东财公告页不完整: total={total_int}, page_size={page_size}, rows={len(rows)}")
+        rows, metadata_layers = found
+    validate_primary_announcement_page(rows, metadata_layers, page_size)
     normalized: list[dict[str, Any]] = []
     for row in rows:
         title = _announcement_row_title(row)
@@ -1302,7 +1348,7 @@ def fetch_announcements(code: str, page_size: int = 8) -> List[str]:
         return {
             "rows": rows[:page_size],
             "source_url": ANNOUNCEMENT_URL,
-            "_provider_total": next((data.get(key) for key in ("total", "totalCount", "totalAnnouncement", "count") if isinstance(data, dict) and data.get(key) is not None), None),
+            "_provider_total": _announcement_total_from_response(data),
             "_requested_page_size": page_size,
         }
 

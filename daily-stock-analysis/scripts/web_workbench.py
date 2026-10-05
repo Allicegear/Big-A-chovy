@@ -811,28 +811,37 @@ def main() -> int:
               f" web_workbench.py --port {args.port + 1}", file=sys.stderr)
         return 1
 
-    if args.no_dashboard_refresh:
-        print("[workbench] dashboard auto-refresh disabled (--no-dashboard-refresh)", file=sys.stderr)
-    else:
-        dash.scheduler.start()  # 看板自动刷新（交易时段内每 interval 秒一轮）
-    url = f"http://localhost:{args.port}"
-    print(f"[workbench] server running at {url}")
-    print(f"[workbench] 工作台: {url}/workbench   实时看板: {url}/")
-    print(f"[workbench] trading hours: {dash.is_trading_hours()}")
-    print("[workbench] press Ctrl+C to stop")
-
-    if not args.no_browser:
-        try:
-            webbrowser.open(f"{url}/workbench")
-        except Exception:
-            pass
-
+    # 定时自动关闭通过 dash._server 请求服务退出，必须先接好引用再启动调度器。
+    dash._attach_server(server)
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n[workbench] shutting down...")
-        dash.scheduler._archive_markdown()
-        server.shutdown()
+        if args.no_dashboard_refresh:
+            print("[workbench] dashboard auto-refresh disabled (--no-dashboard-refresh)", file=sys.stderr)
+        else:
+            dash.scheduler.start()  # 看板自动刷新（交易时段内每 interval 秒一轮）
+        url = f"http://localhost:{server.server_address[1]}"
+        print(f"[workbench] server running at {url}")
+        print(f"[workbench] 工作台: {url}/workbench   实时看板: {url}/")
+        print(f"[workbench] trading hours: {dash.is_trading_hours()}")
+        print("[workbench] press Ctrl+C to stop")
+
+        if not args.no_browser:
+            try:
+                webbrowser.open(f"{url}/workbench")
+            except Exception:
+                pass
+
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\n[workbench] shutting down...")
+            dash.scheduler._archive_markdown()
+            # serve_forever 已因 Ctrl+C 退出；不要在同一线程调用 shutdown()。
+    finally:
+        dash.scheduler.stop()
+        try:
+            server.server_close()
+        finally:
+            dash._detach_server(server)
     return 0
 
 

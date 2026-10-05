@@ -29,6 +29,20 @@ def normalize_code(code: str) -> str:
         return f"sh{code_clean}"
     return f"sz{code_clean}"
 
+
+def _quote_number(parts: List[str], index: int) -> float:
+    """Read one optional numeric Tencent field without shifting its sibling."""
+    if index >= len(parts):
+        return 0.0
+    value = parts[index].strip().strip('"')
+    if not value:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def fetch_realtime_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """批量查询实时行情与五档买卖盘口"""
     symbols = [normalize_code(c) for c in codes]
@@ -89,8 +103,9 @@ def fetch_realtime_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
             "time": time_str,
             "buy_orders": buy_orders,
             "sell_orders": sell_orders,
-            "zt": float(parts[48]) if len(parts) > 48 and parts[48] else 0.0,
-            "dt": float(parts[47]) if len(parts) > 47 and parts[47] else 0.0,
+            # 腾讯行情零基字段：47 为涨停价，48 为跌停价。
+            "zt": _quote_number(parts, 47),
+            "dt": _quote_number(parts, 48),
         }
 
     return results

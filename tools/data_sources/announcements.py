@@ -12,6 +12,15 @@ from tools.rule_config import RULE_CONFIG
 
 ANNOUNCEMENT_SOURCE = "announcement_evidence"
 
+# These aliases all describe the total number of matching records, regardless
+# of where an API places them in its response envelope. ``count`` describes
+# the number of rows in the returned page and is validated separately.
+_ANNOUNCEMENT_TOTAL_FIELDS = (
+    "_provider_total", "total", "total_hits", "totalHits", "totalCount",
+    "total_count", "totalAnnouncement",
+)
+_ANNOUNCEMENT_PAGE_ROW_COUNT_FIELDS = ("count", "row_count", "rowCount")
+
 
 def _announcement_config() -> dict[str, list[str]]:
     """Read the single announcement policy owned by ``rule_config``."""
@@ -64,6 +73,8 @@ def classify_announcement_risk(titles: Iterable[str]) -> dict[str, Any]:
 
 def _business_failure(payload: Mapping[str, Any]) -> str | None:
     """Find business-error envelopes before accepting an empty list."""
+    if "error" in payload and payload.get("error") not in (None, "", False, 0):
+        return f"业务 error={payload.get('error')!r}"
     if "success" in payload:
         success = payload.get("success")
         if success not in (True, 1, "1", "true", "True", "ok", "OK"):
@@ -79,6 +90,83 @@ def _business_failure(payload: Mapping[str, Any]) -> str | None:
             if failure:
                 return failure
     return None
+
+
+def extract_primary_announcement_container(
+    value: Any,
+) -> tuple[list[Any], list[Mapping[str, Any]]] | None:
+    """Return announcement rows and every original envelope layer.
+
+    Keeping the individual mappings is important: flattening nested payloads
+    with ``dict.update`` discards contradictory outer totals when an inner
+    object repeats a field name.
+    """
+    if isinstance(value, list):
+        return value, []
+    if not isinstance(value, Mapping):
+        return None
+    for key in ("rows", "list", "announcements"):
+        rows = value.get(key)
+        if isinstance(rows, list):
+            return rows, [value]
+    for key in ("data", "result"):
+        if key not in value:
+            continue
+        found = extract_primary_announcement_container(value[key])
+        if found is not None:
+            rows, layers = found
+            return rows, [value, *layers]
+    return None
+
+
+def _non_negative_integer(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"公告 {field} 不是非负整数: {value!r}")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        parsed = int(value.strip())
+    else:
+        raise ValueError(f"公告 {field} 不是非负整数: {value!r}")
+    if parsed < 0:
+        raise ValueError(f"公告 {field} 为负数: {parsed}")
+    return parsed
+
+
+def extract_primary_announcement_total(metadata_layers: Iterable[Mapping[str, Any]]) -> int | None:
+    """Validate and return the consistent total across same-meaning fields."""
+    totals: list[tuple[str, int]] = []
+    for layer_index, layer in enumerate(metadata_layers):
+        for field in _ANNOUNCEMENT_TOTAL_FIELDS:
+            if field not in layer or layer.get(field) in (None, ""):
+                continue
+            totals.append((f"layer[{layer_index}].{field}", _non_negative_integer(layer[field], field=field)))
+    if not totals:
+        return None
+    values = {value for _field, value in totals}
+    if len(values) != 1:
+        detail = ", ".join(f"{field}={value}" for field, value in totals)
+        raise ValueError(f"公告总量字段冲突: {detail}")
+    return totals[0][1]
+
+
+def validate_primary_announcement_page(
+    rows: list[Any], metadata_layers: Iterable[Mapping[str, Any]], page_size: int,
+) -> int | None:
+    """Validate total-count evidence and any explicit page-row count."""
+    layers = list(metadata_layers)
+    total = extract_primary_announcement_total(layers)
+    for layer_index, layer in enumerate(layers):
+        for field in _ANNOUNCEMENT_PAGE_ROW_COUNT_FIELDS:
+            if field not in layer or layer.get(field) in (None, ""):
+                continue
+            page_count = _non_negative_integer(layer[field], field=field)
+            if page_count != len(rows):
+                raise ValueError(
+                    f"公告页内数量不匹配: layer[{layer_index}].{field}={page_count}, rows={len(rows)}"
+                )
+    _validate_page_count(rows, total, page_size)
+    return total
 
 
 def _validate_row_shape(rows: list[Any], *, code: str | None = None) -> list[dict[str, Any]]:
@@ -111,9 +199,18 @@ def _validate_row_shape(rows: list[Any], *, code: str | None = None) -> list[dic
 
 def _validate_page_count(rows: list[Any], total: Any, page_size: int) -> None:
     if total in (None, ""):
+        if not rows:
+            raise ValueError("公告空页缺少明确的 total=0")
         return
+    if isinstance(total, bool):
+        raise ValueError(f"公告 total 不是非负整数: {total!r}")
     try:
-        total_int = int(total)
+        if isinstance(total, int):
+            total_int = total
+        elif isinstance(total, str) and total.strip().isdecimal():
+            total_int = int(total.strip())
+        else:
+            raise ValueError(f"公告 total 不是非负整数: {total!r}")
     except (TypeError, ValueError) as exc:
         raise ValueError(f"公告 total 不是非负整数: {total!r}") from exc
     if total_int < 0:
@@ -123,27 +220,12 @@ def _validate_page_count(rows: list[Any], total: Any, page_size: int) -> None:
         raise ValueError(f"公告页不完整: total={total_int}, page_size={page_size}, rows={len(rows)}")
 
 
-def _primary_container(value: Any) -> tuple[list[Any], Mapping[str, Any]] | None:
-    """Extract rows from either a normalized result or provider nesting."""
-    if isinstance(value, list):
-        return value, {}
-    if not isinstance(value, Mapping):
-        return None
-    for key in ("rows", "list", "announcements"):
-        if isinstance(value.get(key), list):
-            return value[key], value
-    for key in ("data", "result"):
-        nested = value.get(key)
-        found = _primary_container(nested)
-        if found is not None:
-            rows, metadata = found
-            merged = dict(value)
-            merged.update(metadata)
-            return rows, merged
-    return None
+def _primary_container(value: Any) -> tuple[list[Any], list[Mapping[str, Any]]] | None:
+    """Compatibility name for the shared, non-flattening container extractor."""
+    return extract_primary_announcement_container(value)
 
 
-def _primary_rows(value: Any) -> tuple[list[dict[str, Any]], str]:
+def _primary_rows(value: Any, *, page_size: int = 30) -> tuple[list[dict[str, Any]], str]:
     if isinstance(value, Result):
         if value.status in {ResultStatus.OK.value, ResultStatus.EMPTY.value} and isinstance(value.data, list):
             return _validate_row_shape(value.data), value.source_url
@@ -155,12 +237,14 @@ def _primary_rows(value: Any) -> tuple[list[dict[str, Any]], str]:
         found = _primary_container(value)
         if found is None:
             raise ValueError("主公告源缺少公告列表")
-        rows, metadata = found
-        total = next((metadata.get(key) for key in ("_provider_total", "total", "totalCount", "totalAnnouncement", "count") if metadata.get(key) is not None), None)
-        page_size = int(metadata.get("_requested_page_size") or metadata.get("page_size") or 30)
-        _validate_page_count(rows, total, page_size)
-        return _validate_row_shape(rows), str(value.get("source_url") or metadata.get("source_url") or "")
+        rows, metadata_layers = found
+        validate_primary_announcement_page(rows, metadata_layers, page_size)
+        source_url = str(value.get("source_url") or next(
+            (layer.get("source_url") for layer in metadata_layers if layer.get("source_url")), ""
+        ))
+        return _validate_row_shape(rows), source_url
     if isinstance(value, list):
+        validate_primary_announcement_page(value, [], page_size)
         return _validate_row_shape(value), ""
     raise ValueError("主公告源返回结构异常")
 
@@ -177,7 +261,7 @@ def fetch_announcement_evidence(
     primary_error: str | None = None
     if primary is not None:
         try:
-            rows, source_url = _primary_rows(primary())
+            rows, source_url = _primary_rows(primary(), page_size=page_size)
             normalized = []
             for row in rows:
                 title = str(row.get("title") or row.get("announcementTitle") or "").strip()
