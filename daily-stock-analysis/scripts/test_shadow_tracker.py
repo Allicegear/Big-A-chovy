@@ -1,11 +1,13 @@
 import contextlib
 import io
 import json
+import multiprocessing
 import unittest
 import os
 import sys
 import tempfile
 import shutil
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -13,7 +15,9 @@ from unittest.mock import patch
 TOOLS_DIR = Path(__file__).resolve().parent.parent.parent / "tools"
 sys.path.insert(0, str(TOOLS_DIR))
 
-import shadow_tracker as tracker
+import tools.shadow_tracker as tracker
+sys.modules["shadow_tracker"] = tracker
+import detect_divergence_leader as divergence
 from shadow_tracker import (
     collect_samples_from_report,
     fetch_t1_day_kline_extremes,
@@ -32,17 +36,71 @@ from tools.rule_config import is_complete_shadow_result, shadow_targets
 from tools.validate_consistency import check_shadow_database
 
 
+class _ThreadOnlyFileLock:
+    """Permit synthetic single-process tests without claiming process safety."""
+    LOCK_EX = 1
+    LOCK_UN = 2
+
+    @staticmethod
+    def flock(_fd, _operation):
+        return None
+
+
+def _shadow_process_scan(shadow_dir, reports_dir, date_str, simulate_no_fcntl, barrier, output_queue):
+    """Independent-process worker; inputs are synthetic reports in a temp directory."""
+    os.environ["A_SHARE_SHADOW_DATA_DIR"] = shadow_dir
+    process_tracker = tracker
+    process_tracker.SHADOW_DATA_DIR = Path(shadow_dir)
+    process_tracker.SHADOW_DB_FILE = process_tracker.SHADOW_DATA_DIR / "shadow_samples.json"
+    if simulate_no_fcntl:
+        process_tracker.fcntl = None
+        try:
+            with process_tracker._database_lock():
+                pass
+        except process_tracker.ShadowDatabaseError as exc:
+            output_queue.put(("refused", str(exc)))
+            return
+
+        # On the old implementation, both processes read the same empty snapshot
+        # before either can replace the database. This makes the lost-update
+        # regression deterministic instead of relying on scheduler timing.
+        original_init_db = process_tracker.init_db
+
+        def synchronized_init_db():
+            db = original_init_db()
+            barrier.wait(timeout=20)
+            return db
+
+        process_tracker.init_db = synchronized_init_db
+
+    process_tracker.update_all_t1_metrics = lambda *_args, **_kwargs: None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            process_tracker.scan_and_update(date_str, reports_dir=reports_dir)
+    except BaseException as exc:
+        output_queue.put(("error", repr(exc)))
+    else:
+        output_queue.put(("ok", ""))
+
+
 class ShadowTrackerTests(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self.old_shadow_dir = tracker.SHADOW_DATA_DIR
         self.old_shadow_file = tracker.SHADOW_DB_FILE
+        self.old_fcntl = tracker.fcntl
+        if tracker.fcntl is None:
+            # Existing unit cases use only one process; cross-process safety is
+            # tested separately and production still refuses writes without a
+            # genuine lock implementation.
+            tracker.fcntl = _ThreadOnlyFileLock
         tracker.SHADOW_DATA_DIR = Path(self.test_dir) / "shadow_data"
         tracker.SHADOW_DB_FILE = tracker.SHADOW_DATA_DIR / "shadow_samples.json"
 
     def tearDown(self):
         tracker.SHADOW_DATA_DIR = self.old_shadow_dir
         tracker.SHADOW_DB_FILE = self.old_shadow_file
+        tracker.fcntl = self.old_fcntl
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def _write_coalition_report(self, date_str, time_str, codes, *, folder=None, reordered=False):
@@ -374,6 +432,136 @@ class ShadowTrackerTests(unittest.TestCase):
                     future.result(timeout=10)
         db = init_db()
         self.assertEqual({row["code"] for row in db["samples"]["coalition"]}, {"600001", "600002"})
+
+    def _divergence_trigger(self, code="000012", date="20260821"):
+        return {
+            "code": code, "name": f"合成{code}", "date": date,
+            "trigger_time": "09:35", "trigger_price": 10.0, "plate": "测试板块",
+            "mainp": 6.0, "xl": 2500.0, "pull": 1.2, "scenario": "A",
+        }
+
+    def test_scan_and_divergence_record_interleave_preserves_both_categories(self):
+        self._write_coalition_report("20260821", "1000", ["000011"], folder=self.test_dir)
+        snapshot_taken = threading.Event()
+        scan_finished = threading.Event()
+        original_init_db = tracker.init_db
+
+        def pause_after_stale_snapshot():
+            db = original_init_db()
+            snapshot_taken.set()
+            if not scan_finished.wait(10):
+                raise TimeoutError("synthetic interleave did not release divergence record")
+            return db
+
+        errors = []
+
+        def record_divergence():
+            try:
+                divergence.record([self._divergence_trigger()])
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=record_divergence)
+        with patch.object(divergence, "init_db", side_effect=pause_after_stale_snapshot, create=True):
+            worker.start()
+            # The legacy implementation reads outside the write lock and pauses
+            # here. The transactional implementation does not use that entrypoint
+            # and may commit first; either serialized order must retain both rows.
+            snapshot_taken.wait(1.0)
+            with patch.object(tracker, "update_all_t1_metrics"), contextlib.redirect_stdout(io.StringIO()):
+                scan_and_update("20260821", reports_dir=self.test_dir)
+            scan_finished.set()
+            worker.join(timeout=10)
+
+        self.assertFalse(worker.is_alive(), "divergence writer did not finish")
+        self.assertEqual(errors, [])
+        db = init_db()
+        self.assertEqual({row["code"] for row in db["samples"]["coalition"]}, {"000011"})
+        self.assertEqual({row["code"] for row in db["samples"]["divergence"]}, {"000012"})
+
+    def test_divergence_record_is_idempotent_and_preserves_other_categories(self):
+        db = init_db()
+        db["targets"]["custom_external"] = {"name": "外部自定义机制", "target_samples": 7}
+        db["samples"]["custom_external"] = [{"id": "C-1", "code": "000088", "date": "20260820", "first_touch": "retain"}]
+        db["samples"]["coalition"].append({"id": "COAL-1", "code": "000077", "date": "20260820", "first_touch": "retain", "t1_result": None})
+        save_db(db)
+
+        trigger = self._divergence_trigger()
+        with contextlib.redirect_stdout(io.StringIO()):
+            divergence.record([trigger])
+            divergence.record([trigger])
+
+        updated = init_db()
+        self.assertEqual(len(updated["samples"]["divergence"]), 1)
+        self.assertEqual(updated["samples"]["divergence"][0]["code"], "000012")
+        self.assertEqual(updated["samples"]["coalition"][0]["first_touch"], "retain")
+        self.assertEqual(updated["samples"]["custom_external"][0]["first_touch"], "retain")
+        self.assertEqual(updated["targets"]["custom_external"], {"name": "外部自定义机制", "target_samples": 7})
+
+    def test_save_db_rejects_stale_snapshot_without_replacing_newer_history(self):
+        original = init_db()
+        save_db(original)
+        stale = init_db()
+
+        current = init_db()
+        current["targets"]["custom_external"] = {"name": "外部自定义机制", "target_samples": 7}
+        current["samples"]["custom_external"] = [{"id": "C-1", "code": "000088", "date": "20260820", "first_touch": "retain"}]
+        save_db(current)
+
+        stale["samples"]["divergence"].append({"id": "DIV-OLD", "code": "000012", "date": "20260821", "t1_result": None})
+        with self.assertRaises(tracker.ShadowDatabaseConflict):
+            save_db(stale)
+        after = init_db()
+        self.assertEqual(after["samples"]["custom_external"], current["samples"]["custom_external"])
+        self.assertEqual(after["targets"]["custom_external"], current["targets"]["custom_external"])
+        self.assertEqual(after["samples"]["divergence"], [])
+
+    def _run_process_scans(self, *, simulate_no_fcntl):
+        self._write_coalition_report("20260821", "1000", ["000011"], folder=self.test_dir)
+        self._write_coalition_report("20260824", "1000", ["000012"], folder=self.test_dir)
+        context = multiprocessing.get_context("spawn")
+        output_queue = context.Queue()
+        barrier = context.Barrier(2) if simulate_no_fcntl else None
+        processes = [
+            context.Process(
+                target=_shadow_process_scan,
+                args=(str(tracker.SHADOW_DATA_DIR), self.test_dir, date_str, simulate_no_fcntl, barrier, output_queue),
+            )
+            for date_str in ("20260821", "20260824")
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=30)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                self.fail("shadow scan subprocess did not exit")
+        outcomes = [output_queue.get(timeout=5) for _ in processes]
+        self.assertEqual([process.exitcode for process in processes], [0, 0])
+        output_queue.close()
+        output_queue.join_thread()
+        return outcomes
+
+    @unittest.skipIf(tracker.fcntl is None, "platform has no real cross-process lock")
+    def test_independent_process_scans_preserve_both_dates(self):
+        outcomes = self._run_process_scans(simulate_no_fcntl=False)
+        self.assertEqual(outcomes, [("ok", ""), ("ok", "")])
+        db = init_db()
+        self.assertEqual({row["code"] for row in db["samples"]["coalition"]}, {"000011", "000012"})
+
+    def test_no_fcntl_processes_refuse_unsafe_writes_instead_of_losing_history(self):
+        outcomes = self._run_process_scans(simulate_no_fcntl=True)
+        if all(kind == "refused" for kind, _detail in outcomes):
+            self.assertTrue(all("跨进程" in detail or "拒绝" in detail for _, detail in outcomes))
+            self.assertFalse(tracker.SHADOW_DB_FILE.exists())
+            return
+
+        # Implementations with another genuine cross-process primitive may
+        # continue; silent success with only one date is never acceptable.
+        self.assertEqual(outcomes, [("ok", ""), ("ok", "")])
+        db = init_db()
+        self.assertEqual({row["code"] for row in db["samples"]["coalition"]}, {"000011", "000012"})
 
     def test_malformed_database_and_atomic_write_failure_preserve_existing_file(self):
         tracker.SHADOW_DATA_DIR.mkdir(parents=True, exist_ok=True)

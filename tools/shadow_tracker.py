@@ -27,14 +27,15 @@ import copy
 import tempfile
 import threading
 import uuid
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Callable, Dict, List, Any, Optional, Tuple
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - Windows fallback keeps thread safety
+except ImportError:  # pragma: no cover - writes are explicitly refused below
     fcntl = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -69,6 +70,10 @@ _DB_THREAD_LOCK = threading.RLock()
 
 class ShadowDatabaseError(ValueError):
     """The on-disk shadow database is malformed and must not be overwritten."""
+
+
+class ShadowDatabaseConflict(ShadowDatabaseError):
+    """A stale whole-database snapshot would remove or overwrite newer data."""
 
 
 def _empty_db() -> Dict[str, Any]:
@@ -113,18 +118,20 @@ def _validate_db(db: Any) -> Dict[str, Any]:
 
 @contextmanager
 def _database_lock():
-    """Serialize read/merge/write across threads and (on Unix) processes."""
+    """Serialize a complete database transaction across threads and processes."""
+    if fcntl is None:
+        raise ShadowDatabaseError(
+            "当前平台没有可用的跨进程文件锁，拒绝写入影子样本库以避免并发丢失历史"
+        )
     SHADOW_DATA_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = SHADOW_DB_FILE.with_name(f".{SHADOW_DB_FILE.name}.lock")
     with _DB_THREAD_LOCK:
         with lock_path.open("a+") as handle:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 yield
             finally:
-                if fcntl is not None:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _atomic_save_db(db: Dict[str, Any]) -> None:
@@ -171,10 +178,72 @@ def init_db() -> Dict[str, Any]:
     return _empty_db()
 
 
-def save_db(db: Dict[str, Any]) -> None:
-    """持久化保存影子样本数据库。"""
+def _snapshot_signature(row: Dict[str, Any]) -> str:
+    return json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _assert_snapshot_preserves_current(current: Dict[str, Any], candidate: Dict[str, Any]) -> None:
+    """Reject stale whole-file snapshots that omit or alter committed data."""
+    for key, value in current.items():
+        if key == "last_updated":
+            continue
+        if key not in candidate or candidate[key] != value:
+            if key in {"targets", "samples"}:
+                continue
+            raise ShadowDatabaseConflict(f"旧快照缺少或改写了数据库字段 {key!r}，拒绝覆盖")
+
+    current_targets = current.get("targets") or {}
+    candidate_targets = candidate.get("targets") or {}
+    for category, metadata in current_targets.items():
+        if candidate_targets.get(category) != metadata:
+            raise ShadowDatabaseConflict(
+                f"旧快照未保留较新的目标配置 {category!r}，拒绝覆盖"
+            )
+
+    current_samples = current.get("samples") or {}
+    candidate_samples = candidate.get("samples") or {}
+    for category, current_rows in current_samples.items():
+        proposed_rows = candidate_samples.get(category)
+        if proposed_rows is None:
+            raise ShadowDatabaseConflict(f"旧快照缺少类别 {category!r}，拒绝覆盖")
+        required = Counter(_snapshot_signature(row) for row in current_rows)
+        proposed = Counter(_snapshot_signature(row) for row in proposed_rows)
+        if required - proposed:
+            raise ShadowDatabaseConflict(
+                f"旧快照会删除或改写 {category!r} 类中已提交的样本，拒绝覆盖"
+            )
+
+
+def mutate_db(mutator: Callable[[Dict[str, Any]], Any]) -> Tuple[Any, Dict[str, Any]]:
+    """Run read → mutate → validate → atomic commit under one process lock.
+
+    The callback receives the latest database snapshot while the interprocess
+    lock is held and must mutate it in place. The result and committed snapshot
+    are returned after the lock-protected write succeeds.
+    """
     with _database_lock():
-        _atomic_save_db(db)
+        db = init_db()
+        result = mutator(db)
+        validated = _validate_db(db)
+        _atomic_save_db(validated)
+        return result, copy.deepcopy(validated)
+
+
+def save_db(db: Dict[str, Any]) -> None:
+    """Save a snapshot only if it still contains every currently committed value.
+
+    New rows and targets can be added for compatibility with existing callers,
+    but a snapshot that predates another write is rejected instead of replacing
+    the newer database. Concurrent production writers should use ``mutate_db``.
+    """
+    candidate = _validate_db(db)
+
+    def commit_snapshot(current: Dict[str, Any]) -> None:
+        _assert_snapshot_preserves_current(current, candidate)
+        current.clear()
+        current.update(copy.deepcopy(candidate))
+
+    mutate_db(commit_snapshot)
 
 
 def parse_val(val_str: Any) -> float:
@@ -697,11 +766,8 @@ def scan_and_update(date_str: Optional[str] = None, reports_dir: Optional[str] =
         raise ValueError("--date 必须为 YYYYMMDD")
     reports_dir = reports_dir or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "筛选结果"))
 
-    total_added = 0
-    # Hold the same interprocess lock for the entire load → merge → settle → replace
-    # transaction, so concurrent scans cannot overwrite each other's additions.
-    with _database_lock():
-        db = init_db()
+    def merge_scan(db: Dict[str, Any]) -> int:
+        total_added = 0
         files = _all_report_files(reports_dir)
         if date_str is not None:
             files = [
@@ -712,7 +778,10 @@ def scan_and_update(date_str: Optional[str] = None, reports_dir: Optional[str] =
         for report_path in files:
             total_added += collect_samples_from_report(report_path, db)
         update_all_t1_metrics(db, reports_dir=reports_dir)
-        _atomic_save_db(db)
+        return total_added
+
+    # The shared transaction owns the lock before loading the latest snapshot.
+    total_added, db = mutate_db(merge_scan)
 
     print(f"=== 影子系统扫描完成：新增 {total_added} 个样本，当前总样本库状态已更新 ===")
     print(generate_report(db))
