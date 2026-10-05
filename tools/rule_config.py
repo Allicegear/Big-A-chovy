@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from math import isfinite
+import re
 from typing import Any, Dict
 
 
@@ -487,6 +488,17 @@ def is_complete_shadow_result(result: Any) -> bool:
     if result.get("extremes_complete") is not True:
         return False
     if result.get("source") != RULE_CONFIG["shadow"]["required_complete_source"]:
+        return False
+    try:
+        expected_time = normalize_hhmm(RULE_CONFIG["execution"]["t1_exit_window"]["target"])
+        recorded_time = normalize_hhmm(result.get("target_time"))
+    except (TypeError, ValueError):
+        return False
+    if recorded_time != expected_time or result.get("target_snapshot_found") is not True:
+        return False
+    if not re.fullmatch(r"\d{8}", str(result.get("t1_date") or "")):
+        return False
+    if result.get("t1_date_verified") is not True:
         return False
 
     numeric_fields = (
