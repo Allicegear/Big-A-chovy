@@ -356,12 +356,27 @@ WATCH_ANNOUNCEMENT_KEYWORDS = list(ANNOUNCEMENT_CONFIG["watch_keywords"])
 ANNOUNCEMENT_IGNORE_KEYWORDS = list(ANNOUNCEMENT_CONFIG["ignore_keywords"])
 
 
-def fetch_json(url: str, params: Dict[str, Any], timeout: int = 6, retries: int = 0) -> Any:
+def fetch_json(
+    url: str,
+    params: Dict[str, Any],
+    timeout: int = 6,
+    retries: int = 0,
+    *,
+    deadline: float | None = None,
+) -> Any:
     errors: Dict[str, str] = {}
+    independent_host = "sina.com.cn" in url
     if NETWORK_MODE == "direct":
         sessions = [("直连", REQUESTS_DIRECT_SESSION)]
     elif NETWORK_MODE == "proxy":
         sessions = [("系统代理", REQUESTS_SESSION)]
+    elif independent_host:
+        # 东财探测失败只说明东财不可用，不能因此把所有候选路径都从新浪
+        # 备用源的探测/实际抓取中排除。
+        sessions = network_path.ordered_independent_sessions(
+            REQUESTS_DIRECT_SESSION,
+            deadline=deadline,
+        )
     else:
         # auto：实测所有路径（直连+各候选代理端口）延迟，最快优先，不依赖系统代理设置
         sessions = network_path.ordered_sessions(REQUESTS_DIRECT_SESSION)
@@ -376,8 +391,12 @@ def fetch_json(url: str, params: Dict[str, Any], timeout: int = 6, retries: int 
                     "Accept-Language": "zh-CN,zh;q=0.9",
                 }
                 for label, session in sessions:
+                    remaining = deadline - time.monotonic() if deadline is not None else timeout
+                    if remaining <= 0:
+                        errors[label] = "deadline exceeded"
+                        break
                     try:
-                        resp = session.get(url, params=params, headers=headers, timeout=timeout,
+                        resp = session.get(url, params=params, headers=headers, timeout=min(timeout, remaining),
                                            verify=tls_context.requests_verify())
                         resp.raise_for_status()
                         _mark_host_ok(url)
@@ -394,11 +413,40 @@ def fetch_json(url: str, params: Dict[str, Any], timeout: int = 6, retries: int 
                 _mark_host_failed(url)
                 raise NetworkUnavailable(url, errors)
             query = urllib.parse.urlencode(params)
-            req = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": UA})
-            opener = build_url_opener(NETWORK_MODE)
-            with opener.open(req, timeout=timeout) as resp:
-                data = resp.read().decode("utf-8", errors="replace")
-            return json.loads(data)
+            request_url = f"{url}?{query}"
+            req = urllib.request.Request(request_url, headers={"User-Agent": UA})
+            if independent_host and NETWORK_MODE == "auto":
+                paths = network_path.independent_path_candidates(deadline=deadline)
+                for label, proxy in paths:
+                    remaining = deadline - time.monotonic() if deadline is not None else timeout
+                    if remaining <= 0:
+                        errors[label] = "deadline exceeded"
+                        break
+                    handlers = [urllib.request.HTTPSHandler(context=SSL_CONTEXT)]
+                    handlers.append(urllib.request.ProxyHandler(
+                        {"http": proxy, "https": proxy} if proxy else {}
+                    ))
+                    opener = urllib.request.build_opener(*handlers)
+                    try:
+                        with opener.open(req, timeout=min(timeout, remaining)) as resp:
+                            data = resp.read().decode("utf-8", errors="replace")
+                        result = json.loads(data)
+                        _mark_host_ok(url)
+                        return result
+                    except Exception as exc:
+                        errors[label] = f"{type(exc).__name__}: {' '.join(str(exc).split())[:220]}"
+            else:
+                opener = build_url_opener(NETWORK_MODE)
+                remaining = deadline - time.monotonic() if deadline is not None else timeout
+                if remaining <= 0:
+                    raise TimeoutError("deadline exceeded")
+                with opener.open(req, timeout=min(timeout, remaining)) as resp:
+                    data = resp.read().decode("utf-8", errors="replace")
+                result = json.loads(data)
+                _mark_host_ok(url)
+                return result
+            _mark_host_failed(url)
+            raise NetworkUnavailable(url, errors)
         except NetworkUnavailable:
             pass
         except Exception as exc:  # network providers are not fully stable

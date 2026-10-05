@@ -181,6 +181,87 @@ class DashboardTimeoutTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertFalse(self.staged.exists(), "降级快照不得提交状态（不得清空上一份有效状态）")
 
+    def test_sina_probe_allows_engine_but_degraded_result_preserves_snapshot(self):
+        previous = dict(VALID_PREV)
+        sched = _bare_scheduler(latest=previous)
+
+        def fake_engine(**kwargs):
+            kwargs["state_commit"].stage(
+                self.staged,
+                lambda: state_commit.atomic_write_text(self.staged, "DEGRADED"),
+            )
+            return {
+                "meta": {
+                    "timestamp": "2026-10-05 10:30:00",
+                    "market_fetch_complete": False,
+                    "market_data_degraded": True,
+                },
+                "strict_ultra": [],
+            }
+
+        with mock.patch.object(dash.network_path, "has_working_path", return_value=False), \
+             mock.patch.object(dash, "_sina_reachable", return_value=True), \
+             mock.patch.object(dash, "_inject_proxy_to_session"), \
+             mock.patch.object(dash, "is_trading_hours", return_value=False), \
+             mock.patch.object(dash, "SCREENING_TIMEOUT", 0.5), \
+             mock.patch.object(sched, "_save_markdown"), \
+             mock.patch.object(sched, "_save_last_valid"), \
+             mock.patch.object(realtime_engine, "run_screening", side_effect=fake_engine) as engine:
+            ok = sched.run_screening()
+
+        self.assertTrue(ok)
+        engine.assert_called_once()
+        self.assertIs(sched.latest_result, previous)
+        self.assertTrue(sched.preserve_snapshot)
+        self.assertFalse(sched.proxy_unavailable, "Sina probe succeeded; do not report all providers unavailable")
+        self.assertFalse(self.staged.exists(), "fallback/degraded data cannot advance committed state")
+
+    def test_dual_provider_failure_preserves_snapshot_and_skips_engine(self):
+        previous = dict(VALID_PREV)
+        sched = _bare_scheduler(latest=previous)
+        with mock.patch.object(dash.network_path, "has_working_path", return_value=False), \
+             mock.patch.object(dash, "_sina_reachable", return_value=False), \
+             mock.patch.object(realtime_engine, "run_screening") as engine:
+            ok = sched.run_screening()
+
+        self.assertTrue(ok)
+        engine.assert_not_called()
+        self.assertIs(sched.latest_result, previous)
+        self.assertTrue(sched.preserve_snapshot)
+        self.assertTrue(sched.proxy_unavailable)
+
+    def test_sina_probe_success_does_not_allow_late_commit_after_timeout(self):
+        sched = _bare_scheduler(latest=dict(VALID_PREV))
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def fake_engine(**kwargs):
+            commit = kwargs["state_commit"]
+            commit.stage(self.staged, lambda: state_commit.atomic_write_text(self.staged, "LATE"))
+            entered.set()
+            release.wait(timeout=2)
+            commit.commit()
+            finished.set()
+            return {"meta": {"timestamp": "2026-10-05 10:30:00",
+                             "market_fetch_complete": True, "market_data_degraded": False}}
+
+        with mock.patch.object(dash.network_path, "has_working_path", return_value=False), \
+             mock.patch.object(dash, "_sina_reachable", return_value=True), \
+             mock.patch.object(dash, "_inject_proxy_to_session"), \
+             mock.patch.object(dash, "SCREENING_TIMEOUT", 0.05), \
+             mock.patch.object(realtime_engine, "run_screening", side_effect=fake_engine):
+            ok = sched.run_screening()
+
+        self.assertTrue(entered.wait(timeout=0.2))
+        self.assertTrue(ok)
+        self.assertTrue(sched.preserve_snapshot)
+        self.assertFalse(sched.proxy_unavailable)
+        self.assertFalse(self.staged.exists())
+        release.set()
+        self.assertTrue(finished.wait(timeout=1))
+        self.assertFalse(self.staged.exists(), "超时后的工作线程不得提交状态")
+
     def test_engine_round_never_cross_writes_new_round(self):
         """旧轮超时后，新一轮的提交不受旧轮影响，且旧轮无法再写。"""
         sched = _bare_scheduler(latest=dict(VALID_PREV))

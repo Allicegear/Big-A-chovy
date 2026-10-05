@@ -107,6 +107,8 @@ _lock = threading.Lock()
 _cached_paths: Optional[List[Dict[str, Any]]] = None   # 排好序的可用路径
 _cached_at: float = 0.0
 _cached_ok: bool = False
+_independent_candidates: Optional[List[Tuple[str, Optional[str]]]] = None
+_independent_candidates_at: float = 0.0
 _proxy_sessions: Dict[str, Any] = {}                   # proxy_url -> requests.Session
 _current_label: Optional[str] = None                   # 当前选中路径，用于切换粘性
 _fail_streak: Dict[str, int] = {}                      # label -> 连续失败次数
@@ -404,6 +406,54 @@ def ordered_sessions(direct_session) -> List[Tuple[str, Any]]:
         _current_label = "直连"
     else:
         _current_label = paths[0]["label"]
+    return sessions
+
+
+def independent_path_candidates(*, deadline: float | None = None) -> List[Tuple[str, Optional[str]]]:
+    """Return measured routes, or all non-cooled candidates for an independent host.
+
+    The cached Eastmoney probe can legitimately have no winning path while a
+    different provider (for example Sina) remains reachable through one of
+    those same routes. Keep normal latency/sticky ordering when Eastmoney has
+    winners; only bypass that endpoint-specific negative result, while still
+    respecting the existing candidate list and circuit cooldowns.
+    """
+    paths = best_paths(deadline=deadline)
+    if paths:
+        candidates = [(path["label"], path["proxy"]) for path in paths]
+    else:
+        global _independent_candidates, _independent_candidates_at
+        with _lock:
+            cached = _independent_candidates
+            cache_fresh = cached is not None and time.time() - _independent_candidates_at <= NEGATIVE_TTL
+        if cache_fresh:
+            candidates = list(cached or [])
+        else:
+            candidates = candidate_paths(deadline=deadline)
+            if deadline is None or time.monotonic() < deadline:
+                with _lock:
+                    _independent_candidates = list(candidates)
+                    _independent_candidates_at = time.time()
+        active = [entry for entry in candidates if not _in_cooldown(entry[0])]
+        candidates = active or candidates
+        if _current_label:
+            current = next((entry for entry in candidates if entry[0] == _current_label), None)
+            if current is not None:
+                candidates = [current] + [entry for entry in candidates if entry is not current]
+    return candidates
+
+
+def ordered_independent_sessions(
+    direct_session, *, deadline: float | None = None
+) -> List[Tuple[str, Any]]:
+    """Build reusable sessions for the routes available to an independent host."""
+    if requests is None:
+        return []
+    candidates = independent_path_candidates(deadline=deadline)
+    sessions = [
+        (label, direct_session if proxy is None else _session_for(proxy))
+        for label, proxy in candidates
+    ]
     return sessions
 
 
