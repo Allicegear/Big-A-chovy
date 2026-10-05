@@ -1203,6 +1203,8 @@ def _announcement_business_failure(value: Any) -> str | None:
     """Reject an error envelope at any data/result nesting level."""
     if not isinstance(value, dict):
         return None
+    if "error" in value and value.get("error") not in (None, "", False, 0):
+        return f"error={value.get('error')!r}"
     if "success" in value and value.get("success") not in (True, 1, "1", "true", "True", "ok", "OK"):
         return f"success={value.get('success')!r}"
     if "code" in value and value.get("code") not in (None, "", 0, "0", 200, "200"):
@@ -1240,6 +1242,42 @@ def _announcement_row_title(row: Any) -> str:
     return ""
 
 
+_ANNOUNCEMENT_TOTAL_KEYS = (
+    "_provider_total", "total", "total_hits", "totalHits", "totalCount",
+    "totalAnnouncement", "count",
+)
+
+
+def _announcement_total(container: Dict[str, Any]) -> Any:
+    return next((container.get(key) for key in _ANNOUNCEMENT_TOTAL_KEYS if container.get(key) is not None), None)
+
+
+def _announcement_total_from_response(data: Any) -> Any:
+    if isinstance(data, dict):
+        found = _announcement_container(data)
+        return _announcement_total(found[1] if found is not None else data)
+    return None
+
+
+def _validate_announcement_page_count(rows: List[Any], total: Any, page_size: int) -> None:
+    if total in (None, ""):
+        if not rows:
+            raise RuntimeError("东财公告空页缺少明确的 total=0")
+        return
+    if isinstance(total, bool):
+        raise RuntimeError(f"东财公告 total 不是非负整数: {total!r}")
+    if isinstance(total, int):
+        total_int = total
+    elif isinstance(total, str) and total.strip().isdecimal():
+        total_int = int(total.strip())
+    else:
+        raise RuntimeError(f"东财公告 total 不是非负整数: {total!r}")
+    page_limit = max(1, int(page_size))
+    expected = min(total_int, page_limit)
+    if total_int < 0 or len(rows) != expected:
+        raise RuntimeError(f"东财公告页不完整: total={total_int}, page_size={page_limit}, rows={len(rows)}")
+
+
 def _validate_primary_announcement_response(data: Any, *, code: str, page_size: int) -> list[dict[str, Any]]:
     """Validate Eastmoney's business envelope before title extraction."""
     if isinstance(data, list):
@@ -1256,15 +1294,8 @@ def _validate_primary_announcement_response(data: Any, *, code: str, page_size: 
         if found is None:
             raise RuntimeError("东财公告响应缺少公告列表容器")
         rows, container = found
-        total = next((container.get(key) for key in ("total", "totalCount", "totalAnnouncement", "count") if container.get(key) is not None), None)
-    if total is not None:
-        try:
-            total_int = int(total)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"东财公告 total 不是非负整数: {total!r}") from exc
-        expected = min(total_int, max(1, int(page_size)))
-        if total_int < 0 or len(rows) != expected:
-            raise RuntimeError(f"东财公告页不完整: total={total_int}, page_size={page_size}, rows={len(rows)}")
+        total = _announcement_total(container)
+    _validate_announcement_page_count(rows, total, page_size)
     normalized: list[dict[str, Any]] = []
     for row in rows:
         title = _announcement_row_title(row)
@@ -1302,7 +1333,7 @@ def fetch_announcements(code: str, page_size: int = 8) -> List[str]:
         return {
             "rows": rows[:page_size],
             "source_url": ANNOUNCEMENT_URL,
-            "_provider_total": next((data.get(key) for key in ("total", "totalCount", "totalAnnouncement", "count") if isinstance(data, dict) and data.get(key) is not None), None),
+            "_provider_total": _announcement_total_from_response(data),
             "_requested_page_size": page_size,
         }
 

@@ -8,11 +8,12 @@ import unittest
 from unittest.mock import Mock, patch
 
 import a_share_daily_screen as screen
+import testing_fixtures as fx
 from tools import query_financials
 import realtime_dashboard as dashboard
 from tools.data_sources.cache import JsonCache
 from tools.data_sources.announcements import fetch_announcement_evidence
-from tools.data_sources.contracts import Result, ResultStatus, result_ok
+from tools.data_sources.contracts import Result, ResultStatus, result_error, result_ok
 from tools.data_sources.tencent import TencentTickSource, aggregate_ticks
 
 
@@ -39,6 +40,10 @@ class AnnouncementBusinessFailureTests(unittest.TestCase):
     def test_total_count_conflict_and_missing_title_use_fallback(self) -> None:
         for payload in (
             {"success": True, "data": {"list": [], "total": 3}},
+            {"success": 1, "error": "failed", "data": {"list": [], "total_hits": 0}},
+            {"success": 1, "data": {"list": [], "total_hits": 8}},
+            {"success": 1, "data": {"list": []}},
+            {"success": 1, "data": {"list": [], "total_hits": 1.5}},
             {"success": True, "data": {"list": [{"code": "600519"}], "total": 1}},
         ):
             with self.subTest(payload=payload):
@@ -48,24 +53,91 @@ class AnnouncementBusinessFailureTests(unittest.TestCase):
                         self.assertEqual(screen.fetch_announcements("600519"), ["备用公告"])
                     fallback.fetch.assert_called_once()
 
-    def test_nested_business_failure_does_not_become_empty_primary(self) -> None:
-        fallback = self._fallback([{"title": "备用公告"}])
-        result = fetch_announcement_evidence(
-            "600519",
-            primary=lambda: {"success": True, "result": {"success": False, "code": 429, "data": []}},
-            fallback=fallback,
+    def _run_real_pipeline(self, primary_payload, fallback_result, risk_cache=None):
+        """Run the real screening core with only its external data sources replaced."""
+        code = "600519"
+        env = fx.SyntheticEnvironment([fx.make_enriched(code, "公告回归")])
+        cache = risk_cache if risk_cache is not None else {}
+        real_fetch = screen.fetch_announcements
+        fallback = Mock()
+        fallback.fetch.return_value = fallback_result
+        with env.active():
+            with (
+                patch.object(screen, "fetch_announcements", real_fetch),
+                patch.object(screen, "fetch_json", return_value=primary_payload),
+                patch.object(screen, "CNInfoAnnouncementSource", return_value=fallback),
+                patch.object(screen, "_load_announcement_risk_cache", return_value=cache),
+            ):
+                result = screen.run_screening_core(
+                    screen.ScreeningParams(modes=frozenset({"strict", "low", "watchlist"}), workers=1, top=50),
+                    screen.ScreeningHooks(),
+                )
+        return result, fallback, cache
+
+    def test_business_error_and_incomplete_empty_page_fail_closed_through_pipeline(self) -> None:
+        payloads = (
+            {"success": 1, "error": "failed", "data": {"list": [], "total_hits": 0}},
+            {"success": 1, "data": {"list": [], "total_hits": 8}},
+            {"success": 1, "data": {"list": []}},
         )
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(result.data["rows"][0]["title"], "备用公告")
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                result, fallback, cache = self._run_real_pipeline(
+                    payload,
+                    result_error(ResultStatus.UNAVAILABLE, source="cninfo", source_url="fixture", code="offline", message="fallback offline"),
+                )
+                self.assertEqual(cache, {}, "双源失败不得写入 clean 缓存")
+                self.assertEqual(result["announcement_risk_map"]["600519"], "unknown")
+                self.assertIn("600519", result["announcement_unknown_codes"])
+                self.assertNotIn("600519", {row["code"] for row in result["dual_pool"]})
+                self.assertNotIn("600519", {row["code"] for row in result["strict_trend"]})
+                self.assertNotIn("600519", {row["code"] for row in result["capital_rank"]})
+                state_rows = [row for row in result["intersection_states"] if row["code"] == "600519"]
+                if state_rows:
+                    self.assertFalse(state_rows[0]["new_open_eligible"])
+                    self.assertFalse(state_rows[0]["actionable"])
+                fallback.fetch.assert_called_once()
+
+    def test_successful_cninfo_fallback_is_classified_before_rank_and_state(self) -> None:
+        result, fallback, cache = self._run_real_pipeline(
+            {"success": 1, "error": "failed", "data": {"list": [], "total_hits": 0}},
+            result_ok([{"title": "关于重大诉讼的公告"}], source="cninfo", source_url="fixture"),
+        )
+        self.assertEqual(cache["600519"]["status"], "avoid")
+        self.assertEqual(result["announcement_risk_map"]["600519"], "avoid")
+        self.assertNotIn("600519", {row["code"] for row in result["dual_pool"]})
+        self.assertNotIn("600519", {row["code"] for row in result["strict_trend"]})
+        self.assertNotIn("600519", {row["code"] for row in result["capital_rank"]})
+        state_rows = [row for row in result["intersection_states"] if row["code"] == "600519"]
+        if state_rows:
+            self.assertFalse(state_rows[0]["new_open_eligible"])
+            self.assertFalse(state_rows[0]["actionable"])
         fallback.fetch.assert_called_once()
 
+    def test_nested_business_failure_does_not_become_empty_primary(self) -> None:
+        for payload in (
+            {"success": True, "result": {"success": False, "code": 429, "data": []}},
+            {"success": 1, "data": {"error": "failed", "list": [], "total_hits": 0}},
+        ):
+            with self.subTest(payload=payload):
+                fallback = self._fallback([{"title": "备用公告"}])
+                result = fetch_announcement_evidence("600519", primary=lambda: payload, fallback=fallback)
+                self.assertEqual(result.status, "ok")
+                self.assertEqual(result.data["rows"][0]["title"], "备用公告")
+                fallback.fetch.assert_called_once()
+
     def test_both_sources_fail_and_stale_avoid_is_preserved(self) -> None:
-        result = {"trend_observation": [{"code": "600519"}]}
         stale = {"600519": {"status": "avoid", "keywords": ["立案"], "titles": ["立案调查"], "checked_at": 0}}
-        with patch.object(screen, "fetch_announcements", side_effect=RuntimeError("all announcement sources failed")):
-            errors = screen.attach_announcement_risks(result, page_size=8, workers=1, risk_cache=stale)
-        self.assertEqual(errors, ["600519"])
-        self.assertEqual(result["trend_observation"][0]["risk_status"], "avoid")
+        result, fallback, cache = self._run_real_pipeline(
+            {"success": 1, "error": "failed", "data": {"list": [], "total_hits": 0}},
+            result_error(ResultStatus.UNAVAILABLE, source="cninfo", source_url="fixture", code="offline", message="fallback offline"),
+            risk_cache=stale,
+        )
+        self.assertEqual(result["announcement_risk_map"]["600519"], "avoid")
+        self.assertTrue(any(row["code"] == "600519" and row["risk_status"] == "avoid" for row in result["strict_ultra"]))
+        self.assertNotIn("600519", {row["code"] for row in result["capital_rank"]})
+        self.assertEqual(cache, stale)
+        fallback.fetch.assert_called_once()
 
 
 class FinancialEvidenceTests(unittest.TestCase):

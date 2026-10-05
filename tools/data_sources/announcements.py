@@ -64,6 +64,8 @@ def classify_announcement_risk(titles: Iterable[str]) -> dict[str, Any]:
 
 def _business_failure(payload: Mapping[str, Any]) -> str | None:
     """Find business-error envelopes before accepting an empty list."""
+    if "error" in payload and payload.get("error") not in (None, "", False, 0):
+        return f"业务 error={payload.get('error')!r}"
     if "success" in payload:
         success = payload.get("success")
         if success not in (True, 1, "1", "true", "True", "ok", "OK"):
@@ -111,9 +113,18 @@ def _validate_row_shape(rows: list[Any], *, code: str | None = None) -> list[dic
 
 def _validate_page_count(rows: list[Any], total: Any, page_size: int) -> None:
     if total in (None, ""):
+        if not rows:
+            raise ValueError("公告空页缺少明确的 total=0")
         return
+    if isinstance(total, bool):
+        raise ValueError(f"公告 total 不是非负整数: {total!r}")
     try:
-        total_int = int(total)
+        if isinstance(total, int):
+            total_int = total
+        elif isinstance(total, str) and total.strip().isdecimal():
+            total_int = int(total.strip())
+        else:
+            raise ValueError(f"公告 total 不是非负整数: {total!r}")
     except (TypeError, ValueError) as exc:
         raise ValueError(f"公告 total 不是非负整数: {total!r}") from exc
     if total_int < 0:
@@ -156,7 +167,7 @@ def _primary_rows(value: Any) -> tuple[list[dict[str, Any]], str]:
         if found is None:
             raise ValueError("主公告源缺少公告列表")
         rows, metadata = found
-        total = next((metadata.get(key) for key in ("_provider_total", "total", "totalCount", "totalAnnouncement", "count") if metadata.get(key) is not None), None)
+        total = next((metadata.get(key) for key in ("_provider_total", "total", "total_hits", "totalHits", "totalCount", "totalAnnouncement", "count") if metadata.get(key) is not None), None)
         page_size = int(metadata.get("_requested_page_size") or metadata.get("page_size") or 30)
         _validate_page_count(rows, total, page_size)
         return _validate_row_shape(rows), str(value.get("source_url") or metadata.get("source_url") or "")
