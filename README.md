@@ -16,7 +16,7 @@
 
 - 当前开发预览版：[v0.6.0-preview.2](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-preview.2)，修正公告总量冲突、行情涨跌停价与财务字段映射，并加固影子样本事务、结算校验和工作台生命周期；仍为预览版。
 - Docker 发布版：[v0.6.0-docker.2](https://github.com/LuQTest/Big-A-chovy/releases/tag/v0.6.0-docker.2)，基于同一源码提供 `linux/amd64` 和 `linux/arm64` 容器镜像。
-- 旧版本（`v0.3.x`、`v0.4.x`、`v0.5.x`）已被当前版本取代；其 tag 与容器镜像标签保留，便于复现与回退。
+- GitHub 保留上一轮回退版 `v0.6.0-preview.1` / `v0.6.0-docker.1` 和稳定 Latest `v0.5.0-docker.4`。更早的 `v0.5.0-preview.*`、`v0.5.0-docker.1`–`.3`、`v0.4.0-*`、`v0.3.5-preview.1` 与 `v0.3.4` Release/tag 已清理；Git 提交历史和 GHCR 镜像版本不受影响。
 
 完整更新记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
