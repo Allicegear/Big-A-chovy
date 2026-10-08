@@ -516,16 +516,24 @@ def check_code_wiring(project_root: Path = PROJECT_ROOT) -> Dict[str, List[Dict[
 def check_authority_boundaries(project_root: Path = PROJECT_ROOT) -> Dict[str, List[Dict[str, str]]]:
     """检查工具层没有重新建立第二套交易裁决规则。"""
     result = _empty_result()
-    skill = _read_text(project_root / "daily-stock-analysis" / "SKILL.md") or ""
-    trading_rules = _read_text(project_root / "daily-stock-analysis" / "references" / "trading-rules.md") or ""
-    if "不承担最终买卖" not in skill or "选股框架.md" not in skill:
-        _add(result, "fail", "daily-stock-analysis/SKILL.md 未明确筛选工具与交易裁决边界")
+    entry = _read_text(project_root / "AGENTS.md") or ""
+    required = (
+        "选股框架.md",
+        "交易规则唯一权威",
+        "skills/盘中/SKILL.md",
+        "项目唯一入口",
+        "daily-stock-analysis/",
+        "不做最终交易裁决",
+    )
+    missing = [item for item in required if item not in entry]
+    if missing:
+        _add(result, "fail", f"AGENTS.md 缺少权威边界声明：{'、'.join(missing)}")
     else:
-        _add(result, "pass", "筛选工具已声明由盘中 skill、框架和决策记录负责最终裁决")
-    if "不再维护第二套交易规则" not in trading_rules and "不承担最终买卖" not in trading_rules:
-        _add(result, "fail", "trading-rules.md 可能重新形成第二套交易规则")
+        _add(result, "pass", "统一入口已明确框架、项目盘中和筛选工具的权威边界")
+    if (project_root / "daily-stock-analysis" / "SKILL.md").exists():
+        _add(result, "fail", "筛选引擎重新出现独立 SKILL.md，应仅保留项目盘中入口")
     else:
-        _add(result, "pass", "辅助 trading-rules 文档未建立第二套交易裁决规则")
+        _add(result, "pass", "筛选引擎未另设独立 AI Skill 入口")
     return result
 
 

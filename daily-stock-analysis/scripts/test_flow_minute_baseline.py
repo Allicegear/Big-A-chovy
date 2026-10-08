@@ -5,6 +5,7 @@
 """
 import math
 import unittest
+from datetime import datetime as RealDateTime
 from unittest.mock import patch
 
 import a_share_daily_screen as screen
@@ -45,6 +46,18 @@ class FlowMinuteBaselineTests(unittest.TestCase):
         screen._FLOW_MINUTE_CACHE.clear()
         # 请求预算是模块级且按轮计，用例之间必须重置，否则后面的用例会因预算耗尽拿不到序列
         screen.reset_flow_minute_round()
+
+    @staticmethod
+    def _freeze_screen_clock(moment):
+        """Freeze the production clock without weakening its freshness gate."""
+        class FrozenDateTime(RealDateTime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return moment.replace(tzinfo=None)
+                return moment.astimezone(tz)
+
+        return patch.object(screen, "datetime", FrozenDateTime)
 
     # ---------- 端点作差 ----------
     def test_increment_uses_five_and_fifteen_minute_endpoints(self):
@@ -128,21 +141,35 @@ class FlowMinuteBaselineTests(unittest.TestCase):
             "2026-09-24 09:30,0,0", "2026-09-24 09:31,100000,40000",
             "2026-09-24 09:32,200000,90000",
         ]}}
-        with patch.object(screen, "fetch_json", return_value=payload):
+        frozen = RealDateTime(2026, 9, 24, 18, 0, tzinfo=screen.TZ)
+        with self._freeze_screen_clock(frozen), patch.object(screen, "fetch_json", return_value=payload):
             got = screen.fetch_flow_minutes("600000", expected_date="2026-09-24")
         self.assertEqual(len(got), 3)
         self.assertEqual(got[-1], ("09:32", 200_000.0, 90_000.0))
 
     def test_fresh_series_accepted_outside_trading_hours(self):
-        today = screen.datetime.now(screen.TZ).strftime("%Y-%m-%d")
+        frozen = RealDateTime(2026, 9, 24, 18, 0, tzinfo=screen.TZ)
+        today = frozen.strftime("%Y-%m-%d")
         payload = {"data": {"klines": [
             f"{today} 09:30,0,0", f"{today} 09:31,100000,40000",
             f"{today} 09:32,200000,90000",
         ]}}
-        with patch.object(screen, "fetch_json", return_value=payload):
+        with self._freeze_screen_clock(frozen), patch.object(screen, "fetch_json", return_value=payload):
             got = screen.fetch_flow_minutes("600000")
         self.assertEqual(len(got), 3)
         self.assertEqual(got[-1], ("09:32", 200_000.0, 90_000.0))
+
+    def test_current_day_stale_series_is_still_rejected_during_trading_hours(self):
+        """Fixing test time must not disable the production 10-minute freshness gate."""
+        frozen = RealDateTime(2026, 9, 24, 11, 0, tzinfo=screen.TZ)
+        today = frozen.strftime("%Y-%m-%d")
+        payload = {"data": {"klines": [
+            f"{today} 09:30,0,0", f"{today} 09:31,100000,40000",
+            f"{today} 09:32,200000,90000",
+        ]}}
+        with self._freeze_screen_clock(frozen), patch.object(screen, "fetch_json", return_value=payload):
+            got = screen.fetch_flow_minutes("600000")
+        self.assertEqual(got, [])
 
     def test_flow_minutes_request_includes_super_order_column(self):
         """coalition 连续性要同时核验主力与超大单，因此序列必须请求 f56。"""

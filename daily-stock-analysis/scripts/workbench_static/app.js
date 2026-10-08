@@ -487,7 +487,6 @@ async function loadConfig() {
   $("#cfg-board-chinext").checked = savedBoards.indexOf("chinext") !== -1;
   $("#cfg-board-star").checked = savedBoards.indexOf("star") !== -1;
 
-  const snapRev = cfg.snapshot_revision;
   const snapView = cfg.snapshot_view === "observe" ? "观察开启" : (cfg.snapshot_view ? "严格展示" : "待生成");
   // 交易板范围：把「当前设置」与「当前快照实际范围」并排显示——两者可能不同，
   // 设置是对下一轮生效，快照是已经跑完那一轮的真实范围。
@@ -519,15 +518,13 @@ async function loadConfig() {
         : "");
 
   $("#config-status").innerHTML =
-    `<div>当前设置：<strong>v${cfg.revision}</strong>` +
-    `${cfg.updated_at ? `（修改于 ${esc(cfg.updated_at)}）` : ""}` +
+    `<div>保存时间：<strong>${esc(cfg.updated_at || "尚未保存")}</strong>` +
     `｜交易板范围：<strong>${esc(curBoards)}</strong></div>` +
-    `<div>当前快照：<strong>${snapRev != null ? "v" + snapRev : "待生成"}</strong>` +
-    `（观察模式：${esc(snapView)}｜实际范围：${snapBoards == null ? "范围未记录" : esc(snapBoards)}` +
-    `｜口径：${esc(scopeText)}）</div>` +
+    `<div>当前快照：观察模式：${esc(snapView)}｜实际范围：${snapBoards == null ? "范围未记录" : esc(snapBoards)}` +
+    `｜口径：${esc(scopeText)}</div>` +
     methodWarn +
     (cfg.pending
-      ? `<div class="pending">新配置 v${cfg.revision} 待下一轮生效（当前快照仍按 v${snapRev} 的范围）</div>`
+      ? `<div class="pending">已保存，待下一轮筛选生效；当前快照仍使用保存前的设置。</div>`
       : "");
 
   const err = $("#config-error");
@@ -596,7 +593,10 @@ async function applyConfig() {
       state.textContent = running ? "已保存；正在筛选，新配置待下一轮生效" : "已保存，下一轮筛选生效";
       await loadConfig();
     } else {
-      state.innerHTML = `<span class="err-text">${esc((res.errors || []).join("；"))}</span>`;
+      const message = res.conflict
+        ? "配置已被其他页面更新，请刷新后重试"
+        : (res.errors || []).join("；");
+      state.innerHTML = `<span class="err-text">${esc(message)}</span>`;
       await loadConfig();
     }
   } catch (e) {
