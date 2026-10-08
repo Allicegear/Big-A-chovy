@@ -113,7 +113,7 @@ body {
   cursor: pointer;
   user-select: none;
 }
-/* 口径入口：只显示当前口径（负超单观察模式 + 快照配置版本），点击进入工作台-参数配置 */
+/* 口径入口：显示观察模式与配置保存时间，点击进入工作台-参数配置 */
 .config-chip {
   font-size: 12px;
   color: var(--text-secondary);

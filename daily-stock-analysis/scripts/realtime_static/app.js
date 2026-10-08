@@ -952,7 +952,6 @@ function renderFooter(data) {
   const cfg = data.intersection_config || {};
   const meta = data.intersection_config_meta || {};
   const parts = [];
-  if (cfg.version) parts.push(`参数版本: ${cfg.version}`);
   if (cfg.source) parts.push(`来源: ${cfg.source}`);
   if (cfg.confirmation_snapshots) parts.push(`确认快照: ${cfg.confirmation_snapshots}次`);
   if (cfg.morning_cutoff) parts.push(`上午截止: ${cfg.morning_cutoff}`);
@@ -988,17 +987,14 @@ function renderConfigChip(status) {
     ? '<div class="banner banner-snapshot">⚠️ 当前展示的快照由旧口径生成：当时创业板/科创板只进观察列表。当前设置已是三板统一参与正式筛选，两者不可直接比较。</div>'
     : "";
   const snapView = viewText(status.negative_super_view_snapshot);
-  const curRev = status.config_revision;
-  const snapRev = status.config_revision_snapshot;
-  let text;
+  let text = `负超单：${curView} · 保存时间：${status.config_updated_at || "尚未保存"}`;
   let tone = "config-chip";
   if (status.config_pending) {
     // 待生效期间：当前设置与当前快照是两个口径，必须分别写清楚，不能混在一句里。
-    text = `当前设置：${curView}（v${curRev}）；当前快照：${snapView || "未生成"}` +
-      `（${snapRev != null ? "v" + snapRev : "-"}）`;
+    text += ` · 待下一轮生效（当前快照：${snapView || "未生成"}）`;
     tone += " pending";
-  } else {
-    text = `负超单：${curView} · 快照使用配置 ${snapRev != null ? "v" + snapRev : "待生成"}`;
+  } else if (!status.has_result) {
+    text += " · 等待首轮筛选";
   }
   if (status.config_error) {
     text += "（配置回退默认）";

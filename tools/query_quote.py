@@ -9,8 +9,10 @@ import sys
 import json
 import urllib.request
 import argparse
+from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from zoneinfo import ZoneInfo
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "daily-stock-analysis" / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -19,6 +21,7 @@ import tencent_kline  # noqa: E402  腾讯日 K 主机列表单一来源
 import tls_context  # noqa: E402  TLS 校验上下文唯一来源（默认校验证书）
 
 ssl_ctx = tls_context.build_context()
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 def normalize_code(code: str) -> str:
     """自动添加市场前缀 sh / sz"""
@@ -110,16 +113,59 @@ def fetch_realtime_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
 
     return results
 
-def fetch_minute_data(code: str) -> List[str]:
-    """查询当日1分钟分时明细"""
+def fetch_minute_data(code: str, expected_date: Optional[str] = None) -> List[str]:
+    """查询当前交易日 1 分钟分时明细。
+
+    ``expected_date`` is an optional guard for callers that have a known
+    market date.  Tencent's minute endpoint is current-day-only, so a
+    request for another date must return no evidence rather than silently
+    handing today's bars to a historical caller.  The one-argument calling
+    convention remains unchanged for the interactive quote tools.
+    """
     sym = normalize_code(code)
+    normalized_expected_date: Optional[str] = None
+    if expected_date is not None:
+        normalized_expected_date = str(expected_date).strip().replace("-", "")
+        if len(normalized_expected_date) != 8 or not normalized_expected_date.isdigit():
+            return []
+        try:
+            normalized_expected_date = datetime.strptime(
+                normalized_expected_date, "%Y%m%d"
+            ).strftime("%Y%m%d")
+        except ValueError:
+            return []
+        if datetime.now(SHANGHAI_TZ).strftime("%Y%m%d") != normalized_expected_date:
+            return []
+
     url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={sym}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        sub_key = list(data.get("data", {}).keys())[0]
-        m_lines = data["data"][sub_key]["data"]["data"]
+        securities = data.get("data")
+        if not isinstance(securities, dict):
+            return []
+        security = securities.get(sym)
+        if not isinstance(security, dict):
+            return []
+        minute_payload = security.get("data")
+        if not isinstance(minute_payload, dict):
+            return []
+        # expected_date 模式下，电脑自然日只是第一道护栏；响应本身的
+        # 证券交易日也必须存在且完全匹配，不能把旧缓存标成目标日证据。
+        if normalized_expected_date is not None:
+            response_date = str(minute_payload.get("date") or "").strip().replace("-", "")
+            if len(response_date) != 8 or not response_date.isdigit():
+                return []
+            try:
+                response_date = datetime.strptime(response_date, "%Y%m%d").strftime("%Y%m%d")
+            except ValueError:
+                return []
+            if response_date != normalized_expected_date:
+                return []
+        m_lines = minute_payload.get("data")
+        if not isinstance(m_lines, list):
+            return []
         return m_lines
     except Exception as e:
         print(f"获取分时失败: {e}", file=sys.stderr)

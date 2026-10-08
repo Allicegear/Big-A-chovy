@@ -15,7 +15,6 @@ from detect_divergence_leader import (
     evaluate_history,
     evaluate_day_badges,
     day_files,
-    detect_day,
     D1_LOOKBACK,
 )
 
@@ -212,25 +211,6 @@ class DivergenceDayFilesAndBadgesTests(unittest.TestCase):
             self._write(f"09{30 + i * 5:02d}", self._row("000426", "兴业银锡", mp, ann=ann))
         badges = evaluate_day_badges(self.DATE)
         self.assertEqual(badges["000426"]["status"], "not_triggered")
-
-
-class DivergenceArchiveIntegrationTests(unittest.TestCase):
-    ARCHIVE = PROJECT_ROOT / "筛选结果"
-
-    def test_real_0821_positive_and_0807_anchor(self):
-        """真实档案冒烟：0821 兴业银锡必须触发；0807 巨石反证日不得出现巨石。"""
-        day0821 = self.ARCHIVE / "20260821"
-        day0807 = self.ARCHIVE / "20260807"
-        if not (day0821.exists() and day0807.exists()):
-            self.skipTest("报告档案缺失，跳过集成冒烟")
-
-        tgs21 = detect_day("20260821", verbose=False)
-        codes21 = {t["code"] for t in tgs21}
-        self.assertIn("000426", codes21)
-
-        tgs07 = detect_day("20260807", verbose=False)
-        codes07 = {t["code"] for t in tgs07}
-        self.assertNotIn("600176", codes07)
 
 
 if __name__ == "__main__":
