@@ -13,6 +13,10 @@ from screening.intersection import DEFAULT_INTERSECTION_CONFIG, INTERSECTION_CON
 from screening.model import BOARD_MAIN, _fmt, amount_yi, is_number, pct
 from screening.risk import announcement_label
 
+# 区间分位标注档位（纯展示，不参与门槛）：现价处于当日区间 ≥80% 记偏高，≥90% 记贴顶。
+# 阈值依据：2026-09-24 全量报告 42 个候选行的区间分位中位数 76%、≥70% 的占 86%——
+# 70% 那条线几乎每行都触发、没有区分度，因此上调为两档（≥80% 占 21%、≥90% 占 7%）。
+# 若以后要把它变成"不追高"的硬门槛，请先按框架维护纪律搬进 tools/rule_config.py 并记录。
 RANGE_POSITION_WARN_PCT = 80.0
 RANGE_POSITION_TOP_PCT = 90.0
 
