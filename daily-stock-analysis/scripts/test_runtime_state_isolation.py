@@ -67,7 +67,7 @@ class RuntimePathsTests(unittest.TestCase):
         env["PYTHONUTF8"] = "1"
         proc = subprocess.run(
             [sys.executable, "-c", snippet],
-            cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True, timeout=120,
+            cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True, encoding="utf-8", timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         lines = proc.stdout.strip().splitlines()
@@ -119,7 +119,7 @@ class EntrypointIsolationTests(unittest.TestCase):
         env["PYTHONUTF8"] = "1"
         proc = subprocess.run(
             [sys.executable, "-c", snippet],
-            cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True, timeout=180,
+            cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True, encoding="utf-8", timeout=180,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         return proc.stdout.strip()

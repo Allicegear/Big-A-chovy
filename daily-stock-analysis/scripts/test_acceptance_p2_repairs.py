@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -206,7 +208,7 @@ class CacheContractTests(unittest.TestCase):
 
             child = "from_child"
             script = "from pathlib import Path; from tools.data_sources.cache import JsonCache; import sys; JsonCache('p2_shared', path=Path(sys.argv[1])).set('" + child + "', {'ok': True})"
-            subprocess.run(["python3", "-c", script, str(path)], check=True, env={"PYTHONPATH": "."})
+            subprocess.run([sys.executable, "-c", script, str(path)], check=True, env=dict(os.environ, PYTHONPATH="."))
             self.assertIsNotNone(cache_a.get(child))
 
     def test_same_key_requests_are_coalesced(self) -> None:
@@ -331,7 +333,7 @@ with patch.object(network_path, "candidate_paths", return_value=[("直连", None
 '''
         started = time.monotonic()
         completed = subprocess.run(
-            ["python3", "-c", script],
+            [sys.executable, "-c", script],
             cwd=root,
             capture_output=True,
             text=True,
