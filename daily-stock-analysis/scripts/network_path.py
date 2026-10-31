@@ -319,11 +319,15 @@ def probe_paths(*, deadline: float | None = None) -> List[Dict[str, Any]]:
     # per-endpoint timeout plus a small scheduling allowance.  With a caller
     # budget, no join may cross it.
     wait_until = deadline if deadline is not None else time.monotonic() + (PROBE_TIMEOUT + 1.0) * max(1, len(PROBE_ENDPOINTS))
+    # join(timeout) 在 Windows 上可能比截止时刻早几毫秒返回（计时器粒度）；若只
+    # join 一次，线程未完成却又判定"未到截止"，会把空结果当成"全部不可用"写进
+    # 负缓存。因此循环等到线程结束或截止时刻真正过去。
     for thread in threads:
-        remaining = wait_until - time.monotonic()
-        if remaining <= 0:
-            break
-        thread.join(timeout=remaining)
+        while thread.is_alive():
+            remaining = wait_until - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
     if deadline is not None and time.monotonic() >= deadline:
         return []
     paths = [r for r in results if r is not None]
