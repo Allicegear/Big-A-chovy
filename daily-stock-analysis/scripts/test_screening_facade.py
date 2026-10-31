@@ -11,7 +11,9 @@ import unittest
 from pathlib import Path
 
 import a_share_daily_screen as screen
-from screening import capital, intersection, market_warnings, model, net, render, risk, rules
+from screening import (
+    capital, intersection, market_warnings, model, net, render, risk, rules, watchlist,
+)
 from screening.sources import announcements, flow, kline, market
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -68,7 +70,14 @@ NET_EXPORTS = (
 # （例如 fetch_json：fetch_market 等还在核心）在门面上 patch 仍然生效，暂不加入，
 # 待其调用方拆走的那一步再加。
 FACADE_REDIRECT_FORBIDDEN = {
-    "screening.intersection": ("INTERSECTION_STATE_FILE", "INTERSECTION_CALIBRATION_FILE"),
+    "screening.intersection": (
+        "INTERSECTION_STATE_FILE", "INTERSECTION_CALIBRATION_FILE",
+        # 观察池突破状态机拆走后，门面里已无读取方（交集与观察池两个模块各自导入）
+        "_clock_minutes",
+    ),
+    # load/save_watchlist_breakout_state、evaluate_watchlist_breakout_states、build_watchlist
+    # 由核心流水线调用，不在此列。
+    "screening.watchlist": ("WATCHLIST_BREAKOUT_STATE_PATH", "_breakout_snapshot_epoch"),
     "screening.net": (
         "NETWORK_MODE", "requests", "REQUESTS_SESSION", "REQUESTS_DIRECT_SESSION", "UA",
         "SSL_CONTEXT", "_HOST_FAILURES", "_HOST_COOLDOWN", "_EM_COOLDOWN_FILE",
@@ -224,7 +233,23 @@ RENDER_EXPORTS = (
 )
 
 
+WATCHLIST_EXPORTS = (
+    "WATCHLIST_BREAKOUT_STATE_PATH", "_breakout_snapshot_epoch", "build_watchlist",
+    "evaluate_watchlist_breakout_states", "load_watchlist_breakout_state",
+    "save_watchlist_breakout_state",
+)
+
+
 class FacadeIdentityTest(unittest.TestCase):
+    def test_watchlist_names_are_reexported_not_copied(self):
+        for name in WATCHLIST_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(watchlist, name))
+
+    def test_watchlist_config_and_clock_have_a_single_source(self):
+        self.assertIs(watchlist.SCREENING_CONFIG, screen.SCREENING_CONFIG)
+        self.assertIs(watchlist.TZ, screen.TZ)
+
     def test_capital_names_are_reexported_not_copied(self):
         for name in CAPITAL_EXPORTS:
             with self.subTest(name=name):
