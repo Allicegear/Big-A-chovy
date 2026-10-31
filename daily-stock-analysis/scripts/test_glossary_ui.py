@@ -15,7 +15,12 @@ STATIC = SCRIPT_DIR / "realtime_static"
 APP_JS = (STATIC / "app.js").read_text(encoding="utf-8")
 INDEX_HTML = (STATIC / "index.html").read_text(encoding="utf-8")
 STYLE_CSS = (STATIC / "style.css").read_text(encoding="utf-8")
-SCREEN_PY = (SCRIPT_DIR / "a_share_daily_screen.py").read_text(encoding="utf-8")
+# 筛选引擎源码 = 核心门面 + 拆出的 screening/ 子模块（报告渲染在 screening/render.py）。
+# assertIn / assertNotIn 都按整个引擎检查，旧口径不能藏进任何一个子模块。
+SCREEN_PY = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in [SCRIPT_DIR / "a_share_daily_screen.py", *sorted((SCRIPT_DIR / "screening").glob("*.py"))]
+)
 ENGINE_PY = (SCRIPT_DIR / "realtime_engine.py").read_text(encoding="utf-8")
 
 ENTRY_RE = re.compile(r'group: "([^"]+)", scope: "([^"]+)", term: "([^"]+)"')

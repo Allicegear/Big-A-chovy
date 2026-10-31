@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 import a_share_daily_screen as screen
-from screening import intersection, model, risk, rules
+from screening import intersection, model, render, risk, rules
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
@@ -56,7 +56,19 @@ INTERSECTION_EXPORTS = (
 MOVED_STATE_PATHS = ("INTERSECTION_STATE_FILE", "INTERSECTION_CALIBRATION_FILE")
 
 
+RENDER_EXPORTS = (
+    "RANGE_POSITION_TOP_PCT", "RANGE_POSITION_WARN_PCT", "flow_amount_str", "flow_status_cell",
+    "flow_veto_suffix", "markdown_table", "range_position_cell", "render_markdown",
+    "shadow_badge_text",
+)
+
+
 class FacadeIdentityTest(unittest.TestCase):
+    def test_render_names_are_reexported_not_copied(self):
+        for name in RENDER_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(render, name))
+
     def test_intersection_names_are_reexported_not_copied(self):
         for name in INTERSECTION_EXPORTS:
             with self.subTest(name=name):

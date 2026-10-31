@@ -316,7 +316,11 @@ class ResultContractTests(unittest.TestCase):
 
     def test_extended_board_branch_is_gone_from_new_results(self):
         """新结果不再有独立观察分支；旧快照仅在带旧字段时按历史口径渲染。"""
-        core = (SCRIPT_DIR / "a_share_daily_screen.py").read_text(encoding="utf-8")
+        # 旧快照的兼容渲染分支在 screening/render.py；按整个筛选引擎检查
+        core = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [SCRIPT_DIR / "a_share_daily_screen.py", *sorted((SCRIPT_DIR / "screening").glob("*.py"))]
+        )
         self.assertNotIn("build_extended_board_observations", core)
         self.assertIn('if "extended_board_observations" in result', core, "旧快照需保留原口径渲染")
         self.assertIn('"board_scope_status"', core)
