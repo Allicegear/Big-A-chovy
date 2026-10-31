@@ -607,7 +607,11 @@ class SnapshotApiTests(_IsolatedStateTestCase):
             fetcher=_payload_fetcher(SAMPLE_RELEASES),
             env={},
         )
-        with mock.patch.object(update_check, "fetch_releases") as fetch:
+        # 缓存写于 T0，必须把"现在"固定在有效期内：用真实时钟时，T0 一过 24 小时
+        # 缓存就永远过期，snapshot 会起后台线程去联网，结果取决于线程时序。
+        with mock.patch.object(
+            update_check, "_utc_now", return_value=T0 + timedelta(hours=1)
+        ), mock.patch.object(update_check, "fetch_releases") as fetch:
             payload = _snapshot_as()
         fetch.assert_not_called()
         self.assertTrue(payload["update_available"])
@@ -620,7 +624,9 @@ class SnapshotApiTests(_IsolatedStateTestCase):
             fetcher=_payload_fetcher(SAMPLE_RELEASES),
             env={},
         )
-        payload = _snapshot_as()
+        # 同上：固定在缓存有效期内，否则会起后台线程真实访问 GitHub
+        with mock.patch.object(update_check, "_utc_now", return_value=T0 + timedelta(hours=1)):
+            payload = _snapshot_as()
         for key in (
             "status",
             "update_available",

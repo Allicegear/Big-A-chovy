@@ -9,7 +9,7 @@
 import unittest
 
 import a_share_daily_screen as screen
-from screening import model
+from screening import model, rules
 
 MODEL_EXPORTS = (
     "BOARD_CHINEXT", "BOARD_LABELS", "BOARD_MAIN", "BOARD_ORDER", "BOARD_STAR", "BOARD_UNKNOWN",
@@ -18,12 +18,29 @@ MODEL_EXPORTS = (
     "tencent_code", "valid_board_row", "valid_main_board",
 )
 
+RULES_EXPORTS = (
+    "_trend_quality_checks", "has_resonance", "is_after_tail_risk", "low_trend_class",
+    "low_trend_output_eligible", "low_trend_sort_key", "low_ultra_class",
+    "low_ultra_output_eligible", "low_ultra_sort_key", "sector_stats", "strict_trend",
+    "strict_ultra", "trend_condition_diagnosis", "trend_confirm_relaxed", "trend_observation",
+)
+
 
 class FacadeIdentityTest(unittest.TestCase):
     def test_model_names_are_reexported_not_copied(self):
         for name in MODEL_EXPORTS:
             with self.subTest(name=name):
                 self.assertIs(getattr(screen, name), getattr(model, name))
+
+    def test_rules_names_are_reexported_not_copied(self):
+        for name in RULES_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(rules, name))
+
+    def test_rule_parameters_have_a_single_source(self):
+        # 规则模块与核心读同一份参数对象，不是各自的拷贝
+        self.assertIs(rules.SCREENING_CONFIG, screen.SCREENING_CONFIG)
+        self.assertIs(rules.EXECUTION_CONFIG, screen.EXECUTION_CONFIG)
 
     def test_enriched_default_risk_matches_screen(self):
         self.assertEqual(model.RISK_UNKNOWN, screen.RISK_UNKNOWN)
