@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 import a_share_daily_screen as screen
+from screening.sources import kline
 
 
 class EnrichAllOrderTest(unittest.TestCase):
@@ -23,7 +24,8 @@ class EnrichAllOrderTest(unittest.TestCase):
             time.sleep(0.02 * (8 - index))
             return None if index == 3 else row["f12"]
 
-        with mock.patch.object(screen, "enrich", side_effect=slow_first):
+        # enrich_all 在 screening.sources.kline 里调用 enrich
+        with mock.patch.object(kline, "enrich", side_effect=slow_first):
             out, errors = screen.enrich_all(rows, workers=8)
 
         self.assertEqual(out, [r["f12"] for r in rows if r["f12"] != "600003"])

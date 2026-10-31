@@ -11,7 +11,8 @@ import unittest
 from pathlib import Path
 
 import a_share_daily_screen as screen
-from screening import intersection, model, net, render, risk, rules
+from screening import intersection, market_warnings, model, net, render, risk, rules
+from screening.sources import kline
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
@@ -73,6 +74,37 @@ FACADE_REDIRECT_FORBIDDEN = {
         "SSL_CONTEXT", "_HOST_FAILURES", "_HOST_COOLDOWN", "_EM_COOLDOWN_FILE",
         "_EM_COOLDOWN_BACKOFF", "_em_read_cooldown", "_system_proxy_url", "build_url_opener",
     ),
+    # fetch_kline（引擎、shadow_tracker 经门面读取）、enrich_all / kline_source_summary
+    # （核心流水线调用）仍有门面读取方，不在此列。
+    "screening.sources.kline": (
+        "_tencent_kline_fail_streak", "_tencent_kline_blocked_until", "_sina_kline_fallback_warned",
+        "_kline_reference", "_kline_fallback_codes", "_kline_mismatch_codes",
+        "TENCENT_KLINE_FAIL_STREAK_LIMIT", "TENCENT_KLINE_COOLDOWN_SECONDS", "KLINE_MIN_BARS",
+        "KLINE_QFQ_DEVIATION_LIMIT", "KLINE_SOURCE_LABELS", "TENCENT_KLINE_URLS", "TENCENT_KLINE_URL",
+        "SINA_KLINE_URL", "EM_KLINE_URLS", "EM_KLINE_URL", "EM_KLINE_FIELDS1", "EM_KLINE_FIELDS2",
+        "parse_k_rows", "_parse_sina_kline", "_parse_tencent_qfq_kline", "_tencent_kline_ready",
+        "_note_tencent_kline_result", "_note_sina_kline_fallback", "_record_kline_reference",
+        "_note_sina_fallback_code", "enrich",
+    ),
+}
+
+KLINE_EXPORTS = (
+    "EM_KLINE_FIELDS1", "EM_KLINE_FIELDS2", "EM_KLINE_URL", "EM_KLINE_URLS", "KLINE_MIN_BARS",
+    "KLINE_QFQ_DEVIATION_LIMIT", "KLINE_SOURCE_LABELS", "SINA_KLINE_URL",
+    "TENCENT_KLINE_COOLDOWN_SECONDS", "TENCENT_KLINE_FAIL_STREAK_LIMIT", "TENCENT_KLINE_URL",
+    "TENCENT_KLINE_URLS", "_kline_fallback_codes", "_kline_mismatch_codes", "_kline_reference",
+    "_note_sina_fallback_code", "_note_sina_kline_fallback", "_note_tencent_kline_result",
+    "_parse_sina_kline", "_parse_tencent_qfq_kline", "_record_kline_reference",
+    "_tencent_kline_ready", "enrich", "enrich_all", "fetch_kline", "kline_source_summary",
+    "parse_k_rows",
+)
+
+# 子模块用 global 改写的标量：门面若导出，只会是导入时的旧副本（读到的永远是初值，
+# 断言会"恒真"）。门面不导出它们，误读会直接 AttributeError。
+REBOUND_SCALARS_NOT_EXPORTED = {
+    "screening.sources.kline": (
+        "_tencent_kline_fail_streak", "_tencent_kline_blocked_until", "_sina_kline_fallback_warned",
+    ),
 }
 
 
@@ -84,6 +116,24 @@ RENDER_EXPORTS = (
 
 
 class FacadeIdentityTest(unittest.TestCase):
+    def test_kline_names_are_reexported_not_copied(self):
+        for name in KLINE_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(kline, name))
+
+    def test_rebound_scalars_are_not_exported_by_the_facade(self):
+        import importlib
+        for mod, names in REBOUND_SCALARS_NOT_EXPORTED.items():
+            module = importlib.import_module(mod)
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertTrue(hasattr(module, name))
+                    self.assertFalse(hasattr(screen, name), "门面导出会变成导入时的旧副本")
+
+    def test_market_warnings_is_one_shared_list(self):
+        self.assertIs(screen.MARKET_WARNINGS, market_warnings.MARKET_WARNINGS)
+        self.assertIs(kline.MARKET_WARNINGS, market_warnings.MARKET_WARNINGS)
+
     def test_net_names_are_reexported_not_copied(self):
         for name in NET_EXPORTS:
             with self.subTest(name=name):
