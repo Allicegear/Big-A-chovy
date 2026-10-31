@@ -131,8 +131,8 @@ class NetworkDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("Traceback", message)
 
     @patch("time.sleep", return_value=None)
-    @patch("a_share_daily_screen.fetch_sina_market", create=True)
-    @patch("a_share_daily_screen.fetch_json")
+    @patch("screening.sources.market.fetch_sina_market")
+    @patch("screening.sources.market.fetch_json")
     def test_fetch_market_preserves_network_failure_for_cli_handling(self, fetch_json, fetch_sina_market, _sleep):
         failure = NetworkUnavailable("https://example.invalid", {"直连": "ConnectionError"})
         fetch_json.side_effect = failure
@@ -144,8 +144,8 @@ class NetworkDiagnosticsTests(unittest.TestCase):
         self.assertIs(caught.exception, failure)
 
     @patch("time.sleep", return_value=None)
-    @patch("a_share_daily_screen.fetch_sina_market", create=True)
-    @patch("a_share_daily_screen.fetch_json")
+    @patch("screening.sources.market.fetch_sina_market")
+    @patch("screening.sources.market.fetch_json")
     def test_fetch_market_uses_independent_fallback_after_push2_failure(self, fetch_json, fetch_sina_market, _sleep):
         """push2 host aliases must not prevent a separate provider fallback."""
         MARKET_WARNINGS.clear()
@@ -165,9 +165,9 @@ class NetworkDiagnosticsTests(unittest.TestCase):
         self.assertTrue(any("新浪备用行情" in warning for warning in MARKET_WARNINGS))
 
     @patch("time.sleep", return_value=None)
-    @patch("a_share_daily_screen._em_in_cooldown", return_value=False)
-    @patch("a_share_daily_screen.fetch_sina_market", return_value=([], 0), create=True)
-    @patch("a_share_daily_screen.fetch_json")
+    @patch("screening.sources.market._em_in_cooldown", return_value=False)
+    @patch("screening.sources.market.fetch_sina_market", return_value=([], 0))
+    @patch("screening.sources.market.fetch_json")
     def test_page_one_has_one_controlled_host_failover(self, fetch_json, _fetch_sina_market, _cooldown, _sleep):
         """A page-one CDN fault gets controlled host failover."""
         MARKET_WARNINGS.clear()
@@ -205,7 +205,7 @@ class NetworkDiagnosticsTests(unittest.TestCase):
         self.assertTrue(callable(opener.open))
 
     @patch("time.sleep", return_value=None)
-    @patch("a_share_daily_screen.fetch_json")
+    @patch("screening.sources.market.fetch_json")
     def test_fetch_market_marks_incomplete_pages_as_partial_snapshot(self, fetch_json, _sleep):
         """A few successful top-gainer pages must never look like a full market."""
         MARKET_WARNINGS.clear()
@@ -231,7 +231,7 @@ class NetworkDiagnosticsTests(unittest.TestCase):
         self.assertTrue(any("局部快照" in warning for warning in MARKET_WARNINGS))
 
     @patch("time.sleep", return_value=None)
-    @patch("a_share_daily_screen.fetch_json")
+    @patch("screening.sources.market.fetch_json")
     def test_fetch_market_uses_exact_page_count_and_code_order(self, fetch_json, _sleep):
         """A complete two-page response must not request a phantom third page."""
         MARKET_WARNINGS.clear()

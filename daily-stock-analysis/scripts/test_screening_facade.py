@@ -12,7 +12,7 @@ from pathlib import Path
 
 import a_share_daily_screen as screen
 from screening import intersection, market_warnings, model, net, render, risk, rules
-from screening.sources import kline
+from screening.sources import kline, market
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
@@ -86,7 +86,25 @@ FACADE_REDIRECT_FORBIDDEN = {
         "_note_tencent_kline_result", "_note_sina_kline_fallback", "_record_kline_reference",
         "_note_sina_fallback_code", "enrich",
     ),
+    # fetch_market / fetch_indices / fetch_sector_indices / get_market_fetch_status（核心
+    # 流水线调用）、SINA_MARKET_URL / _normalize_sina_row（看板经门面读取）仍有门面读取方。
+    "screening.sources.market": (
+        "EASTMONEY_UT", "CLIST_URLS", "CLIST_STARTUP_URLS", "CLIST_FIELDS", "INDEX_URLS",
+        "INDEX_SECIDS", "SINA_PAGE_SIZE", "SINA_MAX_PAGES", "SECTOR_BOARD_PAGE_SIZE",
+        "SECTOR_BOARD_MAX_PAGES", "SECTOR_BOARD_SORT_FIELD", "SECTOR_BOARD_FIELDS",
+        "MARKET_FETCH_STATUS", "SECTOR_BOARDS_STATUS", "_sina_number", "fetch_sina_market",
+        "_sector_board_params", "_fetch_sector_page",
+    ),
 }
+
+MARKET_EXPORTS = (
+    "CLIST_FIELDS", "CLIST_STARTUP_URLS", "CLIST_URLS", "EASTMONEY_UT", "INDEX_SECIDS",
+    "INDEX_URLS", "MARKET_FETCH_STATUS", "SECTOR_BOARDS_STATUS", "SECTOR_BOARD_FIELDS",
+    "SECTOR_BOARD_MAX_PAGES", "SECTOR_BOARD_PAGE_SIZE", "SECTOR_BOARD_SORT_FIELD",
+    "SINA_MARKET_URL", "SINA_MAX_PAGES", "SINA_PAGE_SIZE", "_fetch_sector_page",
+    "_normalize_sina_row", "_sector_board_params", "_sina_number", "fetch_indices",
+    "fetch_market", "fetch_sector_indices", "fetch_sina_market", "get_market_fetch_status",
+)
 
 KLINE_EXPORTS = (
     "EM_KLINE_FIELDS1", "EM_KLINE_FIELDS2", "EM_KLINE_URL", "EM_KLINE_URLS", "KLINE_MIN_BARS",
@@ -116,6 +134,11 @@ RENDER_EXPORTS = (
 
 
 class FacadeIdentityTest(unittest.TestCase):
+    def test_market_names_are_reexported_not_copied(self):
+        for name in MARKET_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(market, name))
+
     def test_kline_names_are_reexported_not_copied(self):
         for name in KLINE_EXPORTS:
             with self.subTest(name=name):
