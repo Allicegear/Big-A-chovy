@@ -158,9 +158,11 @@ class ResonanceScopeTests(unittest.TestCase):
 
     def test_main_board_prefixes_still_used_for_limit_stats(self):
         """main_board_prefixes 仍服务于「主板涨停/跌停」，两个用途必须分开。"""
+        # 涨跌停统计（market_summary）留在核心；强势股计数（sector_stats）已拆到 screening/rules.py
         src = (SCRIPT_DIR / "a_share_daily_screen.py").read_text(encoding="utf-8")
+        rules = (SCRIPT_DIR / "screening" / "rules.py").read_text(encoding="utf-8")
         self.assertIn("main_board_prefixes", src, "主板涨跌停统计仍需该前缀")
-        self.assertIn("strong_scope_boards", src, "强势股口径应独立可追溯")
+        self.assertIn("strong_scope_boards", rules, "强势股口径应独立可追溯")
 
 
 class ReportContractTests(unittest.TestCase):
