@@ -19,8 +19,14 @@
 
 无未来数据：每个快照只携带该时刻可见字段；状态机仅读取
 「当前快照 + 已持久化历史状态」，从不读取任何后续快照。
+
+原为独立脚本 ``replay_intersection_20260728.py``（CI 不收集），现纳入测试套件；
+仍可直接运行查看逐快照日志：``python test_intersection_replay_20260728.py``。
 """
+import contextlib
+import io
 import tempfile
+import unittest
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -177,11 +183,22 @@ def build_timeline():
     return T
 
 
-def run():
-    # 持久化重定向到临时文件，避免污染真实 intersection_state.json
-    tmp_state = Path(tempfile.mkdtemp()) / "replay_state.json"
-    screen.INTERSECTION_STATE_FILE = tmp_state
+def run() -> list:
+    """跑完整时间线并返回失败断言列表（空列表 = 全部通过）。"""
+    FAILURES.clear()
+    # 持久化重定向到临时文件，避免污染真实 intersection_state.json；结束后恢复，
+    # 否则在测试套件里会把后续测试的状态路径也改掉。
+    original_state_file = screen.INTERSECTION_STATE_FILE
+    with tempfile.TemporaryDirectory() as tmp:
+        screen.INTERSECTION_STATE_FILE = Path(tmp) / "replay_state.json"
+        try:
+            _run_timeline()
+        finally:
+            screen.INTERSECTION_STATE_FILE = original_state_file
+    return list(FAILURES)
 
+
+def _run_timeline() -> None:
     cfg = dict(screen.DEFAULT_INTERSECTION_CONFIG)
     prev_state: dict = {}
     history: dict = {}   # code -> [(time, phase_code, note)]
@@ -274,8 +291,10 @@ def run():
           f"云图退出原因含实际数值：{yt_rows.get('13:46', {}).get('pre_exit_reason')}")
     check(all(p not in (screen.PHASE_ENTRY, screen.PHASE_RETEST_READY) for _, p in phases("002539")),
           "云图全程不产生买点")
-    check(all(not r.get("new_entry_allowed") for r in yt_rows.values()),
-          "云图 watch_risk：全程不允许新开仓（可预警可观察）")
+    # 框架：watch_risk 仅减分不否决，故不断言 new_entry_allowed（风险/环境许可）为否；
+    # 云图从未到达 ENTRY_ELIGIBLE，所以逐只可开仓资格 new_open_eligible 必须全程为否。
+    check(all(not r.get("new_open_eligible") for r in yt_rows.values()),
+          "云图 watch_risk：全程无新开仓资格（未到 ENTRY_ELIGIBLE；watch_risk 仅减分不否决）")
 
     # 2. 星帅尔
     check(all(p == screen.PHASE_OBSERVING for _, p in phases("002860")),
@@ -321,9 +340,23 @@ def run():
         print(f"验收失败 {len(FAILURES)} 项：")
         for f in FAILURES:
             print(f"  ✗ {f}")
-        raise SystemExit(1)
-    print("全部验收断言通过 ✓（状态机仅读取当前快照+持久化历史，无未来数据）")
+    else:
+        print("全部验收断言通过 ✓（状态机仅读取当前快照+持久化历史，无未来数据）")
+
+
+class IntersectionReplay20260728Test(unittest.TestCase):
+    def test_acceptance_timeline(self):
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            failures = run()
+        self.assertEqual(failures, [], log.getvalue()[-4000:])
+
+    def test_state_file_restored_after_run(self):
+        before = screen.INTERSECTION_STATE_FILE
+        with contextlib.redirect_stdout(io.StringIO()):
+            run()
+        self.assertEqual(screen.INTERSECTION_STATE_FILE, before)
 
 
 if __name__ == "__main__":
-    run()
+    raise SystemExit(1 if run() else 0)

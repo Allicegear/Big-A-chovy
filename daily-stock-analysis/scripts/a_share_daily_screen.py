@@ -2709,12 +2709,13 @@ def enrich_all(
     workers: int,
     fetch_kline_fn: Optional[Callable[..., Tuple[List[Dict[str, float]], str]]] = None,
 ) -> Tuple[List[Enriched], List[str]]:
+    # 结果按输入顺序返回，而不是线程完成顺序：下游（如低开洗盘每轮 20 只的
+    # 历史资金查询额度）按列表先后分配，完成顺序会让同一份行情每次结果不同。
     out: List[Enriched] = []
     errors: List[str] = []
     with futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        future_map = {pool.submit(enrich, r, fetch_kline_fn): str(r.get("f12")) for r in rows}
-        for fut in futures.as_completed(future_map):
-            code = future_map[fut]
+        submitted = [(pool.submit(enrich, r, fetch_kline_fn), str(r.get("f12"))) for r in rows]
+        for fut, code in submitted:
             try:
                 item = fut.result()
                 if item:

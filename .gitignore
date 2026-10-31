@@ -46,3 +46,6 @@ tools/shadow_data/shadow_samples.json
 # Local reports and decision records may contain personal trading data
 筛选结果/
 决策记录/
+
+# 重构金标准数据（真实行情录制 + 本机状态种子，仅本地）
+.golden_local/
