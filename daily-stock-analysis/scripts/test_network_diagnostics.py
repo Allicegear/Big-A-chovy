@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import a_share_daily_screen as screen
 import realtime_engine as realtime
+from screening import net
 from a_share_daily_screen import (
     MARKET_WARNINGS,
     NetworkUnavailable,
@@ -308,8 +309,9 @@ class SinaReachableTests(unittest.TestCase):
         session = Mock()
         session.get.return_value.json.return_value = [self.VALID_ROW]
         deadline = time.monotonic() + 2
-        with patch.object(screen, "NETWORK_MODE", "auto"), \
-             patch.object(screen, "requests", object()), \
+        # fetch_json 在 screening.net 里读取这两个模块变量，必须改在 net 上
+        with patch.object(net, "NETWORK_MODE", "auto"), \
+             patch.object(net, "requests", object()), \
              patch.object(screen.network_path, "ordered_independent_sessions", return_value=[("代理A", session)]) as routes, \
              patch.object(screen.network_path, "ordered_sessions", side_effect=AssertionError("Eastmoney-only path list used")):
             data = screen.fetch_json(screen.SINA_MARKET_URL, {"num": 1}, deadline=deadline)
@@ -335,8 +337,8 @@ class SinaReachableTests(unittest.TestCase):
         opener = Mock()
         opener.open.return_value = FakeResponse()
         deadline = time.monotonic() + 2
-        with patch.object(screen, "NETWORK_MODE", "auto"), \
-             patch.object(screen, "requests", None), \
+        with patch.object(net, "NETWORK_MODE", "auto"), \
+             patch.object(net, "requests", None), \
              patch.object(screen.network_path, "independent_path_candidates", return_value=[("直连", None)]) as routes, \
              patch.object(screen.urllib.request, "build_opener", return_value=opener):
             data = screen.fetch_json(screen.SINA_MARKET_URL, {"num": 1}, deadline=deadline)
