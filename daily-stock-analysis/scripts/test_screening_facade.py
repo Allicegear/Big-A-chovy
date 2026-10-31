@@ -6,10 +6,15 @@
 调用方与测试确知自己拿到的是真实实现。
 """
 
+import re
 import unittest
+from pathlib import Path
 
 import a_share_daily_screen as screen
-from screening import model, risk, rules
+from screening import intersection, model, risk, rules
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
 MODEL_EXPORTS = (
     "BOARD_CHINEXT", "BOARD_LABELS", "BOARD_MAIN", "BOARD_ORDER", "BOARD_STAR", "BOARD_UNKNOWN",
@@ -34,7 +39,49 @@ RISK_EXPORTS = (
 )
 
 
+INTERSECTION_EXPORTS = (
+    "DEFAULT_INTERSECTION_CONFIG", "INTERSECTION_CALIBRATION_FILE", "INTERSECTION_CONFIG_VERSION",
+    "INTERSECTION_STATE_FILE", "PHASE_ENTRY", "PHASE_EXPIRED", "PHASE_INVALID", "PHASE_LABELS",
+    "PHASE_LATCHED", "PHASE_LATE", "PHASE_OBSERVING", "PHASE_ORDER", "PHASE_PRE",
+    "PHASE_RETEST_READY", "PHASE_WAIT_RETEST", "_LEGACY_PHASE_MAP", "_canonical_phase",
+    "_clock_minutes", "_config_is_safe", "_format_clock", "_intersection_rejection_reasons",
+    "_late_filter_reasons", "_minute_freshness", "_parse_intersection_datetime", "_pre_gates",
+    "_predict_trigger_price", "_pullback_zone", "compute_pre_intersection",
+    "evaluate_intersection_states", "load_intersection_calibration", "load_intersection_state",
+    "resolve_intersection_config", "resolve_market_mode", "save_intersection_state",
+)
+
+# 已拆到子模块、由子模块内部读取的状态路径：在门面上赋值或 patch 不会生效，
+# 测试会以为自己隔离了状态，实际写的是默认位置。
+MOVED_STATE_PATHS = ("INTERSECTION_STATE_FILE", "INTERSECTION_CALIBRATION_FILE")
+
+
 class FacadeIdentityTest(unittest.TestCase):
+    def test_intersection_names_are_reexported_not_copied(self):
+        for name in INTERSECTION_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(intersection, name))
+
+    def test_calibration_file_still_lives_beside_the_scripts(self):
+        self.assertEqual(intersection.INTERSECTION_CALIBRATION_FILE,
+                         screen.SCRIPT_DIR / "intersection_calibration.json")
+
+    def test_no_code_redirects_moved_state_paths_through_the_facade(self):
+        alias = r"(?:screen|s|a_share_daily_screen)"
+        patterns = [
+            re.compile(rf"\b{alias}\.({'|'.join(MOVED_STATE_PATHS)})\s*=(?!=)"),
+            re.compile(rf"patch\.object\(\s*{alias}\s*,\s*[\"']({'|'.join(MOVED_STATE_PATHS)})[\"']"),
+            re.compile(rf"patch\(\s*[\"']a_share_daily_screen\.({'|'.join(MOVED_STATE_PATHS)})[\"']"),
+        ]
+        offenders = []
+        for path in sorted(list(SCRIPT_DIR.glob("*.py")) + list((PROJECT_ROOT / "tools").glob("*.py"))):
+            if path.name == Path(__file__).name:
+                continue
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if any(p.search(line) for p in patterns):
+                    offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+        self.assertEqual(offenders, [], "请改 screening.intersection 模块上的属性")
+
     def test_risk_names_are_reexported_not_copied(self):
         for name in RISK_EXPORTS:
             with self.subTest(name=name):

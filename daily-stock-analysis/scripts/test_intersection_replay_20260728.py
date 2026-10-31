@@ -32,6 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 import a_share_daily_screen as screen
+from screening import intersection
 
 TZ = screen.TZ
 FAILURES: list = []
@@ -187,14 +188,15 @@ def run() -> list:
     """跑完整时间线并返回失败断言列表（空列表 = 全部通过）。"""
     FAILURES.clear()
     # 持久化重定向到临时文件，避免污染真实 intersection_state.json；结束后恢复，
-    # 否则在测试套件里会把后续测试的状态路径也改掉。
-    original_state_file = screen.INTERSECTION_STATE_FILE
+    # 否则在测试套件里会把后续测试的状态路径也改掉。状态读写在 screening.intersection
+    # 里，必须改那个模块的属性——改门面上的同名属性不会生效。
+    original_state_file = intersection.INTERSECTION_STATE_FILE
     with tempfile.TemporaryDirectory() as tmp:
-        screen.INTERSECTION_STATE_FILE = Path(tmp) / "replay_state.json"
+        intersection.INTERSECTION_STATE_FILE = Path(tmp) / "replay_state.json"
         try:
             _run_timeline()
         finally:
-            screen.INTERSECTION_STATE_FILE = original_state_file
+            intersection.INTERSECTION_STATE_FILE = original_state_file
     return list(FAILURES)
 
 
@@ -352,10 +354,10 @@ class IntersectionReplay20260728Test(unittest.TestCase):
         self.assertEqual(failures, [], log.getvalue()[-4000:])
 
     def test_state_file_restored_after_run(self):
-        before = screen.INTERSECTION_STATE_FILE
+        before = intersection.INTERSECTION_STATE_FILE
         with contextlib.redirect_stdout(io.StringIO()):
             run()
-        self.assertEqual(screen.INTERSECTION_STATE_FILE, before)
+        self.assertEqual(intersection.INTERSECTION_STATE_FILE, before)
 
 
 if __name__ == "__main__":
