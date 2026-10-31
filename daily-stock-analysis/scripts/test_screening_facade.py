@@ -12,7 +12,7 @@ from pathlib import Path
 
 import a_share_daily_screen as screen
 from screening import intersection, market_warnings, model, net, render, risk, rules
-from screening.sources import announcements, kline, market
+from screening.sources import announcements, flow, kline, market
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
@@ -112,7 +112,37 @@ FACADE_REDIRECT_FORBIDDEN = {
         "extract_primary_announcement_total", "validate_primary_announcement_page",
         "_canonical_announcement_risk",
     ),
+    # 门面里仍有读取方（低吸排除 / 低开洗盘 / 主导判定 / 流水线，待 F2 拆走）的不在此列：
+    # load/save_flow_history、apply_flow_increments、fill_flow_increments_from_fflow、
+    # reset_flow_minute_round、round_series_date、low_absorb_unverified_count、
+    # _note_low_absorb_unverified、_pace_flow_minute_request、_flow_minute_series_for、
+    # flow_continuity_from_minutes、flow_negative_samples_from_minutes、
+    # _LOW_OPEN_DAILY_FLOW_CACHE(_LOCK)。
+    "screening.sources.flow": (
+        "FLOW_SNAPSHOT_PATH", "EM_FFLOW_MINUTE_URLS", "FLOW_MINUTE_TTL_SECONDS",
+        "FLOW_MINUTE_MIN_INTERVAL_SECONDS", "FLOW_MINUTE_MAX_CODES_PER_ROUND",
+        "FLOW_MINUTE_SAFETY_RESERVE", "_FLOW_MINUTE_CACHE", "_FLOW_MINUTE_LOCK",
+        "_FLOW_MINUTE_ROUND_CODES", "_FLOW_MINUTE_ROUND_LOCK", "_FLOW_MINUTE_ROUND_EXPECTED_DATE",
+        "_FLOW_MINUTE_LAST_REQUEST_AT", "_LOW_ABSORB_UNVERIFIED_COUNT", "_flow_minute_budget_ok",
+        "_contiguous_tail_start", "_column_values", "flow_window_deltas", "_is_intraday_now",
+        "_minutes_of_hhmm", "fetch_flow_minutes", "flow_increments_from_minutes",
+        "compute_buy_ratio",
+    ),
 }
+
+FLOW_EXPORTS = (
+    "EM_FFLOW_MINUTE_URLS", "FLOW_MINUTE_MAX_CODES_PER_ROUND", "FLOW_MINUTE_MIN_INTERVAL_SECONDS",
+    "FLOW_MINUTE_SAFETY_RESERVE", "FLOW_MINUTE_TTL_SECONDS", "FLOW_SNAPSHOT_PATH",
+    "_FLOW_MINUTE_CACHE", "_FLOW_MINUTE_LOCK", "_FLOW_MINUTE_ROUND_CODES", "_FLOW_MINUTE_ROUND_LOCK",
+    "_LOW_OPEN_DAILY_FLOW_CACHE", "_LOW_OPEN_DAILY_FLOW_CACHE_LOCK", "_column_values",
+    "_contiguous_tail_start", "_flow_minute_budget_ok", "_flow_minute_series_for",
+    "_is_intraday_now", "_minutes_of_hhmm", "_note_low_absorb_unverified",
+    "_pace_flow_minute_request", "apply_flow_increments", "compute_buy_ratio", "fetch_flow_minutes",
+    "fill_flow_increments_from_fflow", "flow_continuity_from_minutes",
+    "flow_increments_from_minutes", "flow_negative_samples_from_minutes", "flow_window_deltas",
+    "load_flow_history", "low_absorb_unverified_count", "reset_flow_minute_round",
+    "round_series_date", "save_flow_history",
+)
 
 ANNOUNCEMENT_EXPORTS = (
     "ANNOUNCEMENT_CACHE_FILE", "ANNOUNCEMENT_CACHE_TTL_SECONDS", "ANNOUNCEMENT_CONFIG",
@@ -154,6 +184,10 @@ REBOUND_SCALARS_NOT_EXPORTED = {
         "_tencent_kline_fail_streak", "_tencent_kline_blocked_until", "_sina_kline_fallback_warned",
     ),
     "screening.sources.announcements": ("_ANNOUNCEMENT_RISK_CACHE",),
+    "screening.sources.flow": (
+        "_FLOW_MINUTE_ROUND_EXPECTED_DATE", "_FLOW_MINUTE_LAST_REQUEST_AT",
+        "_LOW_ABSORB_UNVERIFIED_COUNT",
+    ),
 }
 
 
@@ -165,6 +199,15 @@ RENDER_EXPORTS = (
 
 
 class FacadeIdentityTest(unittest.TestCase):
+    def test_flow_names_are_reexported_not_copied(self):
+        for name in FLOW_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(flow, name))
+
+    def test_flow_config_and_clock_have_a_single_source(self):
+        self.assertIs(flow.SCREENING_CONFIG, screen.SCREENING_CONFIG)
+        self.assertIs(flow.TZ, screen.TZ)
+
     def test_announcement_names_are_reexported_not_copied(self):
         for name in ANNOUNCEMENT_EXPORTS:
             with self.subTest(name=name):
