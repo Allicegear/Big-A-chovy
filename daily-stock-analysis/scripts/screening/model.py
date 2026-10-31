@@ -2,18 +2,11 @@
 from __future__ import annotations
 
 import math
-import sys
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-from tools.rule_config import RULE_CONFIG  # noqa: E402
-
-RISK_UNKNOWN = RULE_CONFIG["risk"]["statuses"]["unknown"]
+from screening.risk import RISK_UNKNOWN  # 风险状态唯一来源
 
 
 def is_number(value: Any) -> bool:

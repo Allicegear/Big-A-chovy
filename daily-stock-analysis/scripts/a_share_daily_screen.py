@@ -69,13 +69,16 @@ import tls_context  # noqa: E402  TLS 校验上下文唯一来源（默认校验
 RISK_CONFIG = RULE_CONFIG["risk"]
 SCREENING_CONFIG = RULE_CONFIG["screening"]
 EXECUTION_CONFIG = RULE_CONFIG["execution"]
-RISK_STATUSES = RISK_CONFIG["statuses"]
-RISK_CLEAN = RISK_STATUSES["clean"]
-RISK_WATCH = RISK_STATUSES["watch_risk"]
-RISK_AVOID = RISK_STATUSES["avoid"]
-RISK_UNKNOWN = RISK_STATUSES["unknown"]
-RISK_STATUS_VALUES = frozenset(RISK_STATUSES.values())
-RISK_CHECKED_VALUES = frozenset({RISK_CLEAN, RISK_WATCH, RISK_AVOID})
+# 公告风险状态常量的唯一来源是 screening/risk.py
+from screening.risk import (  # noqa: E402,F401
+    RISK_AVOID,
+    RISK_CHECKED_VALUES,
+    RISK_CLEAN,
+    RISK_STATUS_VALUES,
+    RISK_STATUSES,
+    RISK_UNKNOWN,
+    RISK_WATCH,
+)
 
 TZ = ZoneInfo("Asia/Shanghai")
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) daily-stock-analysis/1.0"
@@ -1191,72 +1194,17 @@ def _save_announcement_risk_cache(cache: Dict[str, Dict[str, Any]]) -> None:
         pass
 
 
-def _row_risk_status(row: Any) -> str:
-    """Normalize announcement risk without treating missing as clean. Supports Dict and Enriched objects."""
-    if row is None:
-        return RISK_UNKNOWN
-    if isinstance(row, dict):
-        status = row.get("risk_status")
-        if status in RISK_STATUS_VALUES:
-            return status
-        legacy = row.get("announcement_risk")
-        if legacy in RISK_CHECKED_VALUES:
-            return legacy
-        return RISK_UNKNOWN
-    status = getattr(row, "risk_status", None)
-    if status in RISK_STATUS_VALUES:
-        return status
-    legacy = getattr(row, "announcement_risk", None)
-    if legacy in RISK_CHECKED_VALUES:
-        return legacy
-    return RISK_UNKNOWN
-
-
-def announcement_label(row: Dict[str, Any]) -> str:
-    risk = _row_risk_status(row)
-    keywords = row.get("announcement_keywords") or []
-    if keywords:
-        return f"{risk}({','.join(keywords[:3])})"
-    if risk == RISK_UNKNOWN:
-        return f"{RISK_UNKNOWN}(公告检查不可用)"
-    return risk
-
-
-# ── 公告风险政策（唯一语义，依据 选股框架.md「一、信号与建仓门禁」）──────────
-# clean：正常；watch_risk：仅减分，不阻断正式资格；avoid/unknown：一票否决。
-# 所有模块（双池交集状态机、准交集、观察池突破、资金排名、输出标签）都必须读这里，
-# 不得各自把“非 clean”当成硬否决——那是把软风险和框架一票否决混为一谈。
-RISK_HARD_VETO = frozenset({RISK_AVOID, RISK_UNKNOWN})
-
-
-def risk_blocks_formal_qualification(risk: Any) -> bool:
-    """avoid/unknown 一票否决；clean/watch_risk 不因“非 clean”被否决。"""
-    return str(risk or RISK_UNKNOWN) in RISK_HARD_VETO
-
-
-def risk_allows_state_qualification(risk: Any) -> bool:
-    """状态资格（可否推进到 ENTRY_ELIGIBLE 等）只看是否触及一票否决。"""
-    return not risk_blocks_formal_qualification(risk)
-
-
-def risk_note_text(risk: Any) -> str:
-    """人类可读风险标注：软风险与一票否决必须分开表述。"""
-    status = str(risk or RISK_UNKNOWN)
-    if status == RISK_CLEAN:
-        return ""
-    if status == RISK_WATCH:
-        return f"公告{RISK_WATCH}（仅减分，非一票否决）"
-    return f"公告风险否决({status})"
-
-
-def append_risk_text(existing: str, extra: str) -> str:
-    if not extra:
-        return existing
-    if not existing or existing == "无":
-        return extra
-    if extra in existing:
-        return existing
-    return f"{existing}/{extra}"
+# 公告风险政策（_row_risk_status、一票否决判定、风险标注）已拆到 screening/risk.py；
+# 这里重新导出，既有调用方式不变。
+from screening.risk import (  # noqa: E402,F401
+    RISK_HARD_VETO,
+    _row_risk_status,
+    announcement_label,
+    append_risk_text,
+    risk_allows_state_qualification,
+    risk_blocks_formal_qualification,
+    risk_note_text,
+)
 
 
 # 参与公告核验的栏目：公告查询范围 = 这些栏目里出现的全部代码（去重）。

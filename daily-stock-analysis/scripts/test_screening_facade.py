@@ -9,7 +9,7 @@
 import unittest
 
 import a_share_daily_screen as screen
-from screening import model, rules
+from screening import model, risk, rules
 
 MODEL_EXPORTS = (
     "BOARD_CHINEXT", "BOARD_LABELS", "BOARD_MAIN", "BOARD_ORDER", "BOARD_STAR", "BOARD_UNKNOWN",
@@ -26,7 +26,20 @@ RULES_EXPORTS = (
 )
 
 
+RISK_EXPORTS = (
+    "RISK_AVOID", "RISK_CHECKED_VALUES", "RISK_CLEAN", "RISK_STATUS_VALUES", "RISK_STATUSES",
+    "RISK_UNKNOWN", "RISK_WATCH", "RISK_HARD_VETO", "_row_risk_status", "announcement_label",
+    "append_risk_text", "risk_allows_state_qualification", "risk_blocks_formal_qualification",
+    "risk_note_text",
+)
+
+
 class FacadeIdentityTest(unittest.TestCase):
+    def test_risk_names_are_reexported_not_copied(self):
+        for name in RISK_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(risk, name))
+
     def test_model_names_are_reexported_not_copied(self):
         for name in MODEL_EXPORTS:
             with self.subTest(name=name):
@@ -43,7 +56,7 @@ class FacadeIdentityTest(unittest.TestCase):
         self.assertIs(rules.EXECUTION_CONFIG, screen.EXECUTION_CONFIG)
 
     def test_enriched_default_risk_matches_screen(self):
-        self.assertEqual(model.RISK_UNKNOWN, screen.RISK_UNKNOWN)
+        self.assertIs(model.RISK_UNKNOWN, risk.RISK_UNKNOWN)
 
 
 if __name__ == "__main__":
