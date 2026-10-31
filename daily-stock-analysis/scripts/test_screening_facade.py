@@ -12,7 +12,7 @@ from pathlib import Path
 
 import a_share_daily_screen as screen
 from screening import intersection, market_warnings, model, net, render, risk, rules
-from screening.sources import kline, market
+from screening.sources import announcements, kline, market
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
@@ -95,7 +95,37 @@ FACADE_REDIRECT_FORBIDDEN = {
         "MARKET_FETCH_STATUS", "SECTOR_BOARDS_STATUS", "_sina_number", "fetch_sina_market",
         "_sector_board_params", "_fetch_sector_page",
     ),
+    # attach_announcement_risks / apply_announcement_pool_gates / ANNOUNCEMENT_SECTIONS
+    # （核心流水线使用）仍有门面读取方。tools.data_sources 的几个导入名在门面里仍有绑定
+    # 但已无人使用，patch 门面上的它们不会影响公告取数，一并禁止。
+    "screening.sources.announcements": (
+        "ANNOUNCEMENT_URL", "ANNOUNCEMENT_CACHE_FILE", "_ANNOUNCEMENT_RISK_CACHE",
+        "ANNOUNCEMENT_CACHE_TTL_SECONDS", "ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS",
+        "ANNOUNCEMENT_CONFIG", "HARD_ANNOUNCEMENT_KEYWORDS", "WATCH_ANNOUNCEMENT_KEYWORDS",
+        "ANNOUNCEMENT_IGNORE_KEYWORDS", "collect_announcement_titles", "_announcement_container",
+        "_announcement_business_failure", "_has_announcement_container", "_announcement_row_title",
+        "_announcement_total", "_announcement_total_from_response",
+        "_validate_announcement_page_count", "_validate_primary_announcement_response",
+        "fetch_announcements", "classify_announcement_risk", "_load_announcement_risk_cache",
+        "_save_announcement_risk_cache", "CNInfoAnnouncementSource", "project_http_client",
+        "fetch_announcement_evidence", "extract_primary_announcement_container",
+        "extract_primary_announcement_total", "validate_primary_announcement_page",
+        "_canonical_announcement_risk",
+    ),
 }
+
+ANNOUNCEMENT_EXPORTS = (
+    "ANNOUNCEMENT_CACHE_FILE", "ANNOUNCEMENT_CACHE_TTL_SECONDS", "ANNOUNCEMENT_CONFIG",
+    "ANNOUNCEMENT_IGNORE_KEYWORDS", "ANNOUNCEMENT_REQUEST_TIMEOUT_SECONDS",
+    "ANNOUNCEMENT_SECTIONS", "ANNOUNCEMENT_URL", "HARD_ANNOUNCEMENT_KEYWORDS",
+    "WATCH_ANNOUNCEMENT_KEYWORDS", "_announcement_business_failure", "_announcement_container",
+    "_announcement_row_title", "_announcement_total", "_announcement_total_from_response",
+    "_has_announcement_container", "_load_announcement_risk_cache",
+    "_save_announcement_risk_cache", "_validate_announcement_page_count",
+    "_validate_primary_announcement_response", "apply_announcement_pool_gates",
+    "attach_announcement_risks", "classify_announcement_risk", "collect_announcement_titles",
+    "fetch_announcements",
+)
 
 MARKET_EXPORTS = (
     "CLIST_FIELDS", "CLIST_STARTUP_URLS", "CLIST_URLS", "EASTMONEY_UT", "INDEX_SECIDS",
@@ -123,6 +153,7 @@ REBOUND_SCALARS_NOT_EXPORTED = {
     "screening.sources.kline": (
         "_tencent_kline_fail_streak", "_tencent_kline_blocked_until", "_sina_kline_fallback_warned",
     ),
+    "screening.sources.announcements": ("_ANNOUNCEMENT_RISK_CACHE",),
 }
 
 
@@ -134,6 +165,14 @@ RENDER_EXPORTS = (
 
 
 class FacadeIdentityTest(unittest.TestCase):
+    def test_announcement_names_are_reexported_not_copied(self):
+        for name in ANNOUNCEMENT_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(announcements, name))
+
+    def test_announcement_risk_config_has_a_single_source(self):
+        self.assertIs(announcements.RISK_CONFIG, screen.RISK_CONFIG)
+
     def test_market_names_are_reexported_not_copied(self):
         for name in MARKET_EXPORTS:
             with self.subTest(name=name):

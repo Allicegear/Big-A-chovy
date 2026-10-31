@@ -678,14 +678,18 @@ class SnapshotApiTests(_IsolatedStateTestCase):
         starter.assert_called_once_with(force=False)
 
     def test_background_check_collapses_concurrent_calls(self):
-        update_check.start_background_check(force=True)
-        with update_check._lock:
-            update_check._inflight = True
-        try:
-            self.assertFalse(update_check.start_background_check())
-        finally:
+        # 只测"并发调用合并"，不起真实检查：真实线程会访问 GitHub，并在后续用例
+        # 运行期间改写 _last（导致 test_fresh_snapshot_* 偶发失败），还可能在隔离
+        # 目录已恢复后把缓存写进真实状态目录。
+        with mock.patch.object(update_check, "_run_check"):
+            update_check.start_background_check(force=True)
             with update_check._lock:
-                update_check._inflight = False
+                update_check._inflight = True
+            try:
+                self.assertFalse(update_check.start_background_check())
+            finally:
+                with update_check._lock:
+                    update_check._inflight = False
 
 
 class VersionConsistencyTests(unittest.TestCase):

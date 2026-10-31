@@ -50,7 +50,7 @@ class AnnouncementFailClosedTests(unittest.TestCase):
             }
         }
         with patch(
-            "a_share_daily_screen.fetch_announcements",
+            "screening.sources.announcements.fetch_announcements",
             side_effect=AssertionError("fresh cache should avoid a network request"),
         ):
             errors = attach_announcement_risks(
@@ -80,7 +80,7 @@ class AnnouncementFailClosedTests(unittest.TestCase):
             requested.append(code)
             return []
 
-        with patch("a_share_daily_screen.fetch_announcements", side_effect=fake_fetch):
+        with patch("screening.sources.announcements.fetch_announcements", side_effect=fake_fetch):
             attach_announcement_risks(
                 result,
                 page_size=8,
@@ -95,7 +95,7 @@ class AnnouncementFailClosedTests(unittest.TestCase):
         cache = {}
         initial = result_for(row("000948"))
         with patch(
-            "a_share_daily_screen.fetch_announcements",
+            "screening.sources.announcements.fetch_announcements",
             return_value=["关于诉讼事项的公告"],
         ):
             attach_announcement_risks(initial, page_size=8, workers=1, risk_cache=cache)
@@ -106,7 +106,7 @@ class AnnouncementFailClosedTests(unittest.TestCase):
 
         failed = result_for(row("000948"))
         with patch(
-            "a_share_daily_screen.fetch_announcements",
+            "screening.sources.announcements.fetch_announcements",
             side_effect=RuntimeError("公告源不可用"),
         ):
             errors = attach_announcement_risks(
@@ -133,7 +133,7 @@ class AnnouncementFailClosedTests(unittest.TestCase):
         result["capital_rank"][0]["announcement_risk"] = "avoid"
 
         with patch(
-            "a_share_daily_screen.fetch_announcements",
+            "screening.sources.announcements.fetch_announcements",
             side_effect=RuntimeError("公告源不可用"),
         ):
             attach_announcement_risks(

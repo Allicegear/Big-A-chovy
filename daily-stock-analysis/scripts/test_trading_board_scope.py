@@ -319,7 +319,7 @@ class ResultContractTests(unittest.TestCase):
         # 旧快照的兼容渲染分支在 screening/render.py；按整个筛选引擎检查
         core = "\n".join(
             path.read_text(encoding="utf-8")
-            for path in [SCRIPT_DIR / "a_share_daily_screen.py", *sorted((SCRIPT_DIR / "screening").glob("*.py"))]
+            for path in [SCRIPT_DIR / "a_share_daily_screen.py", *sorted((SCRIPT_DIR / "screening").rglob("*.py"))]
         )
         self.assertNotIn("build_extended_board_observations", core)
         self.assertIn('if "extended_board_observations" in result', core, "旧快照需保留原口径渲染")

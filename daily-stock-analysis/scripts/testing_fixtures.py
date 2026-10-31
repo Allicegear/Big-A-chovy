@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 import a_share_daily_screen as screen
 import realtime_engine as engine
+from screening.sources import announcements as ann_src
 
 RISK_CACHE_TTL_SAFE = 60.0  # 缓存条目写得足够新，公告核验走缓存、不发请求
 
@@ -134,10 +135,12 @@ class SyntheticEnvironment:
             mock.patch.object(screen, "save_watchlist_breakout_state", side_effect=rec("breakout")),
             mock.patch.object(screen, "load_holding_codes", return_value=set()),
             mock.patch.object(screen, "load_intersection_calibration", return_value=None),
-            mock.patch.object(screen, "_load_announcement_risk_cache", return_value=dict(self.risk_cache)),
-            mock.patch.object(screen, "_save_announcement_risk_cache", side_effect=lambda *a, **k: None),
+            # 公告缓存读写与抓取由 screening.sources.announcements 内部的
+            # attach_announcement_risks 调用，必须 patch 在那里，否则会读写真实缓存、真实联网
+            mock.patch.object(ann_src, "_load_announcement_risk_cache", return_value=dict(self.risk_cache)),
+            mock.patch.object(ann_src, "_save_announcement_risk_cache", side_effect=lambda *a, **k: None),
             mock.patch.object(
-                screen, "fetch_announcements",
+                ann_src, "fetch_announcements",
                 side_effect=RuntimeError("synthetic: announcement source offline"),
             ),
             # 看板专有依赖：分钟线与 5 分钟量能都不联网
