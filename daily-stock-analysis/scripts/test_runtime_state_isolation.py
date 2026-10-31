@@ -157,7 +157,7 @@ class NoHardcodedStatePathsTests(unittest.TestCase):
     def _sources(cls):
         # 核心拆分出的 screening/ 子模块同样持有状态路径，必须一并扫描
         return list(cls.SOURCES) + sorted(
-            str(p.relative_to(SCRIPT_DIR)) for p in (SCRIPT_DIR / "screening").glob("*.py")
+            str(p.relative_to(SCRIPT_DIR)) for p in (SCRIPT_DIR / "screening").rglob("*.py")
         )
 
     def test_state_files_are_not_hardcoded(self):
@@ -178,7 +178,7 @@ class NoHardcodedStatePathsTests(unittest.TestCase):
         self.assertIn('SETTINGS_PATH = SCRIPT_DIR / "dashboard_settings.json"', settings)
         # 标定配置（intersection_calibration.json）已随状态机拆到 screening/intersection.py
         core_sources = src + "".join(
-            p.read_text(encoding="utf-8") for p in sorted((SCRIPT_DIR / "screening").glob("*.py"))
+            p.read_text(encoding="utf-8") for p in sorted((SCRIPT_DIR / "screening").rglob("*.py"))
         )
         self.assertIn('SCRIPT_DIR / "intersection_calibration.json"', core_sources)
         for name in NOT_REDIRECTED:

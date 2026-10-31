@@ -10,6 +10,8 @@ from unittest.mock import Mock, patch
 
 import a_share_daily_screen as screen
 import testing_fixtures as fx
+# 公告抓取 / 缓存 / 风险挂载在 screening.sources.announcements 里，依赖须 patch 在那里
+from screening.sources import announcements as ann_src
 from tools import query_financials
 import realtime_dashboard as dashboard
 from tools.data_sources.cache import JsonCache
@@ -32,16 +34,16 @@ class AnnouncementBusinessFailureTests(unittest.TestCase):
         return fallback
 
     def test_http_200_business_failure_uses_cninfo_fallback(self) -> None:
-        with patch.object(screen, "fetch_json", return_value={"success": False, "code": 429, "data": None}):
+        with patch.object(ann_src, "fetch_json", return_value={"success": False, "code": 429, "data": None}):
             fallback = self._fallback([{"title": "关于重大诉讼的公告"}])
-            with patch.object(screen, "CNInfoAnnouncementSource", return_value=fallback):
+            with patch.object(ann_src, "CNInfoAnnouncementSource", return_value=fallback):
                 self.assertEqual(screen.fetch_announcements("600519"), ["关于重大诉讼的公告"])
         fallback.fetch.assert_called_once()
 
     def test_valid_empty_primary_does_not_use_fallback(self) -> None:
-        with patch.object(screen, "fetch_json", return_value={"success": True, "data": {"list": [], "total": 0}}):
+        with patch.object(ann_src, "fetch_json", return_value={"success": True, "data": {"list": [], "total": 0}}):
             fallback = self._fallback([{"title": "不应读取"}])
-            with patch.object(screen, "CNInfoAnnouncementSource", return_value=fallback):
+            with patch.object(ann_src, "CNInfoAnnouncementSource", return_value=fallback):
                 self.assertEqual(screen.fetch_announcements("600519"), [])
         fallback.fetch.assert_not_called()
 
@@ -56,18 +58,18 @@ class AnnouncementBusinessFailureTests(unittest.TestCase):
             *self.COUNT_CONFLICTS,
         ):
             with self.subTest(payload=payload):
-                with patch.object(screen, "fetch_json", return_value=payload):
+                with patch.object(ann_src, "fetch_json", return_value=payload):
                     fallback = self._fallback([{"title": "备用公告"}])
-                    with patch.object(screen, "CNInfoAnnouncementSource", return_value=fallback):
+                    with patch.object(ann_src, "CNInfoAnnouncementSource", return_value=fallback):
                         self.assertEqual(screen.fetch_announcements("600519"), ["备用公告"])
                     fallback.fetch.assert_called_once()
 
     def test_page_count_can_differ_from_provider_total(self) -> None:
         rows = [{"title": f"公告 {index}"} for index in range(8)]
         payload = {"success": 1, "data": {"list": rows, "total": 10, "count": 8}}
-        with patch.object(screen, "fetch_json", return_value=payload):
+        with patch.object(ann_src, "fetch_json", return_value=payload):
             fallback = self._fallback([{"title": "不应读取"}])
-            with patch.object(screen, "CNInfoAnnouncementSource", return_value=fallback):
+            with patch.object(ann_src, "CNInfoAnnouncementSource", return_value=fallback):
                 titles = screen.fetch_announcements("600519", page_size=8)
         self.assertEqual(len(titles), 8)
         fallback.fetch.assert_not_called()
@@ -82,10 +84,10 @@ class AnnouncementBusinessFailureTests(unittest.TestCase):
         fallback.fetch.return_value = fallback_result
         with env.active():
             with (
-                patch.object(screen, "fetch_announcements", real_fetch),
-                patch.object(screen, "fetch_json", return_value=primary_payload),
-                patch.object(screen, "CNInfoAnnouncementSource", return_value=fallback),
-                patch.object(screen, "_load_announcement_risk_cache", return_value=cache),
+                patch.object(ann_src, "fetch_announcements", real_fetch),
+                patch.object(ann_src, "fetch_json", return_value=primary_payload),
+                patch.object(ann_src, "CNInfoAnnouncementSource", return_value=fallback),
+                patch.object(ann_src, "_load_announcement_risk_cache", return_value=cache),
             ):
                 result = screen.run_screening_core(
                     screen.ScreeningParams(modes=frozenset({"strict", "low", "watchlist"}), workers=1, top=50),
@@ -145,9 +147,9 @@ class AnnouncementBusinessFailureTests(unittest.TestCase):
             result["trend_diagnostics"] = []
             fallback = self._fallback_error()
             with (
-                patch.object(screen, "ANNOUNCEMENT_CACHE_FILE", cache_path),
-                patch.object(screen, "fetch_json", return_value=self.COUNT_CONFLICTS[0]),
-                patch.object(screen, "CNInfoAnnouncementSource", return_value=fallback),
+                patch.object(ann_src, "ANNOUNCEMENT_CACHE_FILE", cache_path),
+                patch.object(ann_src, "fetch_json", return_value=self.COUNT_CONFLICTS[0]),
+                patch.object(ann_src, "CNInfoAnnouncementSource", return_value=fallback),
             ):
                 errors = screen.attach_announcement_risks(result, page_size=8, workers=1)
             self.assertEqual(errors, ["600519"])

@@ -19,7 +19,7 @@ STYLE_CSS = (STATIC / "style.css").read_text(encoding="utf-8")
 # assertIn / assertNotIn 都按整个引擎检查，旧口径不能藏进任何一个子模块。
 SCREEN_PY = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in [SCRIPT_DIR / "a_share_daily_screen.py", *sorted((SCRIPT_DIR / "screening").glob("*.py"))]
+    for path in [SCRIPT_DIR / "a_share_daily_screen.py", *sorted((SCRIPT_DIR / "screening").rglob("*.py"))]
 )
 ENGINE_PY = (SCRIPT_DIR / "realtime_engine.py").read_text(encoding="utf-8")
 
