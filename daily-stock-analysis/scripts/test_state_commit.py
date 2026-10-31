@@ -24,6 +24,7 @@ import runtime_paths
 import realtime_dashboard as dash
 import realtime_engine
 import a_share_daily_screen as screen
+from screening import intersection
 
 
 class CommitGateTests(unittest.TestCase):
@@ -76,8 +77,9 @@ class CommitGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             flow_path = Path(tmp) / "flow_snapshot.json"
             inter_path = Path(tmp) / "intersection_state.json"
+            # 交集状态读写在 screening.intersection 里，路径必须改在那个模块上
             with mock.patch.object(screen, "FLOW_SNAPSHOT_PATH", flow_path), \
-                 mock.patch.object(screen, "INTERSECTION_STATE_FILE", inter_path):
+                 mock.patch.object(intersection, "INTERSECTION_STATE_FILE", inter_path):
                 rc = state_commit.RoundCommit("t")
                 screen.save_flow_history([], {"600001": [{"ts": time.time()}]}, rc)
                 screen.save_intersection_state({"600001": {"phase": "OBSERVING"}}, "2026-10-02", rc)

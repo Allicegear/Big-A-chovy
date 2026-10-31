@@ -153,8 +153,15 @@ class NoHardcodedStatePathsTests(unittest.TestCase):
 
     SOURCES = ("a_share_daily_screen.py", "realtime_engine.py", "realtime_dashboard.py")
 
+    @classmethod
+    def _sources(cls):
+        # 核心拆分出的 screening/ 子模块同样持有状态路径，必须一并扫描
+        return list(cls.SOURCES) + sorted(
+            str(p.relative_to(SCRIPT_DIR)) for p in (SCRIPT_DIR / "screening").glob("*.py")
+        )
+
     def test_state_files_are_not_hardcoded(self):
-        for name in self.SOURCES:
+        for name in self._sources():
             src = (SCRIPT_DIR / name).read_text(encoding="utf-8")
             with self.subTest(module=name):
                 self.assertNotIn("SCRIPT_DIR / \"flow_snapshot.json\"", src)
@@ -169,9 +176,14 @@ class NoHardcodedStatePathsTests(unittest.TestCase):
         self.assertIn('SCRIPT_DIR / "holdings.json"', src)
         settings = (SCRIPT_DIR / "dashboard_settings.py").read_text(encoding="utf-8")
         self.assertIn('SETTINGS_PATH = SCRIPT_DIR / "dashboard_settings.json"', settings)
+        # 标定配置（intersection_calibration.json）已随状态机拆到 screening/intersection.py
+        core_sources = src + "".join(
+            p.read_text(encoding="utf-8") for p in sorted((SCRIPT_DIR / "screening").glob("*.py"))
+        )
+        self.assertIn('SCRIPT_DIR / "intersection_calibration.json"', core_sources)
         for name in NOT_REDIRECTED:
             with self.subTest(name=name):
-                self.assertNotIn(f"state_file(\"{name}\")", src)
+                self.assertNotIn(f"state_file(\"{name}\")", core_sources)
 
 
 if __name__ == "__main__":
