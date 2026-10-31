@@ -12,6 +12,8 @@ import unittest
 from unittest.mock import patch
 
 import a_share_daily_screen as screen
+# fetch_sector_indices 在 screening.sources.market 里调用 _fetch_sector_page，须 patch 在那里
+from screening.sources import market
 
 
 def page_rows(count, start=0, name_of=None):
@@ -59,7 +61,7 @@ class SectorBoardPaginationTests(unittest.TestCase):
         self.assertEqual(params["pn"], 2)
 
     def test_fetches_all_pages_according_to_total(self):
-        with patch.object(screen, "_fetch_sector_page", side_effect=fake_pages(496)):
+        with patch.object(market, "_fetch_sector_page", side_effect=fake_pages(496)):
             boards = screen.fetch_sector_indices()
         self.assertEqual(len(boards), 496)
         status = screen.SECTOR_BOARDS_STATUS
@@ -72,7 +74,7 @@ class SectorBoardPaginationTests(unittest.TestCase):
 
     def test_more_than_five_pages_is_not_truncated(self):
         """板块数超过 500 时必须继续翻页——这是原实现静默截断的场景。"""
-        with patch.object(screen, "_fetch_sector_page", side_effect=fake_pages(650)):
+        with patch.object(market, "_fetch_sector_page", side_effect=fake_pages(650)):
             boards = screen.fetch_sector_indices()
         self.assertEqual(len(boards), 650)
         self.assertEqual(screen.SECTOR_BOARDS_STATUS["expected_pages"], 7)
@@ -81,7 +83,7 @@ class SectorBoardPaginationTests(unittest.TestCase):
     def test_failed_page_is_retried_then_flagged(self):
         """失败页重试一次，仍失败 → 标记不完整并写警告，绝不静默返回部分板块。"""
         fetch = fake_pages(496, fail=(3,))
-        with patch.object(screen, "_fetch_sector_page", side_effect=fetch):
+        with patch.object(market, "_fetch_sector_page", side_effect=fetch):
             boards = screen.fetch_sector_indices()
         status = screen.SECTOR_BOARDS_STATUS
         self.assertFalse(status["complete"])
@@ -98,14 +100,14 @@ class SectorBoardPaginationTests(unittest.TestCase):
                 return page_rows(50, 100), 300
             return [], 300
 
-        with patch.object(screen, "_fetch_sector_page", side_effect=fetch):
+        with patch.object(market, "_fetch_sector_page", side_effect=fetch):
             boards = screen.fetch_sector_indices()
         self.assertEqual(len(boards), 150)
         self.assertFalse(screen.SECTOR_BOARDS_STATUS["complete"])
         self.assertTrue(any("板块列表不完整" in w for w in screen.MARKET_WARNINGS))
 
     def test_first_page_failure_is_reported(self):
-        with patch.object(screen, "_fetch_sector_page", side_effect=RuntimeError("boom")):
+        with patch.object(market, "_fetch_sector_page", side_effect=RuntimeError("boom")):
             boards = screen.fetch_sector_indices()
         self.assertEqual(boards, [])
         self.assertFalse(screen.SECTOR_BOARDS_STATUS["complete"])
@@ -118,7 +120,7 @@ class SectorBoardPaginationTests(unittest.TestCase):
                 return page_rows(100, 0), 200   # 两页返回同一批板块代码
             return [], 200
 
-        with patch.object(screen, "_fetch_sector_page", side_effect=fetch):
+        with patch.object(market, "_fetch_sector_page", side_effect=fetch):
             boards = screen.fetch_sector_indices()
         self.assertEqual(len(boards), 100)
         status = screen.SECTOR_BOARDS_STATUS
@@ -135,7 +137,7 @@ class SectorBoardPaginationTests(unittest.TestCase):
                         {"f12": "BK0002", "f14": "综合", "f3": -2.0}], 2
             return [], 2
 
-        with patch.object(screen, "_fetch_sector_page", side_effect=fetch):
+        with patch.object(market, "_fetch_sector_page", side_effect=fetch):
             boards = screen.fetch_sector_indices()
         self.assertEqual(len(boards), 2)
         self.assertEqual({b["code"] for b in boards}, {"BK0001", "BK0002"})
@@ -155,7 +157,7 @@ class SectorBoardPaginationTests(unittest.TestCase):
                 return page_rows(80, 90) + page_rows(20, 200), 300
             return [], 300
 
-        with patch.object(screen, "_fetch_sector_page", side_effect=fetch):
+        with patch.object(market, "_fetch_sector_page", side_effect=fetch):
             boards = screen.fetch_sector_indices()
         status = screen.SECTOR_BOARDS_STATUS
         self.assertEqual(len(boards), 190)          # 200 行原始 → 190 个唯一板块
@@ -173,7 +175,7 @@ class SectorBoardPaginationTests(unittest.TestCase):
                         {"f12": "BK0009", "f14": "正常板块", "f3": 0.1}], 1
             return [], 1
 
-        with patch.object(screen, "_fetch_sector_page", side_effect=fetch):
+        with patch.object(market, "_fetch_sector_page", side_effect=fetch):
             boards = screen.fetch_sector_indices()
         self.assertEqual(len(boards), 1)
         self.assertEqual(screen.SECTOR_BOARDS_STATUS["blank_code_rows"], 1)
