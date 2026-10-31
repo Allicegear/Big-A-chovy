@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import a_share_daily_screen as screen
+from screening.sources import kline
 
 
 TODAY = "2026-09-28"
@@ -54,8 +55,9 @@ def sina_payload(bars=90, last_date=PREV, last_close=RAW_CLOSE):
 class KlineSourceChainTests(unittest.TestCase):
     def setUp(self):
         screen.MARKET_WARNINGS.clear()
-        screen._tencent_kline_fail_streak = 0
-        screen._tencent_kline_blocked_until = 0.0
+        # 熔断计数是 kline 模块用 global 改写的标量，必须在 kline 上复位
+        kline._tencent_kline_fail_streak = 0
+        kline._tencent_kline_blocked_until = 0.0
         screen._kline_reference.clear()
         screen._kline_fallback_codes.clear()
         screen._kline_mismatch_codes.clear()
@@ -87,8 +89,9 @@ class KlineSourceChainTests(unittest.TestCase):
                     raise RuntimeError("sina down")
                 return sina
             raise RuntimeError(f"unexpected url {url}")
-        return patch.object(screen, "fetch_json", side_effect=fake_json), \
-            patch.object(screen, "_rank_urls", side_effect=lambda urls: list(urls))
+        # fetch_kline 在 screening.sources.kline 里调用这两个函数，必须 patch 在那里
+        return patch.object(kline, "fetch_json", side_effect=fake_json), \
+            patch.object(kline, "_rank_urls", side_effect=lambda urls: list(urls))
 
     def test_tencent_is_primary(self):
         p1, p2 = self._fetch_with(tencent=tencent_payload())

@@ -259,10 +259,16 @@ def _install_seams(cassette: Cassette, mode: str) -> List[Any]:
         return ds_http.HTTPResponse(entry["status"], entry["url"], base64.b64decode(entry["body"]),
                                     dict(entry.get("headers") or {}), 0.0)
 
+    # fetch_json 随核心拆分被多个子模块各自 import（screening.net、screening.sources.*）。
+    # 逐个替换所有指向真实函数的模块属性，拆分新模块后无需改本工具；断网兜底保证漏网即报错。
     patches = [
-        mock.patch.object(screen, "fetch_json", fetch_json),
-        mock.patch.object(ds_http.HTTPClient, "request", request),
+        mock.patch.object(mod, "fetch_json", fetch_json)
+        for mod in list(sys.modules.values())
+        if mod is not None and getattr(mod, "fetch_json", None) is real_fetch_json
     ]
+    if not patches:
+        raise RuntimeError("golden: 没找到任何引用真实 fetch_json 的模块")
+    patches.append(mock.patch.object(ds_http.HTTPClient, "request", request))
     if mode == "replay":
         import network_path
 

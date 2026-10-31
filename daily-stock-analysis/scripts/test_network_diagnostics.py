@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import a_share_daily_screen as screen
 import realtime_engine as realtime
 from screening import net
+from screening.sources import kline
 from a_share_daily_screen import (
     MARKET_WARNINGS,
     NetworkUnavailable,
@@ -22,9 +23,9 @@ from a_share_daily_screen import (
 class NetworkDiagnosticsTests(unittest.TestCase):
     def setUp(self):
         # 熔断、主机失败记录、K 线缓存都是模块级状态，测试之间必须复位，否则用例顺序会影响结果
-        screen._tencent_kline_fail_streak = 0
-        screen._tencent_kline_blocked_until = 0.0
-        screen._sina_kline_fallback_warned = True
+        kline._tencent_kline_fail_streak = 0
+        kline._tencent_kline_blocked_until = 0.0
+        kline._sina_kline_fallback_warned = True
         screen._HOST_FAILURES.clear()
         realtime._kline_cache = {}
         realtime._kline_cache_date = realtime._today()
@@ -41,7 +42,7 @@ class NetworkDiagnosticsTests(unittest.TestCase):
     def test_fetch_kline_prefers_tencent_qfq(self):
         rows = [f"2026-06-{i:02d},10,10.5,11,9.5,1000" for i in range(1, 71)]
         response = {"data": {"sh600519": {"qfqday": rows}}}
-        with patch.object(screen, "fetch_json", return_value=response) as fetch:
+        with patch.object(kline, "fetch_json", return_value=response) as fetch:
             parsed, source = screen.fetch_kline("600519", 90)
 
         self.assertEqual(source, "tencent_qfq")
@@ -63,7 +64,7 @@ class NetworkDiagnosticsTests(unittest.TestCase):
                 raise NetworkUnavailable(url, {})
             return rows
 
-        with patch.object(screen, "fetch_json", side_effect=fake_fetch) as fetch:
+        with patch.object(kline, "fetch_json", side_effect=fake_fetch) as fetch:
             parsed, source = screen.fetch_kline("600519", 90)
 
         self.assertEqual(source, "sina_daily")
@@ -79,7 +80,7 @@ class NetworkDiagnosticsTests(unittest.TestCase):
 
     def test_tencent_kline_circuit_opens_after_repeated_failures(self):
         """连续失败后熔断腾讯日 K：避免 WAF 拦截页把一轮 76 只放大成上百次请求。"""
-        with patch.object(screen, "fetch_json",
+        with patch.object(kline, "fetch_json",
                           side_effect=NetworkUnavailable("tencent", {})) as fetch:
             for _ in range(5):
                 with self.assertRaises(RuntimeError):
@@ -92,19 +93,19 @@ class NetworkDiagnosticsTests(unittest.TestCase):
     def test_tencent_kline_circuit_resets_on_success(self):
         rows = [f"2026-06-{i:02d},10,10.5,11,9.5,1000" for i in range(1, 71)]
         response = {"data": {"sh600519": {"qfqday": rows}}}
-        screen._tencent_kline_fail_streak = screen.TENCENT_KLINE_FAIL_STREAK_LIMIT - 1
-        with patch.object(screen, "fetch_json", return_value=response):
+        kline._tencent_kline_fail_streak = screen.TENCENT_KLINE_FAIL_STREAK_LIMIT - 1
+        with patch.object(kline, "fetch_json", return_value=response):
             parsed, source = screen.fetch_kline("600519", 90)
 
         self.assertEqual(source, "tencent_qfq")
-        self.assertEqual(screen._tencent_kline_fail_streak, 0)
+        self.assertEqual(kline._tencent_kline_fail_streak, 0)
         self.assertEqual(len(parsed), 70)
 
     def test_tencent_kline_fails_over_between_hosts(self):
         """2026-09-26：web.ifzq.gtimg.cn 被 WAF 拦截，同一接口在 ifzq.gtimg.cn 上仍可用。"""
         rows = [f"2026-06-{i:02d},10,10.5,11,9.5,1000" for i in range(1, 71)]
         response = {"data": {"sh600519": {"qfqday": rows}}}
-        with patch.object(screen, "fetch_json",
+        with patch.object(kline, "fetch_json",
                           side_effect=[NetworkUnavailable("waf", {}), response]) as fetch:
             parsed, source = screen.fetch_kline("600519", 90)
 
