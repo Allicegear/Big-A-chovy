@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 import a_share_daily_screen as screen
-from screening import intersection, market_warnings, model, net, render, risk, rules
+from screening import capital, intersection, market_warnings, model, net, render, risk, rules
 from screening.sources import announcements, flow, kline, market
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -112,12 +112,9 @@ FACADE_REDIRECT_FORBIDDEN = {
         "extract_primary_announcement_total", "validate_primary_announcement_page",
         "_canonical_announcement_risk",
     ),
-    # 门面里仍有读取方（低吸排除 / 低开洗盘 / 主导判定 / 流水线，待 F2 拆走）的不在此列：
-    # load/save_flow_history、apply_flow_increments、fill_flow_increments_from_fflow、
-    # reset_flow_minute_round、round_series_date、low_absorb_unverified_count、
-    # _note_low_absorb_unverified、_pace_flow_minute_request、_flow_minute_series_for、
-    # flow_continuity_from_minutes、flow_negative_samples_from_minutes、
-    # _LOW_OPEN_DAILY_FLOW_CACHE(_LOCK)。
+    # 流水线仍经门面调用的不在此列：load/save_flow_history、apply_flow_increments、
+    # fill_flow_increments_from_fflow、reset_flow_minute_round、low_absorb_unverified_count。
+    # （F2 起低吸排除 / 低开洗盘 / 主导判定已移入 capital，其余分钟序列与日线名字不再有门面读取方。）
     "screening.sources.flow": (
         "FLOW_SNAPSHOT_PATH", "EM_FFLOW_MINUTE_URLS", "FLOW_MINUTE_TTL_SECONDS",
         "FLOW_MINUTE_MIN_INTERVAL_SECONDS", "FLOW_MINUTE_MAX_CODES_PER_ROUND",
@@ -127,8 +124,37 @@ FACADE_REDIRECT_FORBIDDEN = {
         "_contiguous_tail_start", "_column_values", "flow_window_deltas", "_is_intraday_now",
         "_minutes_of_hhmm", "fetch_flow_minutes", "flow_increments_from_minutes",
         "compute_buy_ratio",
+        # F2 追加：调用方已全部移入 capital / flow
+        "_pace_flow_minute_request", "round_series_date", "_flow_minute_series_for",
+        "_note_low_absorb_unverified", "flow_continuity_from_minutes",
+        "flow_negative_samples_from_minutes", "_LOW_OPEN_DAILY_FLOW_CACHE",
+        "_LOW_OPEN_DAILY_FLOW_CACHE_LOCK", "EM_FFLOW_DAILY_URLS", "LOW_OPEN_DAILY_FLOW_SESSIONS",
+        "LOW_OPEN_DAILY_FLOW_MAX_CODES_PER_ROUND", "LOW_OPEN_DAILY_FLOW_CACHE_SECONDS",
+        "fetch_daily_main_flow_history",
+    ),
+    # 流水线 / 交集与突破状态机 / 看板引擎经门面调用的不在此列：_should_exclude_from_low_absorb、
+    # classify_flow、evaluate_dominance_type、flow_veto_reason、low_open_wash_rows、
+    # rank_capital_candidates、build/count_negative_super_observations。
+    # 说明：fetch_json 门面里已无调用方，但看板引擎 / 看板探测 / verify_em_webguest 仍经
+    # screen.fetch_json 调用，在门面上 patch 仍然生效，因此不加入。
+    "screening.capital": (
+        "HARD_BLACKLIST", "_low_open_wash_current_conditions", "_qualifies_low_open_wash",
+        "capital_data_label", "is_negative_super",
     ),
 }
+
+DAILY_FLOW_EXPORTS = (
+    "EM_FFLOW_DAILY_URLS", "LOW_OPEN_DAILY_FLOW_CACHE_SECONDS",
+    "LOW_OPEN_DAILY_FLOW_MAX_CODES_PER_ROUND", "LOW_OPEN_DAILY_FLOW_SESSIONS",
+    "fetch_daily_main_flow_history",
+)
+
+CAPITAL_EXPORTS = (
+    "HARD_BLACKLIST", "_low_open_wash_current_conditions", "_qualifies_low_open_wash",
+    "_should_exclude_from_low_absorb", "build_negative_super_observations", "capital_data_label",
+    "classify_flow", "count_negative_super_observations", "evaluate_dominance_type",
+    "flow_veto_reason", "is_negative_super", "low_open_wash_rows", "rank_capital_candidates",
+)
 
 FLOW_EXPORTS = (
     "EM_FFLOW_MINUTE_URLS", "FLOW_MINUTE_MAX_CODES_PER_ROUND", "FLOW_MINUTE_MIN_INTERVAL_SECONDS",
@@ -199,6 +225,20 @@ RENDER_EXPORTS = (
 
 
 class FacadeIdentityTest(unittest.TestCase):
+    def test_capital_names_are_reexported_not_copied(self):
+        for name in CAPITAL_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(capital, name))
+
+    def test_capital_config_has_a_single_source(self):
+        self.assertIs(capital.RISK_CONFIG, screen.RISK_CONFIG)
+        self.assertIs(capital.SCREENING_CONFIG, screen.SCREENING_CONFIG)
+
+    def test_daily_flow_names_are_reexported_not_copied(self):
+        for name in DAILY_FLOW_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(flow, name))
+
     def test_flow_names_are_reexported_not_copied(self):
         for name in FLOW_EXPORTS:
             with self.subTest(name=name):

@@ -4,6 +4,9 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import a_share_daily_screen as screen
+# fetch_daily_main_flow_history 在 screening.sources.flow 里查找 fetch_json 与限速函数，
+# patch 须打在那里；打在门面上时 assert_not_called 会恒真。
+from screening.sources import flow
 from test_capital_flow_ranking import stock
 
 
@@ -34,12 +37,12 @@ class LowOpenDailyFlowTests(unittest.TestCase):
 
     def _fetch_mock(self, rows):
         return patch.object(
-            screen, "fetch_json", return_value={"data": {"klines": rows}}
+            flow, "fetch_json", return_value={"data": {"klines": rows}}
         )
 
     def test_twenty_completed_daily_bars_qualify_and_sum_once_each(self):
         rows = [f"{day},1000000,0" for day in daily_dates()]
-        with self._fetch_mock(rows), patch.object(screen, "_pace_flow_minute_request"):
+        with self._fetch_mock(rows), patch.object(flow, "_pace_flow_minute_request"):
             result = screen.fetch_daily_main_flow_history("000001", "2026-10-12")
             candidates = screen.low_open_wash_rows([candidate()], "2026-10-12")
 
@@ -53,7 +56,7 @@ class LowOpenDailyFlowTests(unittest.TestCase):
     def test_missing_twenty_day_history_is_unknown_and_cannot_pass(self):
         rows = [f"{day},2000000,0" for day in daily_dates(5)]
         item = candidate()
-        with self._fetch_mock(rows), patch.object(screen, "_pace_flow_minute_request"):
+        with self._fetch_mock(rows), patch.object(flow, "_pace_flow_minute_request"):
             history = screen.fetch_daily_main_flow_history("000001", "2026-10-12")
             candidates = screen.low_open_wash_rows([item], "2026-10-12")
 
@@ -68,15 +71,15 @@ class LowOpenDailyFlowTests(unittest.TestCase):
     def test_duplicate_daily_dates_are_not_counted_twice(self):
         days = daily_dates()
         rows = [f"{day},1000000,0" for day in days for _ in range(2)]
-        with self._fetch_mock(rows), patch.object(screen, "_pace_flow_minute_request"):
+        with self._fetch_mock(rows), patch.object(flow, "_pace_flow_minute_request"):
             history = screen.fetch_daily_main_flow_history("000001", "2026-10-12")
 
         self.assertEqual(history["sessions"], 20)
         self.assertEqual(history["persistent_net"], 20_000_000.0)
 
     def test_malformed_endpoint_shape_fails_closed_without_breaking_screen(self):
-        with patch.object(screen, "fetch_json", return_value={"data": []}), patch.object(
-            screen, "_pace_flow_minute_request"
+        with patch.object(flow, "fetch_json", return_value={"data": []}), patch.object(
+            flow, "_pace_flow_minute_request"
         ):
             history = screen.fetch_daily_main_flow_history("000001", "2026-10-12")
 
@@ -86,7 +89,7 @@ class LowOpenDailyFlowTests(unittest.TestCase):
     def test_open_rebound_below_previous_close_is_not_red(self):
         item = candidate()
         item.price = 9.8  # Above open, but still below previous close.
-        with patch.object(screen, "fetch_json") as fetch:
+        with patch.object(flow, "fetch_json") as fetch:
             candidates = screen.low_open_wash_rows([item], "2026-10-12")
 
         self.assertFalse(screen._low_open_wash_current_conditions(item))

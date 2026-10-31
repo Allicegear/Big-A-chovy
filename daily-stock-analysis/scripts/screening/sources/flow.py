@@ -547,3 +547,105 @@ def fill_flow_increments_from_fflow(enriched: List[Enriched], expected_date: Opt
             e.buy_ratio = compute_buy_ratio(e, flow_cfg)
             filled += 1
     return filled
+
+
+# Historical daily capital flow is served by Eastmoney's daykline endpoint.
+# Unlike the webguest intraday endpoint, push2his returns the date series.
+EM_FFLOW_DAILY_URLS = [
+    "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+    "https://1.push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+    "https://82.push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+]
+LOW_OPEN_DAILY_FLOW_SESSIONS = 20
+LOW_OPEN_DAILY_FLOW_MAX_CODES_PER_ROUND = 20
+LOW_OPEN_DAILY_FLOW_CACHE_SECONDS = 12 * 60 * 60
+
+
+# ── 低开洗盘模块（低开≥2% + 高于昨收 + 均价线上 + 当日/20日主力净流入为正）──
+def fetch_daily_main_flow_history(
+    code: str, expected_date: str, *, allow_request: bool = True
+) -> Dict[str, Any]:
+    """Fetch 20 completed daily main-flow bars preceding the current market date.
+
+    Intraday cumulative snapshots are deliberately not accepted here. The
+    current session is checked separately from ``e.main_net``.
+    """
+    code = str(code or "")
+    expected_date = str(expected_date or "")[:10]
+    try:
+        datetime.strptime(expected_date, "%Y-%m-%d")
+    except ValueError:
+        return {"status": "unavailable", "sessions": 0, "persistent_net": None}
+    cache_key = (code, expected_date)
+    now = time.time()
+    with _LOW_OPEN_DAILY_FLOW_CACHE_LOCK:
+        cached = _LOW_OPEN_DAILY_FLOW_CACHE.get(cache_key)
+        if cached:
+            ttl = LOW_OPEN_DAILY_FLOW_CACHE_SECONDS if cached[1].get("status") == "complete" else 120
+            if now - cached[0] <= ttl:
+                return {**cached[1], "_request_made": False}
+    if not allow_request:
+        return {"status": "unavailable", "sessions": 0, "persistent_net": None,
+                "reason": "本轮历史资金查询额度已用完", "_request_made": False}
+
+    params = {
+        "secid": secid_for(code),
+        "fields1": "f1,f2,f3,f7",
+        "fields2": "f51,f52,f56",
+        "klt": "101",
+        "lmt": str(LOW_OPEN_DAILY_FLOW_SESSIONS + 20),
+        "beg": "0",
+        "end": "20500101",
+    }
+    last_error: Optional[Exception] = None
+    best_result: Optional[Dict[str, Any]] = None
+    for url in _rank_urls(EM_FFLOW_DAILY_URLS):
+        _pace_flow_minute_request()
+        try:
+            payload = fetch_json(url, params, timeout=6)
+        except Exception as exc:
+            last_error = exc
+            _mark_host_failed(url)
+            continue
+        data = payload.get("data") if isinstance(payload, dict) else None
+        rows = data.get("klines") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            rows = []
+        by_date: Dict[str, float] = {}
+        for line in rows:
+            parts = str(line).split(",")
+            if len(parts) < 2:
+                continue
+            bar_date = parts[0].strip()[:10]
+            try:
+                datetime.strptime(bar_date, "%Y-%m-%d")
+                main_net = float(parts[1])
+            except (TypeError, ValueError):
+                continue
+            if bar_date < expected_date and math.isfinite(main_net):
+                by_date[bar_date] = main_net
+        latest = sorted(by_date.items())[-LOW_OPEN_DAILY_FLOW_SESSIONS:]
+        result: Dict[str, Any] = {
+            "status": "complete" if len(latest) == LOW_OPEN_DAILY_FLOW_SESSIONS else "insufficient",
+            "sessions": len(latest),
+            "persistent_net": round(sum(value for _, value in latest), 2)
+            if len(latest) == LOW_OPEN_DAILY_FLOW_SESSIONS else None,
+            "first_date": latest[0][0] if latest else None,
+            "last_date": latest[-1][0] if latest else None,
+            "source": "eastmoney_push2his_daykline",
+        }
+        _mark_host_ok(url)
+        if result["status"] == "complete":
+            best_result = result
+            break
+        if best_result is None or result["sessions"] > best_result["sessions"]:
+            best_result = result
+
+    if best_result is None:
+        best_result = {
+            "status": "unavailable", "sessions": 0, "persistent_net": None,
+            "reason": str(last_error) if last_error else "历史资金接口无有效数据",
+        }
+    with _LOW_OPEN_DAILY_FLOW_CACHE_LOCK:
+        _LOW_OPEN_DAILY_FLOW_CACHE[cache_key] = (now, dict(best_result))
+    return {**best_result, "_request_made": True}
