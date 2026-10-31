@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 import a_share_daily_screen as screen
-from screening import intersection, model, render, risk, rules
+from screening import intersection, model, net, render, risk, rules
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
@@ -51,9 +51,29 @@ INTERSECTION_EXPORTS = (
     "resolve_intersection_config", "resolve_market_mode", "save_intersection_state",
 )
 
-# 已拆到子模块、由子模块内部读取的状态路径：在门面上赋值或 patch 不会生效，
-# 测试会以为自己隔离了状态，实际写的是默认位置。
-MOVED_STATE_PATHS = ("INTERSECTION_STATE_FILE", "INTERSECTION_CALIBRATION_FILE")
+NET_EXPORTS = (
+    "NETWORK_MODE", "REQUESTS_DIRECT_SESSION", "REQUESTS_SESSION", "SSL_CONTEXT", "UA",
+    "NetworkUnavailable", "_EM_COOLDOWN_BACKOFF", "_EM_COOLDOWN_FILE", "_HOST_COOLDOWN",
+    "_HOST_FAILURES", "_em_clear_cooldown", "_em_in_cooldown", "_em_read_cooldown",
+    "_em_set_cooldown", "_mark_host_failed", "_mark_host_ok", "_rank_urls", "_system_proxy_url",
+    "build_url_opener", "fetch_json", "format_network_failure", "requests", "set_network_mode",
+    "network_path",
+)
+
+# 禁止经门面重定向的名字：读取它们的代码已全部在子模块里，在门面上赋值或 patch
+# 只改了门面的副本，被测代码看不到——测试会以为自己隔离了状态或替换了依赖，实际
+# 没有（状态写到默认位置、走了真实网络分支）。
+# 规则：某个名字的**所有读取方**都已拆进子模块时才加进来。调用方仍在门面里的函数
+# （例如 fetch_json：fetch_market 等还在核心）在门面上 patch 仍然生效，暂不加入，
+# 待其调用方拆走的那一步再加。
+FACADE_REDIRECT_FORBIDDEN = {
+    "screening.intersection": ("INTERSECTION_STATE_FILE", "INTERSECTION_CALIBRATION_FILE"),
+    "screening.net": (
+        "NETWORK_MODE", "requests", "REQUESTS_SESSION", "REQUESTS_DIRECT_SESSION", "UA",
+        "SSL_CONTEXT", "_HOST_FAILURES", "_HOST_COOLDOWN", "_EM_COOLDOWN_FILE",
+        "_EM_COOLDOWN_BACKOFF", "_em_read_cooldown", "_system_proxy_url", "build_url_opener",
+    ),
+}
 
 
 RENDER_EXPORTS = (
@@ -64,6 +84,11 @@ RENDER_EXPORTS = (
 
 
 class FacadeIdentityTest(unittest.TestCase):
+    def test_net_names_are_reexported_not_copied(self):
+        for name in NET_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIs(getattr(screen, name), getattr(net, name))
+
     def test_render_names_are_reexported_not_copied(self):
         for name in RENDER_EXPORTS:
             with self.subTest(name=name):
@@ -78,21 +103,34 @@ class FacadeIdentityTest(unittest.TestCase):
         self.assertEqual(intersection.INTERSECTION_CALIBRATION_FILE,
                          screen.SCRIPT_DIR / "intersection_calibration.json")
 
-    def test_no_code_redirects_moved_state_paths_through_the_facade(self):
-        alias = r"(?:screen|s|a_share_daily_screen)"
+    def test_no_code_redirects_moved_names_through_the_facade(self):
+        alias = r"(?:screen|s|em|a_share_daily_screen)"
+        owner = {name: mod for mod, names in FACADE_REDIRECT_FORBIDDEN.items() for name in names}
+        names = "|".join(re.escape(n) for n in owner)
         patterns = [
-            re.compile(rf"\b{alias}\.({'|'.join(MOVED_STATE_PATHS)})\s*=(?!=)"),
-            re.compile(rf"patch\.object\(\s*{alias}\s*,\s*[\"']({'|'.join(MOVED_STATE_PATHS)})[\"']"),
-            re.compile(rf"patch\(\s*[\"']a_share_daily_screen\.({'|'.join(MOVED_STATE_PATHS)})[\"']"),
+            re.compile(rf"\b{alias}\.({names})\s*=(?!=)"),
+            re.compile(rf"patch\.object\(\s*{alias}\s*,\s*[\"']({names})[\"']"),
+            re.compile(rf"patch\(\s*[\"']a_share_daily_screen\.({names})[\"']"),
         ]
         offenders = []
         for path in sorted(list(SCRIPT_DIR.glob("*.py")) + list((PROJECT_ROOT / "tools").glob("*.py"))):
             if path.name == Path(__file__).name:
                 continue
             for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                if any(p.search(line) for p in patterns):
-                    offenders.append(f"{path.name}:{lineno}: {line.strip()}")
-        self.assertEqual(offenders, [], "请改 screening.intersection 模块上的属性")
+                for p in patterns:
+                    m = p.search(line)
+                    if m:
+                        offenders.append(f"{path.name}:{lineno}: {line.strip()}  → 改到 {owner[m.group(1)]}")
+        self.assertEqual(offenders, [], "这些名字须在拥有它的子模块上重定向")
+
+    def test_forbidden_names_really_live_in_their_module(self):
+        # 防止名单本身过时：列出的每个名字都必须是对应子模块的属性
+        import importlib
+        for mod, names in FACADE_REDIRECT_FORBIDDEN.items():
+            module = importlib.import_module(mod)
+            for name in names:
+                with self.subTest(module=mod, name=name):
+                    self.assertTrue(hasattr(module, name))
 
     def test_risk_names_are_reexported_not_copied(self):
         for name in RISK_EXPORTS:
