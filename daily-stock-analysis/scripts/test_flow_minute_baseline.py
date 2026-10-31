@@ -10,6 +10,9 @@ from unittest.mock import patch
 
 import a_share_daily_screen as screen
 from a_share_daily_screen import Enriched
+# fetch_flow_minutes / fetch_json / 时钟都在 screening.sources.flow 里被查找，patch 须打在那里；
+# 打在门面上时 assert_not_called 会恒真、side_effect 不生效。
+from screening.sources import flow
 
 
 def stock(code="600000", **overrides):
@@ -57,7 +60,7 @@ class FlowMinuteBaselineTests(unittest.TestCase):
                     return moment.replace(tzinfo=None)
                 return moment.astimezone(tz)
 
-        return patch.object(screen, "datetime", FrozenDateTime)
+        return patch.object(flow, "datetime", FrozenDateTime)
 
     # ---------- 端点作差 ----------
     def test_increment_uses_five_and_fifteen_minute_endpoints(self):
@@ -78,7 +81,7 @@ class FlowMinuteBaselineTests(unittest.TestCase):
     # ---------- 补齐行为 ----------
     def test_fill_sets_baseline_and_marks_source(self):
         row = stock()
-        with patch.object(screen, "fetch_flow_minutes", return_value=series(26)):
+        with patch.object(flow, "fetch_flow_minutes", return_value=series(26)):
             filled = screen.fill_flow_increments_from_fflow([row])
         self.assertEqual(filled, 1)
         self.assertEqual(row.flow_baseline_source, "fflow")
@@ -87,7 +90,7 @@ class FlowMinuteBaselineTests(unittest.TestCase):
 
     def test_rows_with_snapshot_baseline_are_not_refetched(self):
         row = stock(flow_5m_inc=1_000_000, flow_15m_inc=2_000_000)
-        with patch.object(screen, "fetch_flow_minutes") as fetch:
+        with patch.object(flow, "fetch_flow_minutes") as fetch:
             filled = screen.fill_flow_increments_from_fflow([row])
         self.assertEqual(filled, 0)
         fetch.assert_not_called()
@@ -95,7 +98,7 @@ class FlowMinuteBaselineTests(unittest.TestCase):
     def test_partial_baseline_keeps_existing_and_fills_gap(self):
         row = stock(flow_5m_inc=7_000_000,
                     flow_baseline_source="snapshot")
-        with patch.object(screen, "fetch_flow_minutes", return_value=series(26)):
+        with patch.object(flow, "fetch_flow_minutes", return_value=series(26)):
             filled = screen.fill_flow_increments_from_fflow([row])
         self.assertEqual(filled, 1)
         self.assertEqual(row.flow_5m_inc, 7_000_000)   # 已有快照基准不被覆盖
@@ -103,7 +106,7 @@ class FlowMinuteBaselineTests(unittest.TestCase):
 
     def test_failure_keeps_nan_and_never_zero(self):
         row = stock()
-        with patch.object(screen, "fetch_flow_minutes", side_effect=RuntimeError("boom")):
+        with patch.object(flow, "fetch_flow_minutes", side_effect=RuntimeError("boom")):
             filled = screen.fill_flow_increments_from_fflow([row])
         self.assertEqual(filled, 0)
         self.assertTrue(math.isnan(row.flow_5m_inc))
@@ -112,7 +115,7 @@ class FlowMinuteBaselineTests(unittest.TestCase):
 
     def test_round_cap_limits_requests(self):
         rows = [stock(code=f"6000{i:02d}") for i in range(25)]
-        with patch.object(screen, "fetch_flow_minutes", return_value=series(26)) as fetch:
+        with patch.object(flow, "fetch_flow_minutes", return_value=series(26)) as fetch:
             filled = screen.fill_flow_increments_from_fflow(rows)
         self.assertEqual(filled, screen.FLOW_MINUTE_MAX_CODES_PER_ROUND)
         self.assertEqual(fetch.call_count, screen.FLOW_MINUTE_MAX_CODES_PER_ROUND)
@@ -120,7 +123,7 @@ class FlowMinuteBaselineTests(unittest.TestCase):
     def test_fill_recomputes_buy_ratio(self):
         row = stock(flow_5m_inc=float("nan"), flow_15m_inc=float("nan"))
         before = screen.compute_buy_ratio(row, screen.SCREENING_CONFIG["flow"])
-        with patch.object(screen, "fetch_flow_minutes", return_value=series(26)):
+        with patch.object(flow, "fetch_flow_minutes", return_value=series(26)):
             screen.fill_flow_increments_from_fflow([row])
         after = screen.compute_buy_ratio(row, screen.SCREENING_CONFIG["flow"])
         self.assertEqual(row.buy_ratio, after)
@@ -131,7 +134,7 @@ class FlowMinuteBaselineTests(unittest.TestCase):
         payload = {"data": {"klines": [
             "2026-09-24 14:56,-1000,-800", "2026-09-24 14:57,-900,-700",
         ]}}
-        with patch.object(screen, "fetch_json", return_value=payload):
+        with patch.object(flow, "fetch_json", return_value=payload):
             got = screen.fetch_flow_minutes("600000", expected_date="2026-09-26")
         self.assertEqual(got, [])
 
@@ -142,7 +145,7 @@ class FlowMinuteBaselineTests(unittest.TestCase):
             "2026-09-24 09:32,200000,90000",
         ]}}
         frozen = RealDateTime(2026, 9, 24, 18, 0, tzinfo=screen.TZ)
-        with self._freeze_screen_clock(frozen), patch.object(screen, "fetch_json", return_value=payload):
+        with self._freeze_screen_clock(frozen), patch.object(flow, "fetch_json", return_value=payload):
             got = screen.fetch_flow_minutes("600000", expected_date="2026-09-24")
         self.assertEqual(len(got), 3)
         self.assertEqual(got[-1], ("09:32", 200_000.0, 90_000.0))
@@ -154,7 +157,7 @@ class FlowMinuteBaselineTests(unittest.TestCase):
             f"{today} 09:30,0,0", f"{today} 09:31,100000,40000",
             f"{today} 09:32,200000,90000",
         ]}}
-        with self._freeze_screen_clock(frozen), patch.object(screen, "fetch_json", return_value=payload):
+        with self._freeze_screen_clock(frozen), patch.object(flow, "fetch_json", return_value=payload):
             got = screen.fetch_flow_minutes("600000")
         self.assertEqual(len(got), 3)
         self.assertEqual(got[-1], ("09:32", 200_000.0, 90_000.0))
@@ -167,13 +170,13 @@ class FlowMinuteBaselineTests(unittest.TestCase):
             f"{today} 09:30,0,0", f"{today} 09:31,100000,40000",
             f"{today} 09:32,200000,90000",
         ]}}
-        with self._freeze_screen_clock(frozen), patch.object(screen, "fetch_json", return_value=payload):
+        with self._freeze_screen_clock(frozen), patch.object(flow, "fetch_json", return_value=payload):
             got = screen.fetch_flow_minutes("600000")
         self.assertEqual(got, [])
 
     def test_flow_minutes_request_includes_super_order_column(self):
         """coalition 连续性要同时核验主力与超大单，因此序列必须请求 f56。"""
-        with patch.object(screen, "fetch_json", return_value={"data": {"klines": []}}) as fetch:
+        with patch.object(flow, "fetch_json", return_value={"data": {"klines": []}}) as fetch:
             screen.fetch_flow_minutes("600000")
         _, kwargs = fetch.call_args
         params = kwargs.get("params") or fetch.call_args.args[1]
@@ -304,7 +307,7 @@ class SeriesBasedGateTests(unittest.TestCase):
 
     def test_coalition_uses_series_when_snapshots_missing(self):
         screen.reset_flow_minute_round("2026-09-24")
-        with patch.object(screen, "fetch_flow_minutes", return_value=self._series(20)):
+        with patch.object(flow, "fetch_flow_minutes", return_value=self._series(20)):
             dom, label = screen.evaluate_dominance_type(self._coalition_stock(), {})
         self.assertEqual(dom, "coalition")
 
@@ -312,7 +315,7 @@ class SeriesBasedGateTests(unittest.TestCase):
         screen.reset_flow_minute_round("2026-09-24")
         decaying = [("09:31", 0.0, 0.0), ("09:36", 5_000_000.0, 2_000_000.0),
                     ("09:41", 4_000_000.0, 1_500_000.0), ("09:46", 4_500_000.0, 1_800_000.0)]
-        with patch.object(screen, "fetch_flow_minutes", return_value=decaying):
+        with patch.object(flow, "fetch_flow_minutes", return_value=decaying):
             dom, _ = screen.evaluate_dominance_type(self._coalition_stock(), {})
         self.assertEqual(dom, "none")
 
@@ -321,14 +324,14 @@ class SeriesBasedGateTests(unittest.TestCase):
         screen.reset_flow_minute_round("2026-09-24")
         no_super = [("09:31", 0.0, float("nan")), ("09:36", 5_000_000.0, float("nan")),
                     ("09:41", 9_000_000.0, float("nan"))]
-        with patch.object(screen, "fetch_flow_minutes", return_value=no_super):
+        with patch.object(flow, "fetch_flow_minutes", return_value=no_super):
             dom, _ = screen.evaluate_dominance_type(self._coalition_stock(), {})
         self.assertEqual(dom, "none")
 
     def test_coalition_without_round_date_stays_offline(self):
         """未进入筛选轮（未设置 round date）时不得联网兜底。"""
         stock_row = self._coalition_stock()
-        with patch.object(screen, "fetch_flow_minutes") as fetch:
+        with patch.object(flow, "fetch_flow_minutes") as fetch:
             dom, _ = screen.evaluate_dominance_type(stock_row, {})
         fetch.assert_not_called()
         self.assertEqual(dom, "none")
@@ -342,14 +345,14 @@ class SeriesBasedGateTests(unittest.TestCase):
         # 规则要求 6 期、其中 ≥3 期净流出；5 分钟间隔采样至少需要 26 根 bar
         negative = [(f"{(570 + i) // 60:02d}:{(570 + i) % 60:02d}",
                      -9_000_000.0 + i * 100_000.0, -4_000_000.0) for i in range(31)]
-        with patch.object(screen, "fetch_flow_minutes", return_value=negative):
+        with patch.object(flow, "fetch_flow_minutes", return_value=negative):
             excluded, reason = screen._should_exclude_from_low_absorb(self._high_position_stock(), {})
         self.assertTrue(excluded)
         self.assertIn("高位派发降权", reason)
 
     def test_low_absorb_unverified_is_counted_not_silently_skipped(self):
         screen.reset_flow_minute_round("2026-09-24")
-        with patch.object(screen, "fetch_flow_minutes", side_effect=RuntimeError("no data")):
+        with patch.object(flow, "fetch_flow_minutes", side_effect=RuntimeError("no data")):
             excluded, reason = screen._should_exclude_from_low_absorb(self._high_position_stock(), {})
         self.assertFalse(excluded)
         self.assertEqual(reason, "")
@@ -358,7 +361,7 @@ class SeriesBasedGateTests(unittest.TestCase):
     def test_low_absorb_uses_snapshots_when_available(self):
         row = self._high_position_stock()
         history = {row.code: [{"main_net": -float(i)} for i in range(1, 7)]}
-        with patch.object(screen, "fetch_flow_minutes") as fetch:
+        with patch.object(flow, "fetch_flow_minutes") as fetch:
             excluded, reason = screen._should_exclude_from_low_absorb(row, history)
         fetch.assert_not_called()
         self.assertTrue(excluded)
